@@ -39,6 +39,8 @@ pub struct Prepare {
     pub target_path: String,
     #[serde(default)]
     pub deduplicate: bool,
+    #[serde(default)]
+    pub preserve_structure: bool,
     pub files: Vec<InputFile>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -61,6 +63,8 @@ struct Batch {
     target_path: String,
     #[serde(default)]
     deduplicate: bool,
+    #[serde(default)]
+    preserve_structure: bool,
     files: Vec<File>,
     finished: bool,
     job_id: Option<String>,
@@ -190,6 +194,7 @@ fn existing_batch(
         ensure!(
             batch.target_path == destination.to_string_lossy()
                 && batch.deduplicate == input.deduplicate
+                && batch.preserve_structure == input.preserve_structure
                 && original == actual,
             conflict("batch ID already belongs to another manifest")
         );
@@ -247,13 +252,71 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
     if let Some(batch) = existing_batch(&jobs.db.lock().unwrap(), library, &input, &destination)? {
         return Ok(batch);
     }
-    let existing_groups = if input.deduplicate {
-        existing_groups(&destination)?
+    let mut directories: BTreeMap<std::path::PathBuf, SourceGroups> = BTreeMap::new();
+    for (key, entries) in groups {
+        let parent = if input.preserve_structure {
+            FsPath::new(&entries[0].0.relative_path)
+                .parent()
+                .unwrap_or(FsPath::new(""))
+        } else {
+            FsPath::new("")
+        };
+        import_directory(&destination, parent, false)?;
+        directories
+            .entry(parent.to_path_buf())
+            .or_default()
+            .insert(key, entries);
+    }
+    let mut planned_directories = Vec::new();
+    for (parent, groups) in directories {
+        let existing =
+            hash_existing_groups(&destination.join(&parent), &groups, input.deduplicate)?;
+        planned_directories.push((parent, groups, existing));
+    }
+    let db = jobs.db.lock().unwrap();
+    if let Some(batch) = existing_batch(&db, library, &input, &destination)? {
+        return Ok(batch);
+    }
+    let mut files = Vec::new();
+    for (parent, groups, (existing_groups, existing_hashes)) in planned_directories {
+        let directory = destination.join(&parent);
+        for mut file in plan_files(
+            &db,
+            &directory,
+            &groups,
+            input.deduplicate,
+            &existing_groups,
+            &existing_hashes,
+        )? {
+            file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+            files.push(file);
+        }
+    }
+    let batch = Batch {
+        id: input.id,
+        target_path: destination.to_string_lossy().to_string(),
+        deduplicate: input.deduplicate,
+        preserve_structure: input.preserve_structure,
+        files,
+        finished: false,
+        job_id: None,
+    };
+    save(&db, library, &batch)?;
+    Ok(batch)
+}
+type SourceGroups = BTreeMap<String, Vec<(InputFile, String, String)>>;
+fn hash_existing_groups(
+    destination: &FsPath,
+    groups: &SourceGroups,
+    deduplicate: bool,
+) -> Result<(ExistingGroups, BTreeMap<String, String>)> {
+    let existing_groups = if deduplicate && destination.exists() {
+        existing_groups(destination)?
     } else {
         BTreeMap::new()
     };
     let mut existing_hashes = BTreeMap::new();
-    if input.deduplicate {
+    if deduplicate {
         let candidates: HashSet<_> = groups
             .values()
             .flatten()
@@ -269,23 +332,39 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
             }
         }
     }
-    let db = jobs.db.lock().unwrap();
-    if let Some(batch) = existing_batch(&db, library, &input, &destination)? {
-        return Ok(batch);
-    }
-    let mut reserved: HashSet<String> = std::fs::read_dir(&destination)?
-        .map(|e| e.map(|e| e.file_name().to_string_lossy().to_lowercase()))
-        .collect::<std::io::Result<_>>()?;
+    Ok((existing_groups, existing_hashes))
+}
+fn plan_files(
+    db: &rusqlite::Connection,
+    destination: &FsPath,
+    groups: &SourceGroups,
+    deduplicate: bool,
+    existing_groups: &ExistingGroups,
+    existing_hashes: &BTreeMap<String, String>,
+) -> Result<Vec<File>> {
+    let mut reserved: HashSet<String> = if destination.exists() {
+        std::fs::read_dir(destination)?
+            .map(|e| e.map(|e| e.file_name().to_string_lossy().to_lowercase()))
+            .collect::<std::io::Result<_>>()?
+    } else {
+        HashSet::new()
+    };
     let mut pending_names = HashSet::new();
     let mut stmt = db.prepare("SELECT manifest FROM imports")?;
     for raw in stmt.query_map([], |r| r.get::<_, String>(0))? {
         let batch: Batch = serde_json::from_str(&raw?)?;
-        if batch.target_path == destination.to_string_lossy() {
-            for file in batch.files {
+        for file in batch.files {
+            let path = FsPath::new(&batch.target_path).join(&file.file_name);
+            if path.parent() == Some(destination) {
+                let name = path
+                    .file_name()
+                    .context("reserved filename")?
+                    .to_string_lossy()
+                    .to_lowercase();
                 if !batch.finished {
-                    pending_names.insert(file.file_name.to_lowercase());
+                    pending_names.insert(name.clone());
                 }
-                reserved.insert(file.file_name.to_lowercase());
+                reserved.insert(name);
             }
         }
     }
@@ -319,7 +398,7 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
                 suffixes.push(suffix.clone());
             }
         }
-        if input.deduplicate {
+        if deduplicate {
             ensure!(
                 suffixes
                     .iter()
@@ -335,8 +414,8 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
                 &suffixes,
                 &pending_names,
                 &reserved,
-                &existing_groups,
-                &existing_hashes,
+                existing_groups,
+                existing_hashes,
             )? {
                 for ((input, _, _), (name, skipped)) in entries.iter().zip(matches) {
                     reserved.insert(name.to_lowercase());
@@ -397,17 +476,57 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
             break;
         }
     }
-    let batch = Batch {
-        id: input.id,
-        target_path: destination.to_string_lossy().to_string(),
-        deduplicate: input.deduplicate,
-        files,
-        finished: false,
-        job_id: None,
-    };
-    save(&db, library, &batch)?;
-    Ok(batch)
+    Ok(files)
 }
+
+// Walk each ancestor without following symlinks, including when a directory was
+// added after prepare. Excluded scanner directories cannot contain imports.
+fn import_directory(root: &FsPath, relative: &FsPath, create: bool) -> Result<std::path::PathBuf> {
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(invalid(
+                "destination directory must be relative without dot components",
+            ));
+        };
+        let name_text = name.to_string_lossy();
+        ensure!(
+            !name_text.starts_with('.')
+                && !name_text.eq_ignore_ascii_case("@eaDir")
+                && !name_text.eq_ignore_ascii_case("#recycle")
+                && name_text.len() <= 255,
+            invalid("excluded or invalid destination directory")
+        );
+        path.push(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                conflict("destination parent must be a directory without symlinks")
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if create {
+                    match std::fs::create_dir(&path) {
+                        Ok(()) => {
+                            std::fs::File::open(path.parent().context("destination parent")?)?
+                                .sync_all()?
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let metadata = std::fs::symlink_metadata(&path)?;
+                            ensure!(
+                                metadata.is_dir() && !metadata.file_type().is_symlink(),
+                                conflict("destination parent must be a directory without symlinks")
+                            );
+                        }
+                        Err(error) => return Err(error).context("create import directory"),
+                    }
+                }
+            }
+            Err(error) => return Err(error).context("inspect import directory"),
+        }
+    }
+    Ok(path)
+}
+
 type ExistingGroups = BTreeMap<String, BTreeMap<String, (String, String)>>;
 fn existing_groups(destination: &FsPath) -> Result<ExistingGroups> {
     let mut groups: BTreeMap<String, BTreeMap<String, (String, String)>> = BTreeMap::new();
@@ -651,6 +770,15 @@ async fn finish(
             .into_iter()
             .find(|f| f.active && f.library_id == library && destination.starts_with(&f.path))
             .context("tracked import folder disappeared")?;
+        for item in &batch.files {
+            import_directory(
+                &destination,
+                FsPath::new(&item.file_name)
+                    .parent()
+                    .context("import parent")?,
+                false,
+            )?;
+        }
         for item in batch.files.iter().filter(|item| item.skipped) {
             let path = destination.join(&item.file_name);
             let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
@@ -692,6 +820,13 @@ async fn finish(
                 }
                 let item = &current.files[index];
                 let staged = staging(&destination, &current.id, &item.input.id);
+                let parent = import_directory(
+                    &destination,
+                    FsPath::new(&item.file_name)
+                        .parent()
+                        .context("import parent")?,
+                    true,
+                )?;
                 let output = destination.join(&item.file_name);
                 match std::fs::hard_link(&staged, &output) {
                     Ok(()) => (),
@@ -707,15 +842,21 @@ async fn finish(
                         return Err(e).context("publish imported original without overwriting");
                     }
                 }
-                std::fs::File::open(&destination)?.sync_all()?;
+                std::fs::File::open(&parent)?.sync_all()?;
                 current.files[index].published = true;
                 save(&db, &library, &current)?;
                 std::fs::remove_file(staged).context("remove completed import staging link")?;
             }
         }
-        let job = state
-            .jobs
-            .enqueue_manual_directory(&folder.id, &destination)?;
+        let job = if batch.preserve_structure {
+            state
+                .jobs
+                .enqueue_reconcile_scope(&folder.id, &destination)?
+        } else {
+            state
+                .jobs
+                .enqueue_manual_directory(&folder.id, &destination)?
+        };
         let db = state.jobs.db.lock().unwrap();
         let mut batch = load(&db, &library, &id)?;
         batch.finished = true;
@@ -761,6 +902,182 @@ fn same_file(first: &FsPath, second: &FsPath) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn structure_input(root: &FsPath, paths: &[&str], deduplicate: bool) -> Prepare {
+        Prepare {
+            id: uuid::Uuid::new_v4().to_string(),
+            target_path: root.to_string_lossy().into_owned(),
+            deduplicate,
+            preserve_structure: true,
+            files: paths
+                .iter()
+                .map(|path| InputFile {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    relative_path: (*path).into(),
+                    size: 8,
+                    sha256: Some(format!("{:x}", Sha256::digest(b"original"))),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn structure_preserves_directories_and_scopes_deduplication_and_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir_all(root.join("card/day")).unwrap();
+        std::fs::write(root.join("IMG.CR3"), b"original").unwrap();
+        std::fs::write(root.join("card/day/IMG.CR3"), b"original").unwrap();
+        let db = dir.path().join("jobs.sqlite");
+        let jobs = Jobs::open(&db, &root).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        let input = structure_input(
+            jobs.root(),
+            &["card/day/IMG.CR3", "card/day/IMG.CR3.xmp", "other/IMG.CR3"],
+            true,
+        );
+        let batch = prepare(&jobs, "lib", input.clone()).unwrap();
+        assert_eq!(
+            batch
+                .files
+                .iter()
+                .map(|f| (f.file_name.as_str(), f.skipped))
+                .collect::<Vec<_>>(),
+            vec![
+                ("card/day/IMG.CR3", true),
+                ("card/day/IMG.CR3.xmp", false),
+                ("other/IMG.CR3", false)
+            ]
+        );
+        assert!(!root.join("other").exists());
+        let mut changed = input.clone();
+        changed.preserve_structure = false;
+        assert!(
+            prepare(&jobs, "lib", changed)
+                .unwrap_err()
+                .to_string()
+                .contains("another manifest")
+        );
+        drop(jobs);
+        let jobs = Jobs::open(&db, &root).unwrap();
+        let resumed = prepare(&jobs, "lib", input).unwrap();
+        assert!(resumed.preserve_structure);
+        assert_eq!(resumed.files[1].file_name, "card/day/IMG.CR3.xmp");
+        let next = prepare(
+            &jobs,
+            "lib",
+            structure_input(jobs.root(), &["card/day/IMG.CR3", "other/IMG.CR3"], false),
+        )
+        .unwrap();
+        assert_eq!(
+            next.files
+                .iter()
+                .map(|f| f.file_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["card/day/IMG (1).CR3", "other/IMG (1).CR3"]
+        );
+        let mut direct = structure_input(&jobs.root().join("card/day"), &["IMG.CR3"], false);
+        direct.preserve_structure = false;
+        assert_eq!(
+            prepare(&jobs, "lib", direct).unwrap().files[0].file_name,
+            "IMG (2).CR3"
+        );
+    }
+
+    #[test]
+    fn structure_rejects_symlink_and_excluded_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(dir.path(), root.join("escape")).unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        for path in [
+            "escape/nested/IMG.CR3",
+            "../IMG.CR3",
+            ".hidden/IMG.CR3",
+            "@eaDir/IMG.CR3",
+            "#recycle/IMG.CR3",
+        ] {
+            assert!(
+                prepare(&jobs, "lib", structure_input(jobs.root(), &[path], false)).is_err(),
+                "{path}"
+            );
+        }
+        let legacy: Prepare = serde_json::from_value(
+            json!({"id":uuid::Uuid::new_v4().to_string(), "targetPath":root, "files":[]}),
+        )
+        .unwrap();
+        assert!(!legacy.preserve_structure);
+    }
+
+    #[tokio::test]
+    async fn structure_finish_publishes_nested_files_and_enqueues_recursive_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir(&root).unwrap();
+        let keeps = dir.path().join("keeps");
+        let previews = crate::previews::PreviewStorage::new(
+            &keeps,
+            Some(&root),
+            "http://localhost",
+            "test-preview-key-01234567890123456789",
+        )
+        .unwrap();
+        let state = Arc::new(AppState {
+            store: Arc::new(
+                crate::store::Store::open(&keeps.join("db/control_plane.sqlite"), true).unwrap(),
+            ),
+            previews: Arc::new(previews),
+            jobs: Arc::new(Jobs::open(&keeps.join("db/jobs.sqlite"), &root).unwrap()),
+            access_token: String::new(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        });
+        state.jobs.add_folder("lib", ".").unwrap();
+        let batch = prepare(
+            &state.jobs,
+            "lib",
+            structure_input(
+                state.jobs.root(),
+                &["card/day/IMG.CR3", "card/day/IMG.CR3.xmp", "other/IMG.CR3"],
+                false,
+            ),
+        )
+        .unwrap();
+        for file in &batch.files {
+            assert!(
+                upload(
+                    State(state.clone()),
+                    Path(("lib".into(), batch.id.clone(), file.input.id.clone())),
+                    Body::from("original")
+                )
+                .await
+                .is_ok()
+            );
+        }
+        assert!(!root.join("card").exists());
+        std::os::unix::fs::symlink(dir.path(), root.join("card")).unwrap();
+        assert!(
+            finish(State(state.clone()), Path(("lib".into(), batch.id.clone())))
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(root.join("card")).unwrap();
+        assert!(!dir.path().join("day").exists());
+        let result = finish(State(state.clone()), Path(("lib".into(), batch.id.clone()))).await;
+        assert!(result.is_ok());
+        let Json(result) = result.ok().unwrap();
+        assert_eq!(result["job"]["scopeKind"], "recursive");
+        for file in &batch.files {
+            assert_eq!(
+                std::fs::read(root.join(&file.file_name)).unwrap(),
+                b"original"
+            );
+        }
+        let resumed = load(&state.jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        assert!(resumed.finished && resumed.files.iter().all(|f| f.published));
+    }
+
     #[test]
     fn sidecar_case_matches_original_destination() {
         let dir = tempfile::tempdir().unwrap();
@@ -782,6 +1099,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 target_path: jobs.root().to_str().unwrap().into(),
                 deduplicate: false,
+                preserve_structure: false,
                 files,
             },
         )
@@ -817,6 +1135,7 @@ mod tests {
                     id: uuid::Uuid::new_v4().to_string(),
                     target_path: jobs.root().to_str().unwrap().into(),
                     deduplicate: false,
+                    preserve_structure: false,
                     files: paths
                         .iter()
                         .map(|path| InputFile {
@@ -857,6 +1176,7 @@ mod tests {
             id: uuid::Uuid::new_v4().to_string(),
             target_path: jobs.root().to_str().unwrap().into(),
             deduplicate: false,
+            preserve_structure: false,
             files: vec![InputFile {
                 id: uuid::Uuid::new_v4().to_string(),
                 relative_path: "card/IMG.HEIC".into(),
@@ -928,6 +1248,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 target_path: jobs.root().to_string_lossy().into(),
                 deduplicate: enabled,
+                preserve_structure: false,
                 files,
             };
             let batch = prepare(&jobs, "lib", input.clone()).unwrap();
@@ -973,6 +1294,7 @@ mod tests {
                 id: uuid::Uuid::new_v4().to_string(),
                 target_path: jobs.root().to_string_lossy().into(),
                 deduplicate: true,
+                preserve_structure: false,
                 files,
             },
         )

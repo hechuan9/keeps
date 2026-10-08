@@ -85,6 +85,7 @@ struct KeepsAPITests {
         let fixture = Fixture { request in
             let body = try JSONSerialization.jsonObject(with: request.bodyData) as! [String: Any]
             #expect(body["deduplicate"] as? Bool == false)
+            #expect(body["preserveStructure"] as? Bool == false)
             let files = body["files"] as! [[String: Any]]
             #expect(files.first?["sha256"] == nil)
             return (200, "{\"id\":\"\(batchID)\",\"targetPath\":\"incoming\",\"finished\":false,\"files\":[]}")

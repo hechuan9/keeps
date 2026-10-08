@@ -5,6 +5,7 @@ import SwiftUI
 @MainActor
 final class ImportStore: ObservableObject {
     let client: KeepsClient
+    @Published var preserveStructure = false
     @Published var deduplicate = false
     @Published private(set) var skippedFiles = 0
     @Published private(set) var source: URL?
@@ -79,6 +80,7 @@ final class ImportStore: ObservableObject {
 
     private func inventory(source: URL, targetPath: String) async throws {
         let calculateHashes = deduplicate
+        let preserveStructure = preserveStructure
         message = calculateHashes ? "正在读取文件以检查目标目录中的重复内容…" : "正在递归查找 RAW、JPEG、HEIF 和关联 XMP…"
         let scan = Task.detached(priority: .userInitiated) { try ImportSource.scan(source, calculateHashes: calculateHashes) }
         let files = try await withTaskCancellationHandler {
@@ -94,7 +96,7 @@ final class ImportStore: ObservableObject {
         totalBytes = files.reduce(0) { $0 + $1.size }
         manifest = KeepsImportManifest(id: UUID(), targetPath: targetPath, files: files.map {
             KeepsImportFile(id: UUID(), relativePath: $0.sourcePath, size: $0.size, sha256: $0.sha256)
-        }, deduplicate: calculateHashes)
+        }, deduplicate: calculateHashes, preserveStructure: preserveStructure)
     }
 
     private func validateSource(_ file: ImportSourceFile) throws {

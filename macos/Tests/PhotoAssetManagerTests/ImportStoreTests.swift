@@ -18,6 +18,7 @@ import Testing
         #expect(snapshot.events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish"])
         #expect(snapshot.manifests.first?.targetPath == "incoming")
         #expect(snapshot.manifests.first?.deduplicate == false)
+        #expect(snapshot.manifests.first?.preserveStructure == false)
         #expect(snapshot.manifests.first?.files.allSatisfy { $0.sha256 == nil } == true)
         #expect(snapshot.manifests.first?.files.map(\.relativePath) == ["a.nef", "nested/b.heic"])
         #expect(try Data(contentsOf: fixture.root.appendingPathComponent("a.nef")) == Data("abc".utf8))
@@ -59,6 +60,23 @@ import Testing
         #expect(snapshot.manifests.count == 2)
         #expect(snapshot.manifests.allSatisfy { $0.id == firstManifest.id && $0.targetPath == "incoming" })
         #expect(snapshot.manifests.allSatisfy { $0.files.map(\.id) == firstManifest.files.map(\.id) })
+    }
+
+    @Test func preservedStructureSurvivesUploadRetry() async throws {
+        let fixture = try makeFixture(failUpload: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.preserveStructure = true
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage != nil)
+        fixture.store.preserveStructure = false
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        let manifests = fixture.state.snapshot().manifests
+        #expect(manifests.count == 2)
+        #expect(manifests.allSatisfy { $0.preserveStructure })
+        #expect(manifests.allSatisfy { $0.files.map(\.relativePath) == ["a.nef", "nested/b.heic"] })
     }
 
     @Test func changedSourcePreventsResumeFromCommittingOldUploads() async throws {

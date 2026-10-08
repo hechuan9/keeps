@@ -5,11 +5,13 @@ public struct KeepsImportManifest: Codable, Sendable {
     public var targetPath: String
     public var files: [KeepsImportFile]
     public var deduplicate: Bool
-    public init(id: UUID, targetPath: String, files: [KeepsImportFile], deduplicate: Bool = false) {
+    public var preserveStructure: Bool
+    public init(id: UUID, targetPath: String, files: [KeepsImportFile], deduplicate: Bool = false, preserveStructure: Bool = false) {
         self.id = id
         self.targetPath = targetPath
         self.files = files
         self.deduplicate = deduplicate
+        self.preserveStructure = preserveStructure
     }
 }
 
