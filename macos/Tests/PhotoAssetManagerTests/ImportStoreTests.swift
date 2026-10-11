@@ -178,13 +178,59 @@ import Testing
         #expect(fixture.state.snapshot().events.filter { $0 == "upload:nested/b.heic" }.count == 1)
     }
 
-    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
+    @Test func processesFirstPhotoDuringSecondUploadAndPauseRestoresSingleConsumer() async throws {
+        let fixture = try makeFixture(gatedPipeline: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForEvent("held:upload:1", state: fixture.state)
+        try await waitForEvent("source:1", state: fixture.state)
+        #expect(fixture.store.completedFiles == 1)
+        #expect(fixture.store.job == nil)
+        #expect(!fixture.state.snapshot().events.contains("finish"))
+        fixture.store.pause()
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:source" }.count == 1)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:upload" }.count == 1)
+        fixture.store.start(targetPath: "incoming")
+        try await waitForEvent("held:upload:2", state: fixture.state)
+        try await waitForEvent("source:2", state: fixture.state)
+        #expect(fixture.state.snapshot().events.filter { $0 == "claim:first" }.count == 1)
+        fixture.store.pause()
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:source" }.count == 2)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:upload" }.count == 2)
+    }
+
+    @Test func mediaFailureCancelsPendingUploadBeforeRetry() async throws {
+        let fixture = try makeFixture(gatedPipeline: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForEvent("held:upload:1", state: fixture.state)
+        try await waitForEvent("source:1", state: fixture.state)
+        fixture.state.failPendingSource()
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage != nil)
+        #expect(fixture.store.completedFiles == 1)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:upload" }.count == 1)
+        #expect(!fixture.state.snapshot().events.contains("finish"))
+    }
+
+    private func waitForEvent(_ event: String, state: ImportScenario) async throws {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if state.snapshot().events.contains(event) { return }
+            await Task.yield()
+        }
+        throw NSError(domain: "ImportStoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "未收到 HTTP 闸门事件：" + event])
+    }
+
+    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false, gatedPipeline: Bool = false) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
         try Data("abc".utf8).write(to: root.appendingPathComponent("a.nef"))
         try Data("abc".utf8).write(to: root.appendingPathComponent("nested/b.heic"))
         let host = UUID().uuidString.lowercased() + ".invalid"
-        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst, publishing: publishing, failPrepare: failPrepare, failPublication: failPublication, acceptFailedUpload: acceptFailedUpload)
+        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst, publishing: publishing, failPrepare: failPrepare, failPublication: failPublication, acceptFailedUpload: acceptFailedUpload, gatedPipeline: gatedPipeline)
         ImportProtocol.scenarios.register(state, host: host)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ImportProtocol.self]
@@ -212,11 +258,16 @@ private final class ImportScenario: @unchecked Sendable {
     private let acceptFailedUpload: Bool
     private let skipFirst: Bool
     private let publishing: Bool
+    private let gatedPipeline: Bool
+    private var pending: [String: ImportProtocol] = [:]
+    private var sourceRequests = 0
+    private var claimed = false
     private var manifests: [KeepsImportManifest] = []
     private var uploaded: Set<UUID> = []
     private var events: [String] = []
 
-    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool, publishing: Bool, failPrepare: Bool, failPublication: Bool, acceptFailedUpload: Bool) {
+    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool, publishing: Bool, failPrepare: Bool, failPublication: Bool, acceptFailedUpload: Bool, gatedPipeline: Bool) {
+        self.gatedPipeline = gatedPipeline
         self.acceptFailedUpload = acceptFailedUpload
         self.failPrepare = failPrepare
         self.failPublication = failPublication
@@ -229,6 +280,42 @@ private final class ImportScenario: @unchecked Sendable {
     func snapshot() -> (events: [String], manifests: [KeepsImportManifest]) {
         lock.lock(); defer { lock.unlock() }
         return (events, manifests)
+    }
+
+    func hold(_ protocolInstance: ImportProtocol) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard gatedPipeline, let manifest = manifests.last else { return false }
+        let request = protocolInstance.request
+        let path = request.url!.path
+        if request.httpMethod == "PUT", let file = manifest.files.first(where: { path.hasSuffix($0.id.uuidString) }), file.relativePath == "nested/b.heic" {
+            let event = "upload:" + file.relativePath
+            events.append(event)
+            events.append("held:upload:\(events.filter { $0 == event }.count)")
+            pending["upload"] = protocolInstance
+            return true
+        }
+        if path.hasSuffix("/tasks/first/source") {
+            sourceRequests += 1
+            events.append("source:\(sourceRequests)")
+            pending["source"] = protocolInstance
+            return true
+        }
+        return false
+    }
+
+    func stopped(_ protocolInstance: ImportProtocol) {
+        lock.lock(); defer { lock.unlock() }
+        if let key = pending.first(where: { $0.value === protocolInstance })?.key {
+            pending.removeValue(forKey: key)
+            events.append("cancel:" + key)
+        }
+    }
+
+    func failPendingSource() {
+        lock.lock()
+        let source = pending.removeValue(forKey: "source")
+        lock.unlock()
+        if let source { source.client?.urlProtocol(source, didFailWithError: URLError(.badServerResponse)) }
     }
 
     func respond(to request: URLRequest) throws -> Data {
@@ -263,6 +350,17 @@ private final class ImportScenario: @unchecked Sendable {
             }
             uploaded.insert(file.id)
             return Data("{}".utf8)
+        }
+        if path.hasSuffix("/worker/claim") {
+            if gatedPipeline, !uploaded.isEmpty, !claimed {
+                claimed = true
+                events.append("claim:first")
+                return Data("{\"task\":{\"taskID\":\"first\",\"inputHash\":\"unused\",\"filename\":\"a.nef\",\"generateStandard\":false,\"generateBrowse\":true,\"thumbnailEdge\":512,\"thumbnailQuality\":85}}".utf8)
+            }
+            return Data("{\"task\":null}".utf8)
+        }
+        if path.hasSuffix("/finish"), request.httpMethod == "GET", !events.contains("finish") {
+            return Data("{\"id\":\"\(manifest.id)\",\"status\":\"uploading\",\"completedFiles\":\(uploaded.count),\"totalFiles\":2,\"indexedFiles\":\(uploaded.count),\"indexTotal\":2,\"thumbnailTotal\":2,\"thumbnailCompleted\":0}".utf8)
         }
         if path.hasSuffix("/finish") {
             events.append(request.httpMethod == "GET" ? "status" : "finish")
@@ -324,6 +422,7 @@ private final class ImportProtocol: URLProtocol, @unchecked Sendable {
             guard let url = request.url, let state = Self.scenarios.state(for: url.host ?? "") else {
                 throw URLError(.unsupportedURL)
             }
+            if state.hold(self) { return }
             let body = try state.respond(to: request)
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: body)
@@ -332,5 +431,7 @@ private final class ImportProtocol: URLProtocol, @unchecked Sendable {
             client?.urlProtocol(self, didFailWithError: error)
         }
     }
-    override func stopLoading() {}
+    override func stopLoading() {
+        Self.scenarios.state(for: request.url?.host ?? "")?.stopped(self)
+    }
 }

@@ -144,9 +144,9 @@ final class ImportStore: ObservableObject {
                     }
                 }
             } catch is CancellationError {
-                message = isFinishing ? "已停止查看进度，NAS 继续后台导入。点击继续导入可恢复查询。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
+                message = isFinishing ? "Mac 处理已暂停，NAS 继续后台导入。点击继续导入可恢复处理。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
             } catch let error as URLError where error.code == .cancelled {
-                message = isFinishing ? "已停止查看进度，NAS 继续后台导入。点击继续导入可恢复查询。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
+                message = isFinishing ? "Mac 处理已暂停，NAS 继续后台导入。点击继续导入可恢复处理。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
             } catch {
                 report(error)
                 message = "导入未完成。可重试此批次，已上传的文件不会重复上传。"
@@ -226,8 +226,22 @@ final class ImportStore: ObservableObject {
         let sourceByPath = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourcePath, $0) })
         skippedFiles = batch.files.filter { $0.skipped == true }.count
         completedFiles = batch.files.filter(\.uploaded).count
-        var completeBytes = batch.files.filter(\.uploaded).reduce(Int64(0)) { $0 + $1.size }
+        let completeBytes = batch.files.filter(\.uploaded).reduce(Int64(0)) { $0 + $1.size }
         sentBytes = completeBytes
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await self.uploadFiles(batch, sourceByPath: sourceByPath, completeBytes: completeBytes)
+            }
+            group.addTask {
+                try await self.consumeMediaWhileUploading(id: batch.id)
+            }
+            defer { group.cancelAll() }
+            while let _ = try await group.next() {}
+        }
+    }
+
+    private func uploadFiles(_ batch: KeepsImportBatch, sourceByPath: [String: ImportSourceFile], completeBytes: Int64) async throws {
+        var completeBytes = completeBytes
         for file in batch.files where !file.uploaded {
             try Task.checkCancellation()
             guard let sourceFile = sourceByPath[file.relativePath] else { throw KeepsAPIError.invalidResponse }
@@ -250,15 +264,36 @@ final class ImportStore: ObservableObject {
         message = "上传完成，正在提交 NAS 整理任务…"
         isFinishing = true
         try persist()
-        try await finish(id: batch.id)
     }
 
-    private func processMedia(id: UUID) async throws {
+    private func updateProgress(_ status: KeepsImportFinish) {
+        publishedFiles = status.completedFiles
+        indexTotal = status.indexTotal ?? fileCount
+        indexedFiles = status.indexedFiles ?? 0
+        thumbnailTotal = status.thumbnailTotal ?? 0
+        thumbnailCompleted = status.thumbnailCompleted ?? 0
+    }
+
+    private func consumeMediaWhileUploading(id: UUID) async throws {
+        while !isFinishing {
+            try Task.checkCancellation()
+            let status = try await client.importFinishStatus(id: id)
+            updateProgress(status)
+            if status.status == "failed" {
+                throw NSError(domain: "KeepsImport", code: 3, userInfo: [NSLocalizedDescriptionKey: status.error ?? "NAS 导入失败，请重试此批次。"])
+            }
+            let processed = try await processMedia(id: id)
+            if !isFinishing, !processed { try await Task.sleep(for: .seconds(1)) }
+        }
+        try await finish(id: id)
+    }
+
+    private func processMedia(id: UUID) async throws -> Bool {
         if mediaTask == nil {
             mediaTask = try await client.claimImportMedia(id: id, workerID: workerID).task
             if mediaTask != nil { try persist() }
         }
-        guard let task = mediaTask else { return }
+        guard let task = mediaTask else { return false }
         let heartbeat = Task {
             while !Task.isCancelled {
                 do { try await Task.sleep(for: .seconds(60)); try await client.heartbeatWorker(taskID: task.taskID) }
@@ -269,7 +304,7 @@ final class ImportStore: ObservableObject {
         defer { heartbeat.cancel() }
         do {
             while true {
-                do { try await ImportRenderer.process(task, client: client); mediaTask = nil; try persist(); break }
+                do { try await ImportRenderer.process(task, client: client); mediaTask = nil; try persist(); return true }
                 catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
                     report(error)
                     try await Task.sleep(for: .seconds(3))
@@ -279,7 +314,7 @@ final class ImportStore: ObservableObject {
                 } catch KeepsAPIError.http(let status, _) where status == 409 {
                     mediaTask = nil
                     try persist()
-                    return
+                    return false
                 }
             }
         }
@@ -296,14 +331,11 @@ final class ImportStore: ObservableObject {
         var submit = true
         while job == nil {
             try Task.checkCancellation()
+            var processed = false
             do {
                 let status = try await (submit ? client.finishImport(id: id) : client.importFinishStatus(id: id))
                 submit = false
-                publishedFiles = status.completedFiles
-                indexTotal = status.indexTotal ?? fileCount
-                indexedFiles = status.indexedFiles ?? 0
-                thumbnailTotal = status.thumbnailTotal ?? 0
-                thumbnailCompleted = status.thumbnailCompleted ?? 0
+                updateProgress(status)
                 errorMessage = nil
                 switch status.status {
                 case "finished":
@@ -313,22 +345,22 @@ final class ImportStore: ObservableObject {
                     message = "正在提取元数据：\(indexedFiles) / \(indexTotal)"
                 case "thumbnails":
                     message = "正在生成缩略图：\(thumbnailCompleted) / \(thumbnailTotal)"
-                    try await processMedia(id: id)
                 case "failed":
                     throw NSError(domain: "KeepsImport", code: 3, userInfo: [NSLocalizedDescriptionKey: status.error ?? "NAS 导入失败，请重试此批次。"])
                 case "uploading":
                     submit = true
                 case "publishing":
-                    message = "NAS 正在提交文件：\(status.completedFiles) / \(status.totalFiles)，关闭进度查询不会中断后台任务。"
+                    message = "NAS 正在提交文件：\(status.completedFiles) / \(status.totalFiles)。"
                 default:
                     throw KeepsAPIError.invalidResponse
                 }
+                if job == nil { processed = try await processMedia(id: id) }
             } catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
                 submit = false
                 report(error)
                 message = "连接暂时中断，正在恢复查询同一导入批次。NAS 已接收的任务会继续运行。"
             }
-            if job == nil { try await Task.sleep(for: .seconds(1)) }
+            if job == nil, !processed { try await Task.sleep(for: .seconds(1)) }
         }
         try FileManager.default.removeItem(at: checkpointURL)
         onCompletion?()

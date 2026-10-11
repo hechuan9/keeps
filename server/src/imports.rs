@@ -72,6 +72,8 @@ struct Batch {
     #[serde(default)]
     finish_error: Option<String>,
     job_id: Option<String>,
+    #[serde(default)]
+    group_jobs: BTreeMap<String, String>,
 }
 fn invalid(message: impl Into<String>) -> anyhow::Error {
     StoreError {
@@ -306,6 +308,7 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
         finish_requested: false,
         finish_error: None,
         job_id: None,
+        group_jobs: BTreeMap::new(),
     };
     save(&db, library, &batch)?;
     Ok(batch)
@@ -647,12 +650,14 @@ async fn prepare_handler(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let batch = tokio::task::spawn_blocking(move || -> Result<Batch> {
+        let _guard = state.jobs.import_mutation.lock().unwrap();
         let input: Prepare = serde_json::from_value(body.clone())?;
         let batch = prepare(&state.jobs, &library, input)?;
         if let Some(worker) = body["workerID"].as_str() {
             reserve_compute(&state, &library, &batch, worker)?;
         }
-        Ok(batch)
+        resume_pipeline(&state, &library, &batch.id)?;
+        load(&state.jobs.db.lock().unwrap(), &library, &batch.id)
     })
     .await
     .map_err(anyhow::Error::from)??;
@@ -660,6 +665,48 @@ async fn prepare_handler(
         serde_json::to_value(batch).map_err(anyhow::Error::from)?,
     ))
 }
+fn resume_pipeline(state: &AppState, library: &str, id: &str) -> Result<()> {
+    let batch = load(&state.jobs.db.lock().unwrap(), library, id)?;
+    let mut replacements = BTreeMap::new();
+    for (group, job_id) in &batch.group_jobs {
+        if let Some(job) = state
+            .jobs
+            .job(job_id)?
+            .filter(|job| job.status == "failed" || job.status == "cancelled" || job.failed > 0)
+        {
+            let retry = state
+                .jobs
+                .enqueue_manual_file(&job.folder_id, FsPath::new(&job.path))?;
+            replacements.insert(group.clone(), retry.id);
+        }
+    }
+    let paths: Vec<_> = batch
+        .files
+        .iter()
+        .map(|f| {
+            FsPath::new(&batch.target_path)
+                .join(&f.file_name)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1) AND (status='failed' OR browse_attempts>=4)",params![library,serde_json::to_string(&paths)?])?;
+    let db = state.jobs.db.lock().unwrap();
+    let mut current = load(&db, library, id)?;
+    if let Some((group, _)) = batch
+        .group_jobs
+        .iter()
+        .find(|(_, job)| Some(*job) == current.job_id.as_ref())
+        && let Some(retry) = replacements.get(group)
+    {
+        current.job_id = Some(retry.clone());
+    }
+    current.group_jobs.extend(replacements);
+    current.finish_error = None;
+    save(&db, library, &current)?;
+    Ok(())
+}
+
 fn reserve_compute(state: &AppState, library: &str, batch: &Batch, worker: &str) -> Result<()> {
     ensure!(
         !worker.is_empty() && worker.len() <= 128,
@@ -855,18 +902,25 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
                 .into_owned()
         })
         .collect();
-    let mut assets = HashSet::new();
-    let mut ready = 0;
+    let mut photo_groups: BTreeMap<_, Vec<&String>> = BTreeMap::new();
+    for path in &paths {
+        let file = FsPath::new(path);
+        photo_groups
+            .entry((file.parent(), destination_stem(path)))
+            .or_default()
+            .push(path);
+    }
+    let mut ready_assets = HashSet::new();
     let mut media_error: Option<String> = None;
     let paths_json = serde_json::to_string(&paths)?;
-    let indexed_assets = db.prepare("SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1")?.query_map(params![library,paths_json],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let indexed_assets = db.prepare("SELECT p.path,p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1")?.query_map(params![library,paths_json],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
     let indexed = indexed_assets.len();
-    assets.extend(indexed_assets);
+    let assets: HashSet<_> = indexed_assets.values().collect();
     for asset in &assets {
         let media: Option<(String,Option<String>,bool)> = db.query_row("SELECT c.status,coalesce(CASE WHEN c.status='failed' THEN c.last_error END,CASE WHEN c.browse_attempts>=4 THEN c.browse_last_error END),coalesce(c.status='ready' AND c.spec=?3 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND c.browse_thumbnail IS NOT NULL AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=json_extract(c.thumbnail,'$.version') AND json_extract(c.browse_thumbnail,'$.spec')=?4,0) FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?1 AND c.asset_id=?2",params![library,asset,crate::cache_pipeline::spec()?,crate::browse_cache::SPEC],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;
         if let Some((status, error, complete)) = media {
             if complete {
-                ready += 1;
+                ready_assets.insert(*asset);
             }
             if status == "failed" || error.is_some() {
                 media_error = error;
@@ -875,29 +929,54 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
     }
     drop(db);
     response["publicationComplete"] = json!(batch.finished);
-    response["indexedFiles"] = json!(indexed);
-    response["indexTotal"] = json!(paths.len());
-    response["thumbnailTotal"] = json!(assets.len());
-    response["thumbnailCompleted"] = json!(ready);
+    response["indexedFiles"] = json!(
+        photo_groups
+            .values()
+            .filter(|group| group.iter().all(|path| indexed_assets.contains_key(*path)))
+            .count()
+    );
+    response["indexTotal"] = json!(photo_groups.len());
+    response["thumbnailTotal"] = json!(photo_groups.len());
+    response["thumbnailCompleted"] = json!(
+        photo_groups
+            .values()
+            .filter(|group| group.iter().all(|path| indexed_assets
+                .get(*path)
+                .is_some_and(|asset| ready_assets.contains(asset))))
+            .count()
+    );
+    let mut job_ids: HashSet<_> = batch.group_jobs.values().cloned().collect();
+    job_ids.extend(batch.job_id.clone());
+    let jobs = job_ids
+        .iter()
+        .map(|id| state.jobs.job(id))
+        .collect::<Result<Vec<_>>>()?;
+    if let Some(job) = jobs
+        .iter()
+        .flatten()
+        .find(|j| j.status == "failed" || j.status == "cancelled" || j.failed > 0)
+    {
+        response["status"] = json!("failed");
+        response["error"] = json!(job.error.as_deref().unwrap_or("index task cancelled"));
+
+        return Ok(response);
+    }
+    if let Some(error) = &media_error {
+        response["status"] = json!("failed");
+        response["error"] = json!(error);
+        return Ok(response);
+    }
     if batch.finished {
-        let job = batch
-            .job_id
-            .as_deref()
-            .map(|id| state.jobs.job(id))
-            .transpose()?
-            .flatten();
-        if let Some(job) = job
-            .as_ref()
-            .filter(|j| j.status == "failed" || j.status == "cancelled" || j.failed > 0)
+        if indexed < paths.len()
+            || jobs
+                .iter()
+                .any(|j| j.as_ref().is_none_or(|j| j.status != "completed"))
         {
-            response["status"] = json!("failed");
-            response["error"] = json!(job.error.as_deref().unwrap_or("index task cancelled"));
-        } else if indexed < paths.len() || job.as_ref().is_some_and(|j| j.status != "completed") {
             response["status"] = json!("indexing");
         } else if let Some(error) = media_error {
             response["status"] = json!("failed");
             response["error"] = json!(error);
-        } else if ready < assets.len() {
+        } else if ready_assets.len() < assets.len() {
             response["status"] = json!("thumbnails");
         } else {
             response["status"] = json!("finished");
@@ -932,6 +1011,7 @@ async fn finish(
         let folder = retry_state.jobs.folders()?.into_iter().filter(|f|f.active && f.library_id==retry_library && destination.starts_with(&f.path)).max_by_key(|f|f.path.len()).context("import folder no longer tracked")?;
         let job = if batch.preserve_structure { retry_state.jobs.enqueue_reconcile_scope(&folder.id,destination)? } else { retry_state.jobs.enqueue_manual_directory(&folder.id,destination)? };
         batch.job_id=Some(job.id);
+        batch.group_jobs.clear();
         save(&retry_state.jobs.db.lock().unwrap(),&retry_library,&batch)?;
         let paths: Vec<_> = batch.files.iter().map(|f|destination.join(&f.file_name).to_string_lossy().into_owned()).collect();
         retry_state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1)",params![retry_library,serde_json::to_string(&paths)?])?;
@@ -972,7 +1052,7 @@ pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<
     while !stop.load(Ordering::Relaxed) {
         let pending = {
             let db = jobs.db.lock().unwrap();
-            let mut query = db.prepare("SELECT library_id,id FROM imports WHERE json_extract(manifest,'$.finishRequested')=1 AND json_extract(manifest,'$.finished')=0 AND json_extract(manifest,'$.finishError') IS NULL")?;
+            let mut query = db.prepare("SELECT library_id,id FROM imports WHERE json_extract(manifest,'$.finished')=0 AND EXISTS(SELECT 1 FROM json_each(manifest,'$.files') WHERE json_extract(value,'$.uploaded')=1) AND json_extract(manifest,'$.finishError') IS NULL")?;
             query
                 .query_map([], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -1028,7 +1108,19 @@ fn publish_checkpoint(
     for parent in parents {
         std::fs::File::open(parent)?.sync_all()?;
     }
-    save(&jobs.db.lock().unwrap(), library, batch)?;
+    let db = jobs.db.lock().unwrap();
+    let mut latest = load(&db, library, &batch.id)?;
+    for file in &mut latest.files {
+        if batch
+            .files
+            .iter()
+            .any(|saved| saved.input.id == file.input.id && saved.published)
+        {
+            file.published = true;
+        }
+    }
+    save(&db, library, &latest)?;
+    drop(db);
     // Retain the staging inode until the publication checkpoint is durable, so a
     // restart can distinguish our own hard link from an unrelated late collision.
     for (path, _) in staged.drain(..) {
@@ -1050,16 +1142,35 @@ fn finish_batch(
         return Ok(json!({"job":jobs.job(&job_id)?}));
     }
     let destination = target(jobs, library, &batch.target_path)?;
-    ensure!(
-        batch.files.iter().all(|f| f.uploaded),
-        conflict("upload all files before finishing import")
-    );
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (index, file) in batch.files.iter().enumerate() {
+        let path = FsPath::new(&file.file_name);
+        let key = format!(
+            "{}/{}",
+            path.parent().context("import parent")?.display(),
+            destination_stem(&file.file_name)
+        );
+        groups.entry(key).or_default().push(index);
+    }
+    let eligible: HashSet<usize> = groups
+        .iter()
+        .filter(|(key, indices)| {
+            !batch.group_jobs.contains_key(*key) && indices.iter().all(|i| batch.files[*i].uploaded)
+        })
+        .flat_map(|(_, indices)| indices)
+        .copied()
+        .collect();
     let folder = jobs
         .folders()?
         .into_iter()
         .find(|f| f.active && f.library_id == library && destination.starts_with(&f.path))
         .context("tracked import folder disappeared")?;
-    for item in &batch.files {
+    for (_, item) in batch
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| eligible.contains(i))
+    {
         import_directory(
             &destination,
             FsPath::new(&item.file_name)
@@ -1068,7 +1179,13 @@ fn finish_batch(
             false,
         )?;
     }
-    for item in batch.files.iter().filter(|item| item.skipped) {
+    for item in batch
+        .files
+        .iter()
+        .enumerate()
+        .filter(|(i, item)| eligible.contains(i) && item.skipped)
+        .map(|(_, item)| item)
+    {
         let path = destination.join(&item.file_name);
         let metadata = std::fs::symlink_metadata(&path)
             .map_err(|error| conflict(format!("deduplicated file is unavailable: {error:#}")))?;
@@ -1082,7 +1199,13 @@ fn finish_batch(
     {
         let mut current = load(&jobs.db.lock().unwrap(), library, id)?;
         // Discover a late collision before exposing any sidecar from this batch.
-        for item in current.files.iter().filter(|item| !item.published) {
+        for item in current
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(i, item)| eligible.contains(i) && !item.published)
+            .map(|(_, item)| item)
+        {
             let output = destination.join(&item.file_name);
             match std::fs::symlink_metadata(&output) {
                 Ok(_) => ensure!(
@@ -1093,7 +1216,7 @@ fn finish_batch(
                 Err(error) => return Err(error).context("inspect import destination"),
             }
         }
-        let mut order: Vec<usize> = (0..current.files.len()).collect();
+        let mut order: Vec<usize> = eligible.iter().copied().collect();
         order.sort_by_key(|i| {
             !current.files[*i]
                 .file_name
@@ -1148,17 +1271,36 @@ fn finish_batch(
         }
         publish_checkpoint(jobs, library, &current, &mut checkpoint)?;
     }
-    let job = if batch.preserve_structure {
-        jobs.enqueue_reconcile_scope(&folder.id, &destination)?
-    } else {
-        jobs.enqueue_manual_directory(&folder.id, &destination)?
-    };
+    for (key, indices) in groups {
+        if !indices.iter().all(|i| eligible.contains(i)) || batch.group_jobs.contains_key(&key) {
+            continue;
+        }
+        let original = indices
+            .iter()
+            .map(|i| &batch.files[*i])
+            .find(|f| !f.file_name.to_ascii_lowercase().ends_with(".xmp"))
+            .or_else(|| indices.first().map(|i| &batch.files[*i]));
+        if let Some(original) = original {
+            let job =
+                jobs.enqueue_manual_file(&folder.id, &destination.join(&original.file_name))?;
+            let db = jobs.db.lock().unwrap();
+            let mut current = load(&db, library, id)?;
+            current.group_jobs.insert(key, job.id);
+            save(&db, library, &current)?;
+        }
+    }
     let db = jobs.db.lock().unwrap();
     let mut batch = load(&db, library, id)?;
-    batch.finished = true;
-    batch.job_id = Some(job.id.clone());
-    save(&db, library, &batch)?;
-    Ok(json!({"job":job}))
+    if batch.finish_requested && batch.files.iter().all(|f| f.published) {
+        batch.finished = true;
+        batch.job_id = batch.group_jobs.values().next_back().cloned();
+        save(&db, library, &batch)?;
+    }
+    let job_id = batch.job_id.clone();
+    drop(db);
+    Ok(
+        json!({"status": if batch.finished { "finished" } else { "uploading" }, "job":job_id.map(|id|jobs.job(&id)).transpose()?.flatten()}),
+    )
 }
 
 fn staging(destination: &FsPath, batch: &str, file: &str) -> std::path::PathBuf {
@@ -1365,8 +1507,17 @@ mod tests {
         let mut batch = prepare(
             &state.jobs,
             "lib",
-            structure_input(state.jobs.root(), &["photo.jpg"], false),
+            structure_input(
+                state.jobs.root(),
+                &["photo.jpg", "photo.CR3", "photo.jpg.xmp", "second.jpg"],
+                false,
+            ),
         )?;
+        let pending = pipeline_status(&state, "lib", &batch.id)?;
+        assert_eq!(pending["indexedFiles"], 0);
+        assert_eq!(pending["indexTotal"], 2);
+        assert_eq!(pending["thumbnailTotal"], 2);
+        assert_eq!(pending["thumbnailCompleted"], 0);
         batch.finished = true;
         save(&state.jobs.db.lock().unwrap(), "lib", &batch)?;
         assert_eq!(
@@ -1377,6 +1528,24 @@ mod tests {
         state.store.lock()?.execute(
             "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','jpeg_original')",
             [state.jobs.root().join("photo.jpg").to_str().unwrap()],
+        )?;
+        assert_eq!(
+            pipeline_status(&state, "lib", &batch.id)?["indexedFiles"],
+            0
+        );
+        state.store.lock()?.execute(
+            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','raw_original')",
+            [state.jobs.root().join("photo.CR3").to_str().unwrap()],
+        )?;
+        let first = pipeline_status(&state, "lib", &batch.id)?;
+        assert_eq!(first["indexedFiles"], 1);
+        assert_eq!(first["indexTotal"], 2);
+        assert_eq!(first["thumbnailTotal"], 2);
+        assert_eq!(first["thumbnailCompleted"], 0);
+        state.store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','second','{}','hash2','fp2','2024-01-01','second.jpg',0,'none',NULL,0)",[])?;
+        state.store.lock()?.execute(
+            "INSERT INTO catalog_paths VALUES('lib',?,'second','hash2','jpeg_original')",
+            [state.jobs.root().join("second.jpg").to_str().unwrap()],
         )?;
         state.store.reconcile_cache()?;
         assert_eq!(
@@ -1398,10 +1567,12 @@ mod tests {
                     .to_string(),
             ],
         )?;
-        assert_eq!(
-            pipeline_status(&state, "lib", &batch.id)?["status"],
-            "finished"
-        );
+        let complete = pipeline_status(&state, "lib", &batch.id)?;
+        assert_eq!(complete["status"], "finished");
+        assert_eq!(complete["indexedFiles"], 2);
+        assert_eq!(complete["indexTotal"], 2);
+        assert_eq!(complete["thumbnailCompleted"], 2);
+        assert_eq!(complete["thumbnailTotal"], 2);
         state.store.lock()?.execute("UPDATE media_cache SET browse_thumbnail=NULL,browse_attempts=4,browse_last_error='encoder failed'",[])?;
         let failed = pipeline_status(&state, "lib", &batch.id)?;
         assert_eq!(failed["status"], "failed");
@@ -1409,7 +1580,7 @@ mod tests {
         Ok(())
     }
     #[tokio::test]
-    async fn structure_finish_publishes_nested_files_and_enqueues_recursive_scan() {
+    async fn structure_finish_publishes_nested_files_and_enqueues_group_jobs() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("photos");
         std::fs::create_dir(&root).unwrap();
@@ -1514,7 +1685,7 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         worker.join().unwrap().unwrap();
         assert_eq!(result["completedFiles"], 3);
-        assert_eq!(result["job"]["scopeKind"], "recursive");
+        assert_eq!(result["job"]["scopeKind"], "file");
         for file in &batch.files {
             assert!(!staging(&root, &batch.id, &file.input.id).exists());
         }
@@ -1526,6 +1697,149 @@ mod tests {
         }
         let resumed = load(&state.jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
         assert!(resumed.finished && resumed.files.iter().all(|f| f.published));
+    }
+
+    #[test]
+    fn complete_groups_publish_before_batch_seal_and_resume_without_overwriting_uploads() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        let mut batch = prepare(
+            &jobs,
+            "lib",
+            structure_input(
+                jobs.root(),
+                &["first.CR3", "first.CR3.xmp", "second.CR3"],
+                false,
+            ),
+        )
+        .unwrap();
+        for file in &mut batch.files {
+            if file.input.relative_path == "first.CR3" {
+                std::fs::write(staging(jobs.root(), &batch.id, &file.input.id), b"original")
+                    .unwrap();
+                file.uploaded = true;
+            }
+        }
+        save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
+        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        assert!(!jobs.root().join("first.CR3").exists());
+        assert!(jobs.jobs(100).unwrap().is_empty());
+        for file in &mut batch.files {
+            if file.input.relative_path.ends_with("xmp") {
+                std::fs::write(staging(jobs.root(), &batch.id, &file.input.id), b"original")
+                    .unwrap();
+                file.uploaded = true;
+            }
+        }
+        save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
+        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        let published = load(&jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        assert!(!published.finished && !published.finish_requested);
+        assert_eq!(published.files.iter().filter(|f| f.published).count(), 2);
+        assert_eq!(published.group_jobs.len(), 1);
+        assert!(jobs.root().join("first.CR3.xmp").exists());
+        assert!(!jobs.root().join("second.CR3").exists());
+        assert!(
+            !group_pending_publication(&jobs, "lib", &[jobs.root().join("first.CR3")]).unwrap()
+        );
+        assert!(
+            group_pending_publication(&jobs, "lib", &[jobs.root().join("second.CR3")]).unwrap()
+        );
+        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        assert_eq!(jobs.jobs(100).unwrap().len(), 1);
+        // A publication snapshot must not erase a concurrent upload or seal.
+        let mut latest = published.clone();
+        latest.finish_requested = true;
+        let second = latest
+            .files
+            .iter_mut()
+            .find(|f| f.input.relative_path == "second.CR3")
+            .unwrap();
+        second.uploaded = true;
+        second.received_sha256 = Some("concurrent-upload".into());
+        save(&jobs.db.lock().unwrap(), "lib", &latest).unwrap();
+        let staged = jobs.root().join("synthetic-checkpoint");
+        std::fs::write(&staged, b"checkpoint").unwrap();
+        publish_checkpoint(
+            &jobs,
+            "lib",
+            &published,
+            &mut vec![(staged, jobs.root().to_owned())],
+        )
+        .unwrap();
+        let merged = load(&jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        assert!(merged.finish_requested);
+        assert!(
+            merged
+                .files
+                .iter()
+                .any(|f| f.received_sha256.as_deref() == Some("concurrent-upload"))
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_resume_requeues_failed_early_group_and_clears_publication_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir(&root).unwrap();
+        let keeps = dir.path().join("keeps");
+        let state = Arc::new(AppState {
+            store: Arc::new(
+                crate::store::Store::open(&keeps.join("db/control_plane.sqlite"), true).unwrap(),
+            ),
+            previews: Arc::new(
+                crate::previews::PreviewStorage::new(
+                    &keeps,
+                    Some(&root),
+                    "http://localhost",
+                    "test-preview-key-01234567890123456789",
+                )
+                .unwrap(),
+            ),
+            jobs: Arc::new(Jobs::open(&keeps.join("db/jobs.sqlite"), &root).unwrap()),
+            access_token: String::new(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        });
+        state.jobs.add_folder("lib", ".").unwrap();
+        let input = structure_input(state.jobs.root(), &["first.CR3", "second.CR3"], false);
+        let mut batch = prepare(&state.jobs, "lib", input.clone()).unwrap();
+        let first = batch
+            .files
+            .iter_mut()
+            .find(|f| f.input.relative_path == "first.CR3")
+            .unwrap();
+        std::fs::write(staging(&root, &batch.id, &first.input.id), b"original").unwrap();
+        first.uploaded = true;
+        save(&state.jobs.db.lock().unwrap(), "lib", &batch).unwrap();
+        finish_batch(&state.jobs, "lib", &batch.id, None).unwrap();
+        let mut batch = load(&state.jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        let old_job = batch.group_jobs.values().next().unwrap().clone();
+        state.jobs.db.lock().unwrap().execute("UPDATE jobs SET status='failed',failed=1,error='synthetic index failure' WHERE id=?",[&old_job]).unwrap();
+        assert_eq!(
+            pipeline_status(&state, "lib", &batch.id).unwrap()["status"],
+            "failed"
+        );
+        batch.finish_error = Some("synthetic publication failure".into());
+        save(&state.jobs.db.lock().unwrap(), "lib", &batch).unwrap();
+        let _ = prepare_handler(
+            State(state.clone()),
+            Path("lib".into()),
+            Json(serde_json::to_value(input).unwrap()),
+        )
+        .await
+        .ok()
+        .unwrap();
+        let resumed = load(&state.jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        assert!(resumed.finish_error.is_none());
+        assert!(!resumed.finished);
+        assert_ne!(resumed.group_jobs.values().next().unwrap(), &old_job);
+        assert_eq!(
+            pipeline_status(&state, "lib", &batch.id).unwrap()["status"],
+            "uploading"
+        );
+        assert_eq!(resumed.files.iter().filter(|f| f.uploaded).count(), 1);
     }
 
     #[test]
@@ -1602,7 +1916,7 @@ mod tests {
         );
         let repeated = finish_batch(&jobs, "lib", &batch.id, None).unwrap();
         assert_eq!(result["job"]["id"], repeated["job"]["id"]);
-        assert_eq!(jobs.jobs(100).unwrap().len(), 1);
+        assert_eq!(jobs.jobs(1000).unwrap().len(), 256);
         assert!(
             batch
                 .files
