@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct AIEditingWorkspaceView: View {
@@ -326,7 +327,7 @@ private struct AIEditingPhotoRow: View {
                     }
                 }.frame(maxHeight: .infinity)
                 Text("你的调整要求").font(.headline)
-                TextEditor(text: $instruction).frame(height: 110)
+                RefinementInstructionEditor(text: $instruction).frame(height: 110)
                 HStack {
                     Spacer()
                     Button("取消") { showsRefinement = false }.keyboardShortcut(.cancelAction)
@@ -461,6 +462,60 @@ struct AIEditingComparisonLayout: Layout {
         for (index, subview) in subviews.enumerated() {
             subview.place(at: CGPoint(x: start + CGFloat(index) * (size.width + spacing), y: bounds.minY),
                           anchor: .topLeading, proposal: ProposedViewSize(size))
+        }
+    }
+}
+
+private struct RefinementInstructionEditor: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    func makeNSView(context: Context) -> NSTextView {
+        let view = NSTextView()
+        view.delegate = context.coordinator
+        view.isRichText = false
+        view.font = .systemFont(ofSize: NSFont.systemFontSize)
+        view.backgroundColor = .textBackgroundColor
+        view.textContainerInset = NSSize(width: 5, height: 4)
+        view.isVerticallyResizable = false
+        view.isHorizontallyResizable = false
+        view.textContainer?.widthTracksTextView = true
+        view.textContainer?.heightTracksTextView = true
+        view.string = text
+        return view
+    }
+
+    func updateNSView(_ view: NSTextView, context: Context) {
+        context.coordinator.text = $text
+        if view.string != text { view.string = text }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) { self.text = text }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn range: NSRange, replacementString: String?) -> Bool {
+            guard let replacementString else { return true }
+            if replacementString.isEmpty { return true }
+            let candidate = (textView.string as NSString).replacingCharacters(in: range, with: replacementString)
+            guard let container = textView.textContainer, let font = textView.font else { return false }
+            let storage = NSTextStorage(string: candidate + "\u{200B}", attributes: [.font: font])
+            let layout = NSLayoutManager()
+            let measuredContainer = NSTextContainer(size: NSSize(
+                width: container.containerSize.width, height: .greatestFiniteMagnitude
+            ))
+            measuredContainer.lineFragmentPadding = container.lineFragmentPadding
+            storage.addLayoutManager(layout)
+            layout.addTextContainer(measuredContainer)
+            layout.ensureLayout(for: measuredContainer)
+            return layout.usedRect(for: measuredContainer).height <= textView.bounds.height - 2 * textView.textContainerInset.height
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard let view = notification.object as? NSTextView else { return }
+            text.wrappedValue = view.string
         }
     }
 }
