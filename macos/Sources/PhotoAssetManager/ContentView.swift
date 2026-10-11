@@ -255,6 +255,17 @@ struct ContentView: View {
         Group {
             if detailMode, let asset = library.selectedAsset {
                 RemotePreview(asset: asset, loadStandard: true).padding(24)
+                    .overlay(alignment: .topLeading) {
+                        if asset.flagState == "rejected" {
+                            Label("已弃用", systemImage: "xmark.circle.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(WorkspaceStyle.text)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(WorkspaceStyle.panel, in: RoundedRectangle(cornerRadius: 6))
+                                .padding(24)
+                                .allowsHitTesting(false)
+                        }
+                    }
             } else {
                 GeometryReader { geometry in
                     let rows = JustifiedAssetGridLayout.rows(
@@ -423,12 +434,21 @@ struct ContentView: View {
                     Button { library.updateSelected(KeepsAssetPatch(flagState: library.selectedAsset?.flagState == "picked" ? "unflagged" : "picked")) } label: {
                         Image(systemName: "flag.fill").foregroundStyle(library.selectedAsset?.flagState == "picked" ? WorkspaceStyle.text : Color(white: 0.4))
                     }.buttonStyle(.plain).help("留用")
+                    Button { library.updateSelected(KeepsAssetPatch(flagState: library.selectedAsset?.flagState == "rejected" ? "unflagged" : "rejected")) } label: {
+                        Label("弃用", systemImage: library.selectedAsset?.flagState == "rejected" ? "xmark.circle.fill" : "xmark.circle")
+                            .foregroundStyle(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.text : Color(white: 0.4))
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.field : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain)
+                        .help(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
+                        .accessibilityLabel(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
+                        .accessibilityAddTraits(library.selectedAsset?.flagState == "rejected" ? [.isSelected] : [])
                 }.disabled(library.isMutating || library.isSelectingAll)
             }
             Group {
                 if library.isLoading && !library.hasLoadedResults { Text("正在读取…") }
                 else if library.configuration != nil && library.lastError == nil {
-                    Text(library.selectedIDs.isEmpty ? "\(library.assets.count) / \(library.total) 张" : "已选 \(library.selectedIDs.count) 张").foregroundStyle(.secondary)
+                    Text(selectionSummary).foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 4)
@@ -440,6 +460,15 @@ struct ContentView: View {
                     .accessibilityLabel("缩略图大小")
             }
         }.font(.system(size: 11)).padding(.horizontal, 20).frame(height: 46).background(WorkspaceStyle.panel)
+    }
+
+    private var selectionSummary: String {
+        if detailMode, let selected = library.selectedAsset,
+           library.selectedIDs.count == 1,
+           let index = library.assets.firstIndex(where: { $0.id == selected.id }) {
+            return "第 \(index + 1) / \(max(library.total, library.assets.count)) 张"
+        }
+        return library.selectedIDs.isEmpty ? "\(library.assets.count) / \(library.total) 张" : "已选 \(library.selectedIDs.count) 张"
     }
 
     private var inspector: some View {
