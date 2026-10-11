@@ -532,22 +532,25 @@ mod tests {
         let worker_jobs = jobs.clone();
         let worker_stop = stop.clone();
         let store = Arc::new(Store::open(&dir.path().join("catalog.sqlite"), true).unwrap());
-        let handle = std::thread::spawn(move || run(worker_jobs, store, worker_stop, None));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let handle =
+            std::thread::spawn(move || run(worker_jobs, store, worker_stop, Some(ready_tx)));
+        ready_rx.blocking_recv().unwrap();
+        assert!(jobs.jobs(10).unwrap().is_empty());
+        let new_file = root.join("new.jpg");
+        std::fs::write(&new_file, b"sample").unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while jobs.claim_next().unwrap().is_none() {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let first = jobs.jobs(1).unwrap().remove(0);
-        jobs.finish(&first.id, None).unwrap();
-        std::fs::write(root.join("new.jpg"), b"sample").unwrap();
-        while jobs
+        while !jobs
             .jobs(10)
             .unwrap()
             .iter()
-            .all(|job| job.status == "completed")
+            .any(|job| job.scope_kind == "file" && job.path == new_file.to_str().unwrap())
         {
-            assert!(Instant::now() < deadline);
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Relaxed);
+                handle.join().unwrap().unwrap();
+                panic!("watcher did not receive the new file event");
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
         stop.store(true, Ordering::Relaxed);
