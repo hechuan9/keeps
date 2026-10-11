@@ -22,7 +22,7 @@ struct PendingDirectoryMove: Codable {
     }
 
     func canRenameDirectory(_ path: String) -> Bool {
-        client != nil && !isDirectoryOperationBlocking && !isMutating &&
+        client != nil && !isOperationBlocking && !isMutating &&
         !isUpdatingHiddenDirectory && !isCheckingConnection && path.hasPrefix("/") &&
         path != "/" && !directories.contains { $0.path == path }
     }

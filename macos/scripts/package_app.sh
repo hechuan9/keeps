@@ -26,6 +26,7 @@ BUILD_NUMBER="$(awk '$1 == "CURRENT_PROJECT_VERSION" { print $3 }' "$ROOT_DIR/Ve
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/Sources/PhotoAssetManager/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+bash "$ROOT_DIR/scripts/bundle_ai_runtime.sh" "$RESOURCES_DIR"
 
 # SwiftPM signs the executable alone; the assembled application needs a bundle signature.
 codesign --force --sign - "$APP_DIR" >&2

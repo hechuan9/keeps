@@ -36,9 +36,9 @@ import KeepsAPI
         let restored = makeStore(host: fixture.host, preferences: fixture.preferences)
         #expect(restored.photoMoveFinished)
         #expect(restored.photoMoveTracking == nil)
-        #expect(restored.isDirectoryOperationBlocking)
+        #expect(restored.isOperationBlocking)
         restored.acknowledgePhotoMoveFailure()
-        #expect(!restored.isDirectoryOperationBlocking)
+        #expect(!restored.isOperationBlocking)
     }
 
     @Test func timeoutPollsSameTaskWithoutResubmission() async throws {

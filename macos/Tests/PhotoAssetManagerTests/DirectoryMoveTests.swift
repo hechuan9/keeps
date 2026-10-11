@@ -130,6 +130,36 @@ import KeepsAPI
         #expect(store.query.directory == "/photos/destination")
     }
 
+    @Test func restoredDirectorySelectionWaitsForLazyTreeLoading() async throws {
+        _ = NSApplication.shared
+        let (store, _) = makeStore()
+        store.showLibrary(directory: "/photos/source/child")
+        store.setDirectoryExpanded("/photos", expanded: true)
+        store.setDirectoryExpanded("/photos/source", expanded: true)
+        let outline = DirectoryOutlineView.DirectoryOutline()
+        let column = NSTableColumn(identifier: .init("directory"))
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+        let coordinator = DirectoryOutlineView.Coordinator(library: store)
+        coordinator.outline = outline
+        outline.dataSource = coordinator
+        outline.delegate = coordinator
+        coordinator.update()
+        #expect(outline.selectedRow == -1)
+        store.refreshNavigation()
+        try await waitUntil { !store.isLoadingNavigation && store.loadingDirectories.isEmpty }
+        coordinator.update()
+        #expect(outline.selectedRow >= 0)
+        #expect(store.query.directory == "/photos/source/child")
+        store.resetNavigation()
+        coordinator.update()
+        store.refreshNavigation()
+        try await waitUntil { !store.isLoadingNavigation && store.loadingDirectories.isEmpty }
+        coordinator.update()
+        #expect(outline.selectedRow >= 0)
+        #expect(store.expandedPaths.contains("/photos/source"))
+    }
+
     @Test func directoryRangeSelectionSurvivesRefreshAndControlASelectsVisibleRows() async throws {
         _ = NSApplication.shared
         let (store, _) = makeStore()
@@ -170,7 +200,7 @@ import KeepsAPI
         let move = Task { await store.moveDirectory("/photos/source", to: "/photos/destination") }
         try await waitUntil { state.hasPendingMove }
         #expect(store.isMovingDirectory)
-        #expect(store.isDirectoryOperationBlocking)
+        #expect(store.isOperationBlocking)
         #expect(!store.canMoveDirectory("/photos/another", to: "/photos/destination"))
         await store.moveDirectory("/photos/another", to: "/photos/destination")
         let changed = await store.checkConnection(baseURL: "https://another.invalid", libraryID: "other", accessCredential: "", save: true)
@@ -181,7 +211,7 @@ import KeepsAPI
         await move.value
         try await waitUntil { !store.isLoading && !store.isLoadingNavigation }
         #expect(!store.isMovingDirectory)
-        #expect(!store.isDirectoryOperationBlocking)
+        #expect(!store.isOperationBlocking)
     }
 
     @Test func dropUsesWholeRowAndHighlightsOnlyName() async throws {

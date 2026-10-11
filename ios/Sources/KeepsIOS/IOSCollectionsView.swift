@@ -96,7 +96,7 @@ private struct IOSDirectoryRows: View {
                             Image(systemName: "folder").foregroundStyle(.secondary)
                             Text(directory.name).lineLimit(2)
                             Spacer(minLength: 8)
-                            Text(directory.photoCount.formatted()).foregroundStyle(.secondary).monospacedDigit()
+                            Text(directory.photoCountLabel).foregroundStyle(.secondary).monospacedDigit()
                             if menu { Image(systemName: "chevron.right").font(.caption).foregroundStyle(.secondary) }
                         }.frame(minHeight: 44).contentShape(Rectangle())
                     }

@@ -92,6 +92,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(versions),
         )
         .route(
+            "/libraries/{library}/assets/{asset}/versions/{hash}/download",
+            get(version_download),
+        )
+        .route(
             "/libraries/{library}/assets/{asset}/version-candidates",
             get(version_candidates),
         )
@@ -557,8 +561,9 @@ async fn navigation(
                 })
                 .collect();
             let counts = state.store.directory_photo_counts(&library, &paths)?;
-            for (directory, count) in directories.iter_mut().zip(counts) {
-                directory["photoCount"] = json!(count);
+            for (directory, (direct, recursive)) in directories.iter_mut().zip(counts) {
+                directory["directPhotoCount"] = json!(direct);
+                directory["photoCount"] = json!(recursive);
             }
             Ok(result)
         })
@@ -790,6 +795,91 @@ async fn versions(
 ) -> ApiResult {
     let id = asset_id(&id)?;
     Ok(Json(blocking(move || state.store.versions(&library, &id)).await?).into_response())
+}
+async fn version_download(
+    State(state): State<Arc<AppState>>,
+    Path((library, id, hash)): Path<(String, String, String)>,
+) -> ApiResult {
+    require_library(&state, &library)?;
+    let id = asset_id(&id)?;
+    if hash.len() != 64
+        || !hash
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(resource_error(400, "invalid content hash").into());
+    }
+    let file = blocking(move || {
+        let versions = state.store.versions(&library, &id)?;
+        let version = versions["items"]
+            .as_array()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|v| v["contentHash"] == hash && v["available"] == true)
+            })
+            .ok_or_else(|| resource_error(404, "version not available for this asset"))?;
+        let folders = state.jobs.folders()?;
+        for location in version["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["available"] == true)
+        {
+            let Some(raw_path) = location["path"].as_str() else {
+                continue;
+            };
+            let path = std::path::Path::new(raw_path);
+            let Some(folder) = folders
+                .iter()
+                .find(|f| f.active && f.library_id == library && path.starts_with(&f.path))
+            else {
+                continue;
+            };
+            let Some(record) = state.jobs.file_state(&folder.id, raw_path)? else {
+                continue;
+            };
+            if record.asset_id != id || record.version != hash || record.error.is_some() {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(path) else {
+                continue;
+            };
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(resource_error(409, "version source is not a regular file"));
+            }
+            state.jobs.validate_path(
+                path.parent()
+                    .ok_or_else(|| resource_error(409, "missing source parent"))?,
+            )?;
+            let file = std::fs::File::open(path)?;
+            let metadata = file.metadata()?;
+            let modified = metadata
+                .modified()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            if metadata.len() != record.size as u64 || modified != record.mtime_ns as u128 {
+                return Err(resource_error(
+                    409,
+                    "version source changed; refresh inventory",
+                ));
+            }
+            return Ok(file);
+        }
+        Err(resource_error(404, "tracked version source unavailable"))
+    })
+    .await?;
+    let file = tokio::fs::File::from_std(file);
+    let length = file.metadata().await.map_err(anyhow::Error::from)?.len();
+    let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+        ],
+        body,
+    )
+        .into_response())
 }
 async fn version_candidates(
     State(state): State<Arc<AppState>>,

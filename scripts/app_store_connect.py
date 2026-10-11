@@ -39,11 +39,14 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def build_status(platform):
-    query = urllib.parse.urlencode({
+def build_status(platform, build=None):
+    filters = {
         "filter[app]": APP_IDS[platform], "sort": "-uploadedDate", "limit": "1",
         "include": "buildBetaDetail,preReleaseVersion,betaGroups",
-    })
+    }
+    if build is not None:
+        filters["filter[version]"] = str(build)
+    query = urllib.parse.urlencode(filters)
     request = urllib.request.Request(
         API + "/v1/builds?" + query,
         headers={"Authorization": "Bearer " + make_token(), "Accept": "application/json"},
@@ -74,13 +77,43 @@ def build_status(platform):
     return {"platform": platform, "appID": APP_IDS[platform], "builds": builds}
 
 
+def wait_for_build(platform, build, version, timeout=1800):
+    deadline = time.monotonic() + timeout
+    while True:
+        result = build_status(platform, build)
+        for item in result["builds"]:
+            if item["version"] != str(build):
+                continue
+            release = item.get("preReleaseVersion") or {}
+            if release.get("version") != version:
+                raise RuntimeError("上传构建的营销版本与预期不一致。")
+            state = item.get("processingState")
+            print(json.dumps({"version": version, "build": build, "processingState": state},
+                             ensure_ascii=False), flush=True)
+            if state in ("FAILED", "INVALID"):
+                raise RuntimeError(f"Apple 构建处理失败：{state}")
+            detail = item.get("buildBetaDetail") or {}
+            if state == "VALID" and detail.get("internalBuildState") == "IN_BETA_TESTING":
+                return result
+        if time.monotonic() >= deadline:
+            raise RuntimeError("安装包已上传，但尚未确认目标构建可用于内部测试；请检查 App Store Connect。")
+        time.sleep(min(30, max(0, deadline - time.monotonic())))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("platform", choices=APP_IDS)
-    parser.add_argument("action", choices=["status"])
+    parser.add_argument("action", choices=["status", "wait"])
+    parser.add_argument("--build")
+    parser.add_argument("--version")
+    parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
+    if args.action == "wait" and (not args.build or not args.version or args.timeout <= 0):
+        parser.error("wait 必须提供 --build、--version 及正数 --timeout。")
     try:
-        print(json.dumps(build_status(args.platform), ensure_ascii=False, indent=2))
+        result = (wait_for_build(args.platform, args.build, args.version, args.timeout)
+                  if args.action == "wait" else build_status(args.platform, args.build))
+        print(json.dumps(result, ensure_ascii=False, indent=2))
     except (ValueError, RuntimeError) as error:
         print(str(error), file=sys.stderr)
         return 1

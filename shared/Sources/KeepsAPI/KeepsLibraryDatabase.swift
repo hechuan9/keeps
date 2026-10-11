@@ -12,6 +12,7 @@ public struct KeepsTimelineEntry: Identifiable, Equatable, Sendable {
     public var preview: KeepsPreview?
     public var standard: KeepsPreview?
     public var gridPreview: KeepsPreview? { thumbnail ?? preview }
+    public var isVideo: Bool { ["mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts"].contains(URL(fileURLWithPath: filename).pathExtension.lowercased()) }
 
     public init(id: UUID, date: String, thumbnail: KeepsPreview?, preview: KeepsPreview?, flagState: String, filename: String, browseThumbnail: KeepsPreview? = nil, standard: KeepsPreview? = nil) {
         self.id = id

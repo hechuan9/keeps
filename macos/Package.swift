@@ -6,7 +6,7 @@ let package = Package(
     products: [.executable(name: "PhotoAssetManager", targets: ["PhotoAssetManager"])],
     dependencies: [.package(path: "../shared")],
     targets: [
-        .executableTarget(name: "PhotoAssetManager", dependencies: [.product(name: "KeepsAPI", package: "shared")], exclude: ["Resources"]),
+        .executableTarget(name: "PhotoAssetManager", dependencies: [.product(name: "KeepsAPI", package: "shared")], exclude: ["Resources"], linkerSettings: [.linkedLibrary("sqlite3")]),
         .testTarget(name: "PhotoAssetManagerTests", dependencies: ["PhotoAssetManager", .product(name: "KeepsAPI", package: "shared")])
     ]
 )

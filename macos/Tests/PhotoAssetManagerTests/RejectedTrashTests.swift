@@ -50,6 +50,22 @@ import KeepsAPI
         #expect(RejectedProtocol.count("zero.invalidPOST") == 0)
     }
 
+    @Test func aiAndImportOperationsBlockRecyclingConfirmation() async {
+        let store = store("conflicts.invalid", preferences: UserDefaults(suiteName: UUID().uuidString)!)
+        await store.previewRejectedTrash()
+        #expect(store.canConfirmRejectedTrash("2"))
+        store.isAIEditingBlocking = true
+        #expect(!store.canConfirmRejectedTrash("2"))
+        store.isAIEditingBlocking = false
+        store.isAISettingsBusy = true
+        #expect(!store.canConfirmRejectedTrash("2"))
+        store.isAISettingsBusy = false
+        store.openImportWindows = [UUID()]
+        #expect(!store.canConfirmRejectedTrash("2"))
+        await store.submitRejectedTrash(confirmation: "2")
+        #expect(RejectedProtocol.count("conflicts.invalidPOST") == 0)
+    }
+
     @Test func changedManifestRequiresFreshConfirmation() async {
         let store = store("changed.invalid", preferences: UserDefaults(suiteName: UUID().uuidString)!)
         await store.previewRejectedTrash()

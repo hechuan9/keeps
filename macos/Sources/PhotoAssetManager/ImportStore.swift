@@ -10,7 +10,7 @@ final class ImportStore: ObservableObject {
     @Published var deduplicate = false
     @Published private(set) var skippedFiles = 0
     @Published private(set) var source: URL?
-    @Published private(set) var isBusy = false
+    @Published private(set) var isBusy = false { didSet { onActivity?(isBusy) } }
     @Published private(set) var message = "选择来源文件夹和 NAS 目标文件夹。"
     @Published private(set) var errorMessage: String?
     @Published private(set) var completedFiles = 0
@@ -30,6 +30,7 @@ final class ImportStore: ObservableObject {
     @Published private(set) var thumbnailTotal = 0
     @Published private(set) var thumbnailCompleted = 0
     var onCompletion: (() -> Void)?
+    var onActivity: ((Bool) -> Void)?
     private var workerID = UUID().uuidString
     private var bookmark: Data?
     private var mediaTask: KeepsWorkerTask?
@@ -340,7 +341,7 @@ final class ImportTaskOwner: ObservableObject {
     @Published var store: ImportStore?
     private var stores: [ImportStore] = []
 
-    func configure(_ client: KeepsClient?, completed: @escaping () -> Void) {
+    func configure(_ client: KeepsClient?, activity: ((Bool) -> Void)? = nil, completed: @escaping () -> Void) {
         guard let client else { store = nil; return }
         let current: ImportStore
         if let existing = stores.first(where: { $0.client.configuration == client.configuration }) { current = existing }
@@ -350,6 +351,7 @@ final class ImportTaskOwner: ObservableObject {
         }
         store = current
         current.onCompletion = completed
+        if let activity { current.onActivity = activity; activity(current.isBusy) }
         if let manifest = current.manifest, current.job == nil, !current.isBusy, current.errorMessage == nil {
             current.start(targetPath: manifest.targetPath)
         }

@@ -272,10 +272,14 @@ fn recycle_plan(
     library: &str,
     task: &Task,
     plan: &Plan,
-    inflight: bool,
     config: &str,
     mut recycle: impl FnMut(&SharedFolder, &Path) -> Result<()>,
 ) -> Result<()> {
+    let inflight: bool = jobs.trash_db.lock().unwrap().query_row(
+        "SELECT inflight FROM rejected_trash_tasks WHERE id=?1",
+        [&task.id],
+        |r| r.get(0),
+    )?;
     let mut next = task.completed_files;
     if inflight {
         let file = plan.files.get(next).context("回收任务进度无效")?;
@@ -334,7 +338,7 @@ fn process(
     recycle: impl FnMut(&SharedFolder, &Path) -> Result<()>,
 ) -> Result<()> {
     let _guard = jobs.directory_mutation.write().unwrap();
-    let (task, plan, inflight) = load(jobs, library, id)?;
+    let (task, plan, _) = load(jobs, library, id)?;
     if task.phase == "reconciling" {
         reconcile(jobs, store, library, &plan)?;
         return transition(
@@ -370,16 +374,7 @@ fn process(
             |r| r.get(0),
         )?;
         ensure!(!importing, error(409, "请先完成正在进行的导入，再回收照片"));
-        recycle_plan(
-            jobs,
-            store,
-            library,
-            &task,
-            &plan,
-            inflight,
-            &config()?,
-            recycle,
-        )
+        recycle_plan(jobs, store, library, &task, &plan, &config()?, recycle)
     })();
     let message = work
         .err()

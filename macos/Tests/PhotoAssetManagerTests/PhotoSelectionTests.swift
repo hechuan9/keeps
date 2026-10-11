@@ -65,6 +65,44 @@ import KeepsAPI
         #expect(!store.isSelectingAll)
     }
 
+    @Test(arguments: [false, true]) func aiActivityBlocksSelectionNavigationAndMutations(settingsTest: Bool) async throws {
+        let store = try await loadedStore()
+        let originalID = store.assets[0].id
+        store.select(originalID)
+        store.isAIEditingBlocking = !settingsTest
+        store.isAISettingsBusy = settingsTest
+        store.pauseLibraryForDirectoryOperation()
+
+        store.select(store.assets[1].id)
+        store.selectAdjacent(1)
+        store.selectAll()
+        store.deselectAll()
+        store.showLibrary(directory: "/other")
+        store.updateSelected(KeepsAssetPatch(rating: 5))
+        store.refresh(force: true)
+        let connected = await store.checkConnection(baseURL: "https://all.invalid", libraryID: "new", accessCredential: "", save: true)
+
+        #expect(store.selectedIDs == [originalID])
+        #expect(store.query.directory == nil)
+        #expect(!store.isMutating)
+        #expect(!store.isLoading)
+        #expect(!connected)
+        #expect(store.configuration?.libraryID == "selection")
+        store.isAIEditingBlocking = false
+        store.isAISettingsBusy = false
+        store.select(store.assets[1].id)
+        #expect(store.selectedIDs == [store.assets[1].id])
+    }
+
+    @Test func finishingSettingsWorkDoesNotUnlockPhotoBatch() {
+        let store = LibraryStore(loadSavedSettings: false, preferences: UserDefaults(suiteName: UUID().uuidString)!)
+        store.isAIEditingBlocking = true
+        store.isAISettingsBusy = true
+        store.isAISettingsBusy = false
+        #expect(store.isOperationBlocking)
+        #expect(!store.isDirectoryOperationBlocking)
+    }
+
     private func loadedStore(paginated: Bool = false) async throws -> LibraryStore {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [SelectionProtocol.self]

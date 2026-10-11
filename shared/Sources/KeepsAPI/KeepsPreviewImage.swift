@@ -49,6 +49,13 @@ public struct KeepsPreviewImage: View {
                         .resizable().aspectRatio(contentMode: contentMode)
                         .frame(width: geometry.size.width, height: geometry.size.height).clipped()
                 }
+                if asset.isVideo {
+                    Image(systemName: "play.circle.fill")
+                        .font(.system(size: min(44, max(24, geometry.size.height * 0.3))))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.8), radius: 4)
+                        .accessibilityHidden(true)
+                }
             }
             .transaction { $0.animation = nil }
             .overlay(alignment: .bottom) {

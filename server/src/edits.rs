@@ -33,7 +33,7 @@ pub(crate) fn migrate(db: &Connection) -> Result<()> {
 ALTER TABLE catalog_assets ADD COLUMN edit_revision INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE catalog_assets ADD COLUMN negative_selected INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE catalog_assets ADD COLUMN last_edit_request TEXT;
-CREATE TABLE photo_edits(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,negative_hash TEXT NOT NULL,exposure_ev REAL NOT NULL,algorithm_version TEXT NOT NULL,renderer_version TEXT NOT NULL,standard TEXT NOT NULL,thumbnail TEXT NOT NULL,browse TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));
+CREATE TABLE photo_edits(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,negative_hash TEXT NOT NULL,exposure_ev REAL,algorithm_version TEXT NOT NULL,renderer_version TEXT NOT NULL,standard TEXT NOT NULL,thumbnail TEXT NOT NULL,browse TEXT NOT NULL,recipe TEXT,PRIMARY KEY(library_id,asset_id));
 CREATE TABLE photo_edit_requests(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,request_id TEXT NOT NULL,payload TEXT NOT NULL,response TEXT NOT NULL,PRIMARY KEY(library_id,asset_id,request_id));")?;
     let pairs = db
         .prepare("SELECT library_id,id FROM catalog_assets")?
@@ -42,6 +42,24 @@ CREATE TABLE photo_edit_requests(library_id TEXT NOT NULL,asset_id TEXT NOT NULL
     for (lib, id) in pairs {
         choose(db, &lib, &id)?;
     }
+    Ok(())
+}
+pub(crate) fn migrate_recipe(db: &Connection) -> Result<()> {
+    let columns = db
+        .prepare("PRAGMA table_info(photo_edits)")?
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, bool>(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_recipe = columns.iter().any(|(name, _)| name == "recipe");
+    let nullable_exposure = columns
+        .iter()
+        .any(|(name, required)| name == "exposure_ev" && !required);
+    if has_recipe && nullable_exposure {
+        return Ok(());
+    }
+    db.execute_batch("ALTER TABLE photo_edits RENAME TO photo_edits_upgrade;
+CREATE TABLE photo_edits(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,negative_hash TEXT NOT NULL,exposure_ev REAL,algorithm_version TEXT NOT NULL,renderer_version TEXT NOT NULL,standard TEXT NOT NULL,thumbnail TEXT NOT NULL,browse TEXT NOT NULL,recipe TEXT,PRIMARY KEY(library_id,asset_id));")?;
+    let recipe = if has_recipe { "recipe" } else { "NULL" };
+    db.execute_batch(&format!("INSERT INTO photo_edits SELECT library_id,asset_id,negative_hash,exposure_ev,algorithm_version,renderer_version,standard,thumbnail,browse,{recipe} FROM photo_edits_upgrade; DROP TABLE photo_edits_upgrade;"))?;
     Ok(())
 }
 pub(crate) fn choose(db: &Connection, lib: &str, id: &str) -> Result<()> {
@@ -97,9 +115,35 @@ fn source(db: &Connection, lib: &str, id: &str, hash: &str) -> Result<PathBuf> {
         .find(|p| p.is_file() && !crate::media::is_video(p))
         .ok_or_else(|| error(409, "底片不存在或不可用，请重新选择底片"))
 }
+type EditStateRow = (Option<String>, i64, Option<String>, Option<f64>);
+type MediaSnapshotRow = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 fn state(db: &Connection, lib: &str, id: &str) -> Result<Value> {
-    let row:Option<(Option<String>,i64,Option<String>,Option<f64>)>=db.query_row("SELECT a.negative_hash,a.edit_revision,a.last_edit_request,e.exposure_ev FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id WHERE a.library_id=? AND a.id=?",params![lib,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+    let row:Option<EditStateRow>=db.query_row("SELECT a.negative_hash,a.edit_revision,a.last_edit_request,e.exposure_ev FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id WHERE a.library_id=? AND a.id=?",params![lib,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let (hash, revision, last, ev) = row.ok_or_else(|| error(404, "照片不存在"))?;
+    let recipe: Option<String> = db
+        .query_row(
+            "SELECT recipe FROM photo_edits WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let recipe = recipe
+        .map(|r| serde_json::from_str::<Value>(&r))
+        .transpose()?;
+    let decision: Option<String> = db
+        .query_row(
+            "SELECT metadata FROM photo_edit_decisions WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| r.get(0),
+        )
+        .optional()?;
     let path = match hash.as_deref().map(|h| source(db, lib, id, h)).transpose() {
         Ok(path) => path,
         Err(e)
@@ -111,7 +155,7 @@ fn state(db: &Connection, lib: &str, id: &str) -> Result<Value> {
         Err(e) => return Err(e),
     };
     Ok(
-        json!({"negativeContentHash":hash,"revision":revision,"lastRequestID":last,"hasEdit":ev.is_some(),"exposureEV":ev,"sourceAvailable":path.is_some(),"sourceFilename":path.as_ref().and_then(|p|p.file_name()).and_then(|v|v.to_str()),"sourceSizeBytes":path.as_ref().map(std::fs::metadata).transpose()?.map(|m|m.len()),"sourceFileHash":hash}),
+        json!({"decisionMetadata":decision,"negativeContentHash":hash,"revision":revision,"lastRequestID":last,"hasEdit":ev.is_some() || recipe.is_some(),"recipe":recipe,"exposureEV":ev,"sourceAvailable":path.is_some(),"sourceFilename":path.as_ref().and_then(|p|p.file_name()).and_then(|v|v.to_str()),"sourceSizeBytes":path.as_ref().map(std::fs::metadata).transpose()?.map(|m|m.len()),"sourceFileHash":hash}),
     )
 }
 impl Store {
@@ -130,7 +174,7 @@ impl Store {
     }
     pub fn media_snapshot(&self, lib: &str, id: &str) -> Result<Value> {
         let db = self.read()?;
-        let row:Option<(Option<String>,Option<String>,Option<String>,Option<String>)>=db.query_row("SELECT coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?4 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?3 WHERE a.library_id=?1 AND a.id=?2",params![lib,id,crate::cache_pipeline::spec()?,crate::browse_cache::SPEC],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
+        let row:Option<MediaSnapshotRow>=db.query_row("SELECT coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?4 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?3 WHERE a.library_id=?1 AND a.id=?2",params![lib,id,crate::cache_pipeline::spec()?,crate::browse_cache::SPEC],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         let Some((thumb, standard, browse, negative)) = row else {
             return Ok(Value::Null);
         };
@@ -230,6 +274,39 @@ fn validate_outputs(
     }
     Ok(descriptors)
 }
+fn validate_recipe(value: &Value) -> Result<Option<String>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    if value["engine"] != "darktable" || value["engineVersion"] != "5.6.2" {
+        return Err(error(422, "unsupported recipe engine or version"));
+    }
+    let json = value["recipeJSON"]
+        .as_str()
+        .filter(|s| s.len() <= 12 * 1024 * 1024)
+        .ok_or_else(|| error(422, "recipeJSON required (maximum 12 MiB)"))?;
+    if !serde_json::from_str::<Value>(json).is_ok_and(|v| v.is_object()) {
+        return Err(error(422, "recipeJSON must encode an object"));
+    }
+    let xmp = value["xmp"]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 1024 * 1024)
+        .ok_or_else(|| error(422, "xmp required (maximum 1 MiB)"))?;
+    if !xmp.contains("darktable:xmp_version") {
+        return Err(error(422, "darktable XMP required"));
+    }
+    if !value["metadata"].is_null() {
+        let metadata = value["metadata"]
+            .as_str()
+            .filter(|s| s.len() <= 256 * 1024)
+            .ok_or_else(|| error(422, "metadata must be JSON text (maximum 256 KiB)"))?;
+        if !serde_json::from_str::<Value>(metadata).is_ok_and(|v| v.is_object()) {
+            return Err(error(422, "metadata must encode an object"));
+        }
+    }
+    Ok(Some(value.to_string()))
+}
+
 fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<Value> {
     let _directory_guard = s.jobs.directory_mutation.read().unwrap();
     let (request, revision) = validate_request(&v)?;
@@ -315,10 +392,20 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
         }
         s.jobs
             .validate_path(path.parent().context("source parent")?)?;
-        let ev = v["exposureEV"]
-            .as_f64()
-            .filter(|e| e.is_finite() && (-2.0..=2.0).contains(e))
-            .ok_or_else(|| error(422, "exposureEV outside -2...2"))?;
+        let recipe = validate_recipe(&v["recipe"])?;
+        let ev = if recipe.is_some() {
+            if !v["exposureEV"].is_null() {
+                return Err(error(422, "recipe and exposureEV are mutually exclusive"));
+            }
+            None
+        } else {
+            Some(
+                v["exposureEV"]
+                    .as_f64()
+                    .filter(|e| e.is_finite() && (-2.0..=2.0).contains(e))
+                    .ok_or_else(|| error(422, "exposureEV outside -2...2"))?,
+            )
+        };
         let algorithm = v["algorithmVersion"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() < 128)
@@ -327,7 +414,7 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
             .as_str()
             .filter(|s| !s.is_empty() && s.len() < 128)
             .context("rendererVersion required")?;
-        tx.execute("INSERT INTO photo_edits VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,asset_id) DO UPDATE SET negative_hash=excluded.negative_hash,exposure_ev=excluded.exposure_ev,algorithm_version=excluded.algorithm_version,renderer_version=excluded.renderer_version,standard=excluded.standard,thumbnail=excluded.thumbnail,browse=excluded.browse",params![lib,id,hash,ev,algorithm,renderer,descriptors[0].to_string(),descriptors[1].to_string(),descriptors[2].to_string()])?;
+        tx.execute("INSERT INTO photo_edits VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,asset_id) DO UPDATE SET negative_hash=excluded.negative_hash,exposure_ev=excluded.exposure_ev,algorithm_version=excluded.algorithm_version,renderer_version=excluded.renderer_version,standard=excluded.standard,thumbnail=excluded.thumbnail,browse=excluded.browse,recipe=excluded.recipe",params![lib,id,hash,ev,algorithm,renderer,descriptors[0].to_string(),descriptors[1].to_string(),descriptors[2].to_string(),recipe])?;
         tx.execute(
             "UPDATE catalog_assets SET negative_hash=? WHERE library_id=? AND id=?",
             params![hash, lib, id],
@@ -346,6 +433,10 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
         }
     }
     tx.execute("UPDATE catalog_assets SET edit_revision=edit_revision+1,negative_selected=1,last_edit_request=?,snapshot=json_set(snapshot,'$.updatedAt',?) WHERE library_id=? AND id=?",params![request,chrono::Utc::now().to_rfc3339(),lib,id])?;
+    tx.execute(
+        "DELETE FROM photo_edit_decisions WHERE library_id=? AND asset_id=?",
+        params![lib, id],
+    )?;
     let response = state(&tx, lib, id)?;
     tx.execute(
         "INSERT INTO photo_edit_requests VALUES(?,?,?,?,?)",
@@ -355,11 +446,56 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
     tx.commit()?;
     Ok(response)
 }
+fn confirm_original(s: &AppState, lib: &str, id: &str, v: Value) -> Result<Value> {
+    let (request, revision) = validate_request(&v)?;
+    let metadata = v["metadata"]
+        .as_str()
+        .filter(|s| s.len() <= 256 * 1024)
+        .ok_or_else(|| error(422, "metadata required (maximum 256 KiB)"))?;
+    if !serde_json::from_str::<Value>(metadata).is_ok_and(|v| v.is_object()) {
+        return Err(error(422, "metadata must encode an object"));
+    }
+    let payload = json!({"action":"confirm-original","body":v}).to_string();
+    let mut db = s.store.lock()?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let receipt: Option<(String,String)> = tx.query_row("SELECT payload,response FROM photo_edit_requests WHERE library_id=? AND asset_id=? AND request_id=?",params![lib,id,request],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    if let Some((old, response)) = receipt {
+        if old != payload {
+            return Err(error(409, "requestID 已用于不同操作"));
+        }
+        return Ok(serde_json::from_str(&response)?);
+    }
+    if state(&tx, lib, id)?["revision"] != revision {
+        return Err(error(409, "照片调整已变化，请刷新后重试"));
+    }
+    tx.execute("INSERT INTO photo_edit_decisions(library_id,asset_id,metadata) VALUES(?,?,?) ON CONFLICT(library_id,asset_id) DO UPDATE SET metadata=excluded.metadata",params![lib,id,metadata])?;
+    let result = state(&tx, lib, id)?;
+    tx.execute("INSERT INTO photo_edit_requests(library_id,asset_id,request_id,payload,response) VALUES(?,?,?,?,?)",params![lib,id,request,payload,result.to_string()])?;
+    tx.commit()?;
+    Ok(result)
+}
+async fn decision(
+    State(s): State<Arc<AppState>>,
+    Path((lib, id)): Path<(String, String)>,
+    Json(v): Json<Value>,
+) -> Result<Response, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| error(422, "invalid asset UUID"))?
+        .to_string();
+    run(move || confirm_original(&s, &lib, &id, v)).await
+}
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/libraries/{library}/assets/{asset}/edit/decisions",
+            post(decision).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
+        )
+        .route(
             "/libraries/{library}/assets/{asset}/edit",
-            get(get_edit).put(commit).delete(reset),
+            get(get_edit)
+                .put(commit)
+                .delete(reset)
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route(
             "/libraries/{library}/assets/{asset}/negative-version",
@@ -445,10 +581,9 @@ async fn download(
         .to_string();
     let p = tokio::task::spawn_blocking(move || -> Result<_> {
         let p = source(&*s.store.lock()?, &lib, &id, &q.content_hash)?;
-        ensure!(
-            !std::fs::symlink_metadata(&p)?.file_type().is_symlink(),
-            "source symlink forbidden"
-        );
+        if !std::fs::symlink_metadata(&p)?.file_type().is_file() {
+            return Err(error(409, "底片不是常规文件，请重新扫描"));
+        }
         s.jobs.validate_path(p.parent().context("source parent")?)?;
         Ok(p)
     })
@@ -588,6 +723,116 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+    #[test]
+    fn darktable_recipe_roundtrips_and_rejects_invalid_payloads() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let recipe = json!({"engine":"darktable","engineVersion":"5.6.2","recipeJSON":"{\"exposureEV\":0.5}","xmp":"<rdf:Description darktable:xmp_version=\"5\"/>","metadata":"{\"opinion\":\"保留暖光\"}"});
+        let stored = validate_recipe(&recipe)?.unwrap();
+        s.store.lock()?.execute("INSERT INTO photo_edits VALUES('lib',?,'hash',NULL,'ai-v1','darktable-5.6.2','{}','{}','{}',?)", params![id,stored])?;
+        let state = s.store.edit_state("lib", &id)?;
+        assert_eq!(state["hasEdit"], true);
+        assert_eq!(state["recipe"], recipe);
+        assert!(state["exposureEV"].is_null());
+        let mut invalid = recipe.clone();
+        invalid["engineVersion"] = json!("6.0");
+        assert!(validate_recipe(&invalid).is_err());
+        invalid = recipe.clone();
+        invalid["recipeJSON"] = json!("[]");
+        assert!(validate_recipe(&invalid).is_err());
+        invalid = recipe.clone();
+        invalid["metadata"] = json!("[]");
+        assert!(validate_recipe(&invalid).is_err());
+        invalid = recipe;
+        invalid["xmp"] = json!("");
+        assert!(validate_recipe(&invalid).is_err());
+        Ok(())
+    }
+    #[test]
+    fn recipe_accepts_embedded_masks_with_a_bounded_total_size() -> Result<()> {
+        let mut recipe = json!({"engine":"darktable","engineVersion":"5.6.2",
+            "recipeJSON":json!({"mask":"A".repeat(2*1024*1024)}).to_string(),
+            "xmp":"<rdf:Description darktable:xmp_version=\"5\"/>"});
+        assert!(validate_recipe(&recipe)?.is_some());
+        recipe["recipeJSON"] = json!(json!({"mask":"A".repeat(12*1024*1024)}).to_string());
+        assert!(validate_recipe(&recipe).is_err());
+        Ok(())
+    }
+    #[tokio::test]
+    async fn edit_route_accepts_embedded_mask_payload_above_two_mib() -> Result<()> {
+        let (_dir, state, id) = setup()?;
+        let before = state.store.edit_state("lib", &id)?;
+        let body = json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":before["revision"],"recipe":{"recipeJSON":json!({"mask":"A".repeat(3*1024*1024)}).to_string()}});
+        let response = crate::api::router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(format!("/libraries/lib/assets/{id}/edit"))
+                    .header("authorization", "Bearer test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))?,
+            )
+            .await?;
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn original_confirmation_route_accepts_opinion_history_above_global_limit() -> Result<()>
+    {
+        let (_dir, s, id) = setup()?;
+        let before = s.store.edit_state("lib", &id)?;
+        let metadata = json!({"opinion":"x".repeat(128*1024)}).to_string();
+        let body=json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":before["revision"],"metadata":metadata}).to_string();
+        let response = crate::api::router(s.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("/libraries/lib/assets/{id}/edit/decisions"))
+                    .header("authorization", "Bearer test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(body))?,
+            )
+            .await?;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            s.store.edit_state("lib", &id)?["decisionMetadata"],
+            metadata
+        );
+        Ok(())
+    }
+    #[test]
+    fn original_confirmation_persists_opinion_without_changing_published_edit() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let before = s.store.edit_state("lib", &id)?;
+        let revision = s.store.library_revision("lib")?;
+        let input = json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":before["revision"],"metadata":"{\"opinion\":\"保留原图\"}"});
+        let result = confirm_original(&s, "lib", &id, input.clone())?;
+        assert_eq!(result["decisionMetadata"], input["metadata"]);
+        assert_eq!(result["recipe"], before["recipe"]);
+        assert_eq!(result["revision"], before["revision"]);
+        assert_eq!(s.store.library_revision("lib")?, revision);
+        assert_eq!(confirm_original(&s, "lib", &id, input.clone())?, result);
+        assert_eq!(s.store.edit_state("lib", &id)?, result);
+        let mut conflict = input.clone();
+        conflict["metadata"] = json!("{}");
+        assert!(confirm_original(&s, "lib", &id, conflict).is_err());
+        let mut stale = input;
+        stale["requestID"] = json!(uuid::Uuid::new_v4().to_string());
+        stale["expectedRevision"] = json!(99);
+        assert!(confirm_original(&s, "lib", &id, stale).is_err());
+        let reset = mutate(
+            &s,
+            "lib",
+            &id,
+            json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":before["revision"]}),
+            "reset",
+        )?;
+        assert!(reset["decisionMetadata"].is_null());
+
+        Ok(())
+    }
     fn setup() -> Result<(tempfile::TempDir, Arc<AppState>, String)> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
@@ -661,7 +906,7 @@ mod tests {
             .unwrap()
             .to_owned();
         s.store.lock()?.execute(
-            "INSERT INTO photo_edits VALUES('lib',?,?,1,'test','test',?,?,?)",
+            "INSERT INTO photo_edits VALUES('lib',?,?,1,'test','test',?,?,?,NULL)",
             params![
                 id,
                 hash,
@@ -741,6 +986,7 @@ mod tests {
         let reset = json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":1});
         let result = mutate(&s, "lib", &id, reset.clone(), "reset")?;
         assert_eq!(result["hasEdit"], false);
+        assert_eq!(result["revision"], 2);
         assert_eq!(result["negativeContentHash"], hash);
         assert_eq!(mutate(&s, "lib", &id, reset, "reset")?, result);
         let due =
@@ -754,6 +1000,31 @@ mod tests {
             std::fs::read(s.jobs.root().join("photo.jpg"))?,
             b"unchanged original"
         );
+        Ok(())
+    }
+    #[tokio::test]
+    async fn source_download_rejects_replaced_symlink() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        s.store.initialize_negative("lib", &id)?;
+        let hash = s.store.edit_state("lib", &id)?["negativeContentHash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let source = s.jobs.root().join("photo.jpg");
+        let moved = s.jobs.root().join("fixture.jpg");
+        std::fs::rename(&source, &moved)?;
+        std::os::unix::fs::symlink(&moved, &source)?;
+        let response = crate::api::router(s)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!(
+                        "/libraries/lib/assets/{id}/edit/source?contentHash={hash}"
+                    ))
+                    .header("authorization", "Bearer test")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), 409);
         Ok(())
     }
     #[tokio::test]
@@ -847,9 +1118,15 @@ mod tests {
 #[cfg(test)]
 mod render_integration {
     use super::*;
-    #[test]
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    #[tokio::test]
     #[ignore = "requires ExifTool and KEEPS_EDIT_TEST_FIXTURES containing rendered HEIF files"]
-    fn real_heif_commit_is_atomic_idempotent_and_validated() -> Result<()> {
+    async fn real_heif_commit_is_atomic_idempotent_and_validated() -> Result<()> {
+        real_commit(false).await?;
+        real_commit(true).await
+    }
+    async fn real_commit(darktable: bool) -> Result<()> {
         let fixtures = PathBuf::from(std::env::var("KEEPS_EDIT_TEST_FIXTURES")?);
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
@@ -863,7 +1140,7 @@ mod render_integration {
         let id=store.ingest_original("lib",path.to_str().unwrap(),&json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"}),&json!({"contentFingerprint":hash,"metadataFingerprint":"meta","originalFilename":"source.heic","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}))?;
         let jobs = crate::jobs::Jobs::open(&root.join("jobs.sqlite"), &photos)?;
         jobs.add_folder("lib", photos.to_str().unwrap())?;
-        let s = AppState {
+        let s = Arc::new(AppState {
             store: Arc::new(store),
             jobs: Arc::new(jobs),
             previews: Arc::new(crate::previews::PreviewStorage::new(
@@ -875,20 +1152,61 @@ mod render_integration {
             access_token: "test".into(),
             library_id: "lib".into(),
             original_root_names: Default::default(),
-        };
+        });
+        let app = crate::api::router(s.clone());
+        let edit_path = format!("/libraries/lib/assets/{id}/edit");
         s.store.initialize_negative("lib", &id)?;
         let request = uuid::Uuid::new_v4().to_string();
+        let prepared = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(format!("{edit_path}/uploads"))
+                    .header("authorization", "Bearer test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        json!({"requestID":request}).to_string(),
+                    ))?,
+            )
+            .await?;
+        assert_eq!(prepared.status(), 200);
+        let uploads: Value =
+            serde_json::from_slice(&prepared.into_body().collect().await?.to_bytes())?;
         let mut outputs = Vec::new();
         for role in ["standard", "thumbnail", "browse"] {
             let input = fixtures.join(format!("{role}.heic"));
             let metadata = crate::media::MediaProcessor::new().extract(&input)?;
             let object = object("lib", &id, &request, role);
-            let target = s.previews.object_path(&object)?;
-            std::fs::create_dir_all(target.parent().unwrap())?;
-            std::fs::copy(&input, &target)?;
+            let target = uploads["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|target| target["role"] == role)
+                .unwrap();
+            assert_eq!(target["objectRef"], object);
+            let url = url::Url::parse(target["uploadURL"].as_str().unwrap())?;
+            let uri = match url.query() {
+                Some(query) => format!("{}?{query}", url.path()),
+                None => url.path().to_owned(),
+            };
+            let uploaded = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .body(axum::body::Body::from(std::fs::read(&input)?))?,
+                )
+                .await?;
+            assert_eq!(uploaded.status(), 204);
             outputs.push(json!({"role":role,"objectRef":object,"contentHash":crate::media::sha256_file(&input)?,"width":metadata.width,"height":metadata.height,"sizeBytes":std::fs::metadata(&input)?.len()}));
         }
-        let input = json!({"requestID":request,"expectedRevision":0,"negativeContentHash":hash,"exposureEV":1.99609375,"algorithmVersion":"test-auto-v1","rendererVersion":"test-ci-v1","outputs":outputs});
+        let mut input = json!({"requestID":request,"expectedRevision":0,"negativeContentHash":hash,"exposureEV":1.99609375,"algorithmVersion":"test-auto-v1","rendererVersion":"test-ci-v1","outputs":outputs});
+        if darktable {
+            input.as_object_mut().unwrap().remove("exposureEV");
+            input["recipe"] = json!({"engine":"darktable","engineVersion":"5.6.2","recipeJSON":"{\"exposureEV\":0.5}","xmp":"<rdf:Description darktable:xmp_version=\"5\"/>"});
+        }
         let mut invalid = input.clone();
         invalid["outputs"][0]["width"] = json!(1);
         assert_eq!(
@@ -905,14 +1223,44 @@ mod render_integration {
         assert_eq!(s.store.edit_state("lib", &id)?["hasEdit"], false);
         assert_eq!(s.store.edit_state("lib", &id)?["revision"], 0);
         s.store.lock()?.execute_batch("DROP TRIGGER reject_edit;")?;
-        let response = mutate(&s, "lib", &id, input.clone(), "commit")?;
+        let saved = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(&edit_path)
+                    .header("authorization", "Bearer test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(input.to_string()))?,
+            )
+            .await?;
+        assert_eq!(saved.status(), 200);
+        let response: Value =
+            serde_json::from_slice(&saved.into_body().collect().await?.to_bytes())?;
         assert_eq!(response["revision"], 1);
         assert_eq!(response["hasEdit"], true);
+        if darktable {
+            assert_eq!(response["recipe"], input["recipe"]);
+        }
         let media = s.store.media_snapshot("lib", &id)?;
         for role in ["standard", "thumbnail", "browse"] {
             assert!(media[role]["version"].as_str().unwrap().contains(&request));
         }
-        assert_eq!(mutate(&s, "lib", &id, input.clone(), "commit")?, response);
+        let repeated = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri(&edit_path)
+                    .header("authorization", "Bearer test")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(input.to_string()))?,
+            )
+            .await?;
+        assert_eq!(repeated.status(), 200);
+        let repeated: Value =
+            serde_json::from_slice(&repeated.into_body().collect().await?.to_bytes())?;
+        assert_eq!(repeated, response);
         let reopened = Store::open(&root.join("catalog.sqlite"), false)?;
         assert_eq!(reopened.edit_state("lib", &id)?, response);
         let mut stale = input;

@@ -3,6 +3,33 @@ import Testing
 @testable import KeepsAPI
 
 struct EditingTests {
+    @Test func comparisonSnapshotDownloadsCurrentStandardIndependentlyOfNegative() async throws {
+        let id = UUID()
+        let fixture = EditingFixture { request in
+            if request.url?.path == "/api/derivatives/\(id)" {
+                #expect(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.contains(URLQueryItem(name: "role", value: "standard")) == true)
+                return (200, "{\"downloadURL\":\"https://\(request.url!.host!)/current-standard\",\"version\":\"published-version\",\"width\":100,\"height\":100}")
+            }
+            #expect(request.url?.path == "/current-standard")
+            return (200, "current displayed photo")
+        }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try await fixture.client.downloadCurrentStandard(assetID: id, to: destination)
+        #expect(try String(contentsOf: destination, encoding: .utf8) == "current displayed photo")
+    }
+
+    @Test func darktableRecipeRoundtripsWithoutExposureField() throws {
+        let recipe = KeepsEditRecipe(recipeJSON: "{\"exposureEV\":0.5}", xmp: "<rdf:Description darktable:xmp_version=\"5\"/>")
+        let commit = KeepsEditCommit(requestID: UUID().uuidString, expectedRevision: 2,
+            negativeContentHash: "source", algorithmVersion: "ai-v1", rendererVersion: "darktable-5.6.2", outputs: [], recipe: recipe)
+        let data = try JSONEncoder().encode(commit)
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["exposureEV"] == nil)
+        #expect(try JSONDecoder().decode(KeepsEditCommit.self, from: data).recipe == recipe)
+        let state = KeepsEditState(negativeContentHash: "source", revision: 3, hasEdit: true, sourceAvailable: true, recipe: recipe)
+        #expect(try JSONDecoder().decode(KeepsEditState.self, from: JSONEncoder().encode(state)).recipe == recipe)
+    }
     @Test func commitPreservesRevisionSourceAndCompleteOutputSet() async throws {
         let assetID = UUID()
         let requestID = UUID().uuidString.lowercased()

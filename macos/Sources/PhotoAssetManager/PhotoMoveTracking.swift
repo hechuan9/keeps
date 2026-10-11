@@ -26,7 +26,7 @@ struct PendingPhotoMove: Codable {
 
     func photoDragPayload(for id: UUID) -> PhotoDragPayload? {
         guard let configuration,
-              !query.trashed, !isDirectoryOperationBlocking, !isMutating,
+              !query.trashed, !isOperationBlocking, !isMutating,
               !isSelectingAll, hasCurrentPhotoResults, assets.contains(where: { $0.id == id }) else { return nil }
         let ids = selectedIDs.contains(id) ? selectedIDs : [id]
         return PhotoDragPayload(assetIDs: ids.sorted { $0.uuidString < $1.uuidString },
@@ -49,7 +49,7 @@ struct PendingPhotoMove: Codable {
     }
 
     func canMovePhotos(_ payload: PhotoDragPayload, to parentPath: String) -> Bool {
-        client != nil && hasCurrentPhotoResults && !isDirectoryOperationBlocking && !isMutating && !isSelectingAll &&
+        client != nil && hasCurrentPhotoResults && !isOperationBlocking && !isMutating && !isSelectingAll &&
         !isUpdatingHiddenDirectory && !isCheckingConnection && !query.trashed &&
         configuration?.baseURL.absoluteString == payload.baseURL && configuration?.libraryID == payload.libraryID &&
         query == payload.query && query.directory == payload.sourcePath &&

@@ -57,7 +57,7 @@ class BackfillTests(unittest.TestCase):
             subprocess.run(['server/target/debug/keeps-server', 'migrate'], env={**os.environ, 'KEEPS_ROOT': temp}, check=True, capture_output=True)
             db = sqlite3.connect(Path(temp) / 'db/control_plane.sqlite')
             item = dict(old='/photo/old.heic', new='/photo/new.heic', oldHash='oldhash', newHash='newhash', size=123, mtimeNs=456)
-            db.execute("INSERT INTO catalog_assets VALUES('lib','asset','{}','rawhash','fp','now','RAW.ARW',0,'none',NULL,0)")
+            db.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','rawhash','fp','now','RAW.ARW',0,'none',NULL,0)")
             db.execute("INSERT INTO catalog_files VALUES('lib','asset','oldhash',1,'jpeg_original','keeps-nas','online')")
             db.execute("INSERT INTO catalog_paths VALUES('lib','/photo/old.heic','asset','oldhash','jpeg_original')")
             db.execute("INSERT INTO catalog_versions VALUES('lib','asset','oldhash',NULL,NULL,100,100,1,?)", [json.dumps({'generatedFrom': 'rawhash'})])

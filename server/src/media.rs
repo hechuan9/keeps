@@ -267,18 +267,28 @@ impl MediaProcessor {
         let jpeg_input = has_jpeg_signature(&source)?;
         let raw_input = is_raw(&source) && !jpeg_input;
         let heif_input = ["heic", "heif", "hif"].contains(&extension(&source).as_str());
+        let video_input = is_video(&source);
         let decoded = scratch.path().join(if raw_input {
             "decoded.ppm"
-        } else if heif_input {
+        } else if heif_input || video_input {
             "decoded.png"
         } else {
             "decoded.tiff"
         });
-        let input = if is_video(&source) {
+        let input = if video_input {
             run(Command::new("ffmpeg")
                 .args(["-nostdin", "-v", "error", "-threads", "1", "-i"])
                 .arg(&source)
-                .args(["-frames:v", "1", "-threads", "1", "-filter_threads", "1"])
+                .args([
+                    "-vf",
+                    &format!("scale={edge}:-2,thumbnail=60"),
+                    "-frames:v",
+                    "1",
+                    "-threads",
+                    "1",
+                    "-filter_threads",
+                    "1",
+                ])
                 .arg(&decoded))?;
             decoded.as_path()
         } else if raw_input {

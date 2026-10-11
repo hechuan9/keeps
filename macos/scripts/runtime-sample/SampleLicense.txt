@@ -1,0 +1,14 @@
+Keeps bundled runtime test image
+
+Landscape — Nick West, published 27 June 2014.
+License: CC0 1.0 Universal Public Domain Dedication
+https://creativecommons.org/publicdomain/zero/1.0/
+
+Source and license record:
+https://commons.wikimedia.org/wiki/File:Landscape_(Unsplash).jpg
+Original publication: https://unsplash.com/photos/4M-5WBrG5-c
+Published under CC0 before the 5 June 2017 Unsplash license change.
+
+Bundled file: Wikimedia Commons 1280-pixel JPEG rendition, unchanged.
+https://thumb.wikimedia.org/wikipedia/commons/thumb/4/4f/Landscape_%28Unsplash%29.jpg/1280px-Landscape_%28Unsplash%29.jpg
+SHA-256: 97c048583a017dbb42a60beb2d1794e4e15c8b34c470e64e413ac8d1ecbd8eca

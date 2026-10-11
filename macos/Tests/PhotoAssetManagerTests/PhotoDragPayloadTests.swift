@@ -100,7 +100,7 @@ import KeepsAPI
         _ = store.photoDragItem(for: ids[2])
         #expect(store.selectedIDs == [ids[2]])
         #expect(store.photoDragItem(for: ids[2])?.types.contains(.init(PhotoDragPayload.pasteboardType)) == true)
-        #expect(!store.isDirectoryOperationBlocking)
+        #expect(!store.isOperationBlocking)
     }
 
     @Test func backgroundRefreshKeepsSelectedPhotosDraggable() async throws {

@@ -1,3 +1,5 @@
+import hashlib
+import plistlib
 import importlib.util
 import io
 import json
@@ -47,11 +49,66 @@ class APITests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "^App Store Connect HTTP 401$"):
                 asc.build_status("macos")
 
+    def test_status_filters_requested_build(self):
+        with patch.object(asc, "make_token", return_value="private-token"), \
+             patch.object(asc.urllib.request, "build_opener") as opener:
+            opener.return_value.open.return_value = io.BytesIO(b'{"data": []}')
+            asc.build_status("macos", "148")
+            query = asc.urllib.parse.parse_qs(asc.urllib.parse.urlparse(
+                opener.return_value.open.call_args.args[0].full_url).query)
+        self.assertEqual(query["filter[version]"], ["148"])
+
+    def test_wait_requires_target_build_and_internal_testing(self):
+        pending = {"builds": []}
+        ready = {"builds": [{"version": "148", "processingState": "VALID",
+                 "preReleaseVersion": {"version": "0.3.1"},
+                 "buildBetaDetail": {"internalBuildState": "IN_BETA_TESTING"}}]}
+        with patch.object(asc, "build_status", side_effect=[pending, ready]) as status, \
+             patch.object(asc.time, "sleep"), patch("sys.stdout", new=io.StringIO()):
+            self.assertEqual(asc.wait_for_build("macos", "148", "0.3.1"), ready)
+        self.assertEqual(status.call_args.args, ("macos", "148"))
+
+    def test_wait_rejects_failed_build_and_timeout(self):
+        failed = {"builds": [{"version": "148", "processingState": "INVALID",
+                  "preReleaseVersion": {"version": "0.3.1"}}]}
+        with patch.object(asc, "build_status", return_value=failed), patch("sys.stdout", new=io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, "INVALID"):
+                asc.wait_for_build("macos", "148", "0.3.1")
+        with patch.object(asc, "build_status", return_value={"builds": []}), \
+             patch.object(asc.time, "monotonic", side_effect=[0, 1]):
+            with self.assertRaisesRegex(RuntimeError, "尚未确认"):
+                asc.wait_for_build("macos", "148", "0.3.1", timeout=1)
+
     def test_redirect_rejected(self):
         self.assertIsNone(asc.NoRedirect().redirect_request(None, None, 302, "", {}, "https://other.example"))
 
 
 class ShellTests(unittest.TestCase):
+    def test_ci_export_uses_imported_identity_hashes(self):
+        workflow = Path(__file__).resolve().parents[1] / ".github/workflows/release-macos.yml"
+        source = workflow.read_text().split("          python3 - <<'PYTHON'\n")[-1].split("          PYTHON")[0]
+        source = "\n".join(line[10:] for line in source.splitlines())
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            certificate = b"application-certificate"
+            application = hashlib.sha1(certificate).hexdigest().upper()
+            installer = "A" * 40
+            profile = {"TeamIdentifier": ["3TZ6RCL8NE"], "UUID": "profile-id",
+                       "DeveloperCertificates": [certificate],
+                       "Entitlements": {"com.apple.application-identifier": "3TZ6RCL8NE.local.keeps"}}
+            (root / "keeps-profile.plist").write_bytes(plistlib.dumps(profile))
+            (root / "keeps.provisionprofile").touch()
+            identities = f'1) {application} "3rd Party Mac Developer Application: ClimaMind LLC (3TZ6RCL8NE)"\n2) {installer} "3rd Party Mac Developer Installer: ClimaMind LLC (3TZ6RCL8NE)"'
+            (root / "signing-identities.txt").write_text(identities)
+            with patch.dict(os.environ, RUNNER_TEMP=temporary, GITHUB_ENV=str(root / "env")), \
+                 patch.object(Path, "home", return_value=root):
+                exec(compile(source, str(workflow), "exec"), {})
+                options = plistlib.loads((root / "ExportOptions.plist").read_bytes())
+                self.assertEqual(options["signingCertificate"], application)
+                self.assertEqual(options["installerSigningCertificate"], installer)
+                (root / "signing-identities.txt").write_text(identities.splitlines()[0])
+                with self.assertRaisesRegex(ValueError, "签名身份"):
+                    exec(compile(source, str(workflow), "exec"), {})
     def test_forwarding_cleanup_and_partial_configuration(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -90,6 +147,10 @@ sys.exit(int(os.environ.get("STUB_EXIT", "0")))
                 self.assertFalse(Path(record["path"]).exists())
                 self.assertIn("-authenticationKeyIssuerID", record["args"])
                 self.assertNotIn("test-private-key", result.stdout + result.stderr)
+            result = run("upload", {"EXPORT_OPTIONS_PLIST": "/tmp/manual-export.plist"})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = json.loads((root / "record.json").read_text())["args"]
+            self.assertEqual(args[args.index("-exportOptionsPlist") + 1], "/tmp/manual-export.plist")
 
 
 if __name__ == "__main__":

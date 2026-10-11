@@ -138,6 +138,7 @@ impl Store {
     }
     pub fn reconcile_cache(&self) -> Result<()> {
         self.lock()?.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec) SELECT a.library_id,a.id,coalesce(d.content_hash,a.content_hash),? FROM catalog_assets a LEFT JOIN catalog_defaults d ON a.library_id=d.library_id AND a.id=d.asset_id WHERE a.trashed=0 ON CONFLICT(library_id,asset_id) DO UPDATE SET source_hash=excluded.source_hash,spec=excluded.spec,status='pending',attempts=0,available_at=0,last_error=NULL WHERE media_cache.source_hash!=excluded.source_hash OR media_cache.spec!=excluded.spec OR (media_cache.status='cancelled' AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=excluded.library_id AND p.asset_id=excluded.asset_id AND p.content_hash=excluded.source_hash AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))", [spec()?])?;
+        self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE status='ready' AND json_extract(thumbnail,'$.version') NOT LIKE 'video-v3:%' AND EXISTS (SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND (lower(a.filename) GLOB '*.mov' OR lower(a.filename) GLOB '*.mp4' OR lower(a.filename) GLOB '*.m4v' OR lower(a.filename) GLOB '*.avi' OR lower(a.filename) GLOB '*.mkv' OR lower(a.filename) GLOB '*.mts' OR lower(a.filename) GLOB '*.m2ts'))", [])?;
         Ok(())
     }
     pub fn recover_cache(&self) -> Result<()> {
@@ -654,7 +655,7 @@ fn generate(
         "standard input changed during generation"
     );
     let object = previews.put_generated_role(lib, id, &generated.sha256, &target, "thumbnail")?;
-    let thumbnail = json!({"objectRef":object,"width":generated.width,"height":generated.height,"version":format!("{}:{}",spec()?,generated.sha256),"sizeBytes":generated.size_bytes});
+    let thumbnail = json!({"objectRef":object,"width":generated.width,"height":generated.height,"version":format!("{}{}:{}",if media::is_video(standard_input) { "video-v3:" } else { "" },spec()?,generated.sha256),"sizeBytes":generated.size_bytes});
     let standard = json!({"path":standard_path,"width":width,"height":height,"version":standard_hash,"sizeBytes":fs::metadata(&standard_path)?.len(),"mtimeNs":file_mtime(&standard_path)?,"deferred":extension == "3fr"});
     store.cache_publish(lib, id, hash, &thumbnail, &standard)?;
     tracing::info!(asset_id=%id,bytes=generated.size_bytes,"NAS thumbnail ready");
@@ -736,6 +737,48 @@ pub(crate) fn select_standard_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reconcile_requeues_only_old_video_thumbnails() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        for (id, filename, version) in [
+            ("old-video", "clip.MP4", "thumbnail-heic-512-q50-v1:old"),
+            (
+                "green-video",
+                "green.mp4",
+                "video-v2:thumbnail-heic-512-q50-v1:green",
+            ),
+            (
+                "new-video",
+                "clip.mov",
+                "video-v3:thumbnail-heic-512-q50-v1:new",
+            ),
+            ("photo", "still.jpg", "thumbnail-heic-512-q50-v1:photo"),
+        ] {
+            store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib',?1,'{}',?1,?1,'2024-01-01',?2,0,'unflagged',NULL,0)",params![id,filename])?;
+            store.reconcile_cache()?;
+            store.lock()?.execute(
+                "UPDATE media_cache SET status='ready',thumbnail=?2 WHERE asset_id=?1",
+                params![id, json!({"version":version}).to_string()],
+            )?;
+        }
+        store.reconcile_cache()?;
+        let db = store.lock()?;
+        let mut q = db.prepare("SELECT asset_id,status FROM media_cache ORDER BY asset_id")?;
+        let rows = q
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            rows,
+            [
+                ("green-video".into(), "pending".into()),
+                ("new-video".into(), "ready".into()),
+                ("old-video".into(), "pending".into()),
+                ("photo".into(), "ready".into())
+            ]
+        );
+        Ok(())
+    }
     fn seed(store: &Store, n: usize) -> Result<()> {
         for index in 0..n {
             let id = format!("00000000-0000-0000-0000-{index:012}");

@@ -172,12 +172,12 @@ class Worker:
                 count = 0
                 env = dict(os.environ, TMPDIR=temp)
                 if task.get("mediaType") == "video":
-                    source = directory / "first-frame.tiff"
+                    source = directory / "first-frame.png"
                     # NAS validates the full source hash at claim and publication.
                     # The loopback proxy keeps credentials out of ffmpeg and refuses redirects.
                     with self.video_source(prefix) as (url, transfer):
                         self.render(["ffmpeg", "-nostdin", "-v", "error", "-threads", "1", "-i", url,
-                                     "-frames:v", "1", "-threads", "1", "-filter_threads", "1", str(source)],
+                                     "-vf", f"scale={task['thumbnailEdge']}:-2,thumbnail=60", "-frames:v", "1", "-threads", "1", "-filter_threads", "1", str(source)],
                                     env, directory, lease_lost)
                     count = transfer["bytes"]
                 else:

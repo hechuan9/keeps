@@ -42,6 +42,7 @@ jobs:
           brew install gitleaks
           gitleaks dir . --redact --no-banner
       - run: python macos/scripts/test_pre_merge_gate.py
+      - run: python macos/scripts/test_bundle_ai_runtime.py
       - name: Toolchain versions
         run: |
           swift --version
@@ -49,6 +50,7 @@ jobs:
       - run: swift test --package-path shared
       - run: swift test --package-path ios
       - run: swift test --package-path macos
+      - run: swift test --package-path macos/ColorTools
       - run: bash macos/scripts/package_app.sh
       - name: Build iOS Simulator
         run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build

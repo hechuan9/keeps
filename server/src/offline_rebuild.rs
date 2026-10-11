@@ -469,7 +469,8 @@ impl Manager {
             {
                 let path = child["path"].as_str().context("directory path")?.to_owned();
                 let root = path.trim_end_matches('/');
-                let count:i64=source.query_row("SELECT count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0",params![lib,format!("{root}/"),format!("{root}0")],|r|r.get(0))?;
+                let (direct, count):(i64,i64)=source.query_row("SELECT count(DISTINCT CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN p.asset_id END), count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0",params![lib,format!("{root}/"),format!("{root}0")],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                child["directPhotoCount"] = json!(direct);
                 child["photoCount"] = json!(count);
                 if child["hasChildren"].as_bool() == Some(true) {
                     pending.push(Some(path));
@@ -1017,7 +1018,7 @@ mod tests {
         let descriptor =
             json!({"objectRef":object,"width":64,"height":48,"version":"edit-version"});
         app.store.lock()?.execute(
-            "INSERT INTO photo_edits VALUES('photos',?,?,1,'test','test',?,?,?)",
+            "INSERT INTO photo_edits VALUES('photos',?,?,1,'test','test',?,?,?,NULL)",
             params![
                 id,
                 hash,

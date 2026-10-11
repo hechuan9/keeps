@@ -1,10 +1,24 @@
 import Foundation
 
+public struct KeepsEditRecipe: Codable, Equatable, Sendable {
+    public var engine: String
+    public var engineVersion: String
+    public var recipeJSON: String
+    public var metadata: String?
+    public var xmp: String
+    public init(engine: String = "darktable", engineVersion: String = "5.6.2", recipeJSON: String, xmp: String, metadata: String? = nil) {
+        self.metadata = metadata
+        self.engine = engine; self.engineVersion = engineVersion; self.recipeJSON = recipeJSON; self.xmp = xmp
+    }
+}
+
 public struct KeepsEditState: Codable, Equatable, Sendable {
+    public var decisionMetadata: String?
     public var negativeContentHash: String?
     public var revision: Int64
     public var hasEdit: Bool
     public var exposureEV: Double?
+    public var recipe: KeepsEditRecipe?
     public var sourceFilename: String?
     public var sourceAvailable: Bool
     public var lastRequestID: String?
@@ -13,10 +27,12 @@ public struct KeepsEditState: Codable, Equatable, Sendable {
 
     public init(negativeContentHash: String?, revision: Int64, hasEdit: Bool, exposureEV: Double? = nil,
                 sourceFilename: String? = nil, sourceAvailable: Bool, lastRequestID: String? = nil,
-                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil) {
+                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil, recipe: KeepsEditRecipe? = nil, decisionMetadata: String? = nil) {
+        self.decisionMetadata = decisionMetadata
         self.negativeContentHash = negativeContentHash
         self.revision = revision
         self.hasEdit = hasEdit
+        self.recipe = recipe
         self.exposureEV = exposureEV
         self.sourceFilename = sourceFilename
         self.sourceAvailable = sourceAvailable
@@ -66,14 +82,16 @@ public struct KeepsEditCommit: Codable, Sendable {
     public var requestID: String
     public var expectedRevision: Int64
     public var negativeContentHash: String
-    public var exposureEV: Double
+    public var exposureEV: Double?
+    public var recipe: KeepsEditRecipe?
     public var algorithmVersion: String
     public var rendererVersion: String
     public var outputs: [KeepsEditOutput]
-    public init(requestID: String, expectedRevision: Int64, negativeContentHash: String, exposureEV: Double,
-                algorithmVersion: String, rendererVersion: String, outputs: [KeepsEditOutput]) {
+    public init(requestID: String, expectedRevision: Int64, negativeContentHash: String, exposureEV: Double? = nil,
+                algorithmVersion: String, rendererVersion: String, outputs: [KeepsEditOutput], recipe: KeepsEditRecipe? = nil) {
         self.requestID = requestID; self.expectedRevision = expectedRevision
         self.negativeContentHash = negativeContentHash; self.exposureEV = exposureEV
+        self.recipe = recipe
         self.algorithmVersion = algorithmVersion; self.rendererVersion = rendererVersion; self.outputs = outputs
     }
 }

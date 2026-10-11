@@ -10,7 +10,7 @@ import KeepsAPI
         let moving = Task { await store.moveDirectory("/source", to: "/target") }
         try await waitUntil { fixture.state.hasPendingPoll }
         #expect(store.directoryMovePhase == "moving")
-        #expect(store.isDirectoryOperationBlocking)
+        #expect(store.isOperationBlocking)
         #expect(fixture.preferences.data(forKey: "keeps.pendingDirectoryMove") != nil)
         store.showLibrary(directory: "another")
         store.setDirectoryExpanded("another", expanded: true)
@@ -73,7 +73,7 @@ import KeepsAPI
         #expect(fixture.state.getIDs.isEmpty)
         restored.acknowledgeDirectoryMoveFailure()
         #expect(!restored.isMovingDirectory)
-        #expect(!restored.isDirectoryOperationBlocking)
+        #expect(!restored.isOperationBlocking)
         #expect(fixture.preferences.data(forKey: "keeps.pendingDirectoryMove") == nil)
     }
 

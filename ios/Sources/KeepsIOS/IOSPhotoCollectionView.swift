@@ -450,6 +450,7 @@ private final class TimelineRail: UIView {
 private final class PhotoCollectionCell: UICollectionViewCell {
     private let photo = UIImageView()
     private let badge = UIImageView()
+    private let videoBadge = UIImageView(image: UIImage(systemName: "play.circle.fill"))
     private var task: Task<Void, Never>?
     private var standardTask: Task<Void, Never>?
     private var key: String?
@@ -475,6 +476,10 @@ private final class PhotoCollectionCell: UICollectionViewCell {
         badge.layer.shadowOpacity = 0.7
         badge.layer.shadowRadius = 2
         contentView.addSubview(badge)
+        videoBadge.tintColor = .white
+        videoBadge.layer.shadowOpacity = 0.8
+        videoBadge.layer.shadowRadius = 4
+        contentView.addSubview(videoBadge)
         isAccessibilityElement = true
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -509,7 +514,8 @@ private final class PhotoCollectionCell: UICollectionViewCell {
         self.browsing = browsing
         self.loadStandard = loadStandard
         accessibilityCustomActions = [UIAccessibilityCustomAction(name: "重新载入缩略图", target: self, selector: #selector(retryImage))]
-        accessibilityLabel = entry.filename
+        accessibilityLabel = entry.isVideo ? "视频：\(entry.filename)" : entry.filename
+        videoBadge.isHidden = !entry.isVideo
         accessibilityTraits = selected ? [.button, .selected] : .button
         photo.contentMode = compact ? .scaleAspectFill : .scaleAspectFit
         let symbol = selecting ? (selected ? "checkmark.circle.fill" : "circle") : (entry.flagState == "picked" ? "heart.fill" : nil)
@@ -522,6 +528,8 @@ private final class PhotoCollectionCell: UICollectionViewCell {
         super.layoutSubviews()
         photo.frame = contentView.bounds
         badge.frame = CGRect(x: bounds.width - 25, y: bounds.height - 25, width: 21, height: 21)
+        let size = min(44, max(24, bounds.height * 0.3))
+        videoBadge.frame = CGRect(x: (bounds.width - size) / 2, y: (bounds.height - size) / 2, width: size, height: size)
         loadImage()
     }
     @objc private func retryImage() -> Bool { cancelRequest(); hasSharpImage = false; loadImage(); return true }

@@ -16,7 +16,7 @@ struct PendingDirectoryTrash: Codable {
     private static let trashKey = "keeps.pendingDirectoryTrash"
 
     func trashDirectory(_ directory: KeepsNavigationDirectory, confirmationName: String) async throws {
-        guard !isDirectoryOperationBlocking, !isMutating, !isUpdatingHiddenDirectory, !isCheckingConnection,
+        guard !isOperationBlocking, !isMutating, !isUpdatingHiddenDirectory, !isCheckingConnection,
               let configuration else { throw KeepsAPIError.invalidConfiguration }
         guard confirmationName == directory.name else { throw KeepsAPIError.http(422, "目录名不一致") }
         directoryTrash = PendingDirectoryTrash(id: UUID(), path: directory.path, name: directory.name,

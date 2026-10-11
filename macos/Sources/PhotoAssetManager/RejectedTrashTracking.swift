@@ -13,7 +13,7 @@ struct PendingRejectedTrash: Codable {
     private static let rejectedTrashKey = "keeps.pendingRejectedTrash"
 
     func previewRejectedTrash() async {
-        guard !isDirectoryOperationBlocking, !isMutating, !isCheckingConnection, !isUpdatingHiddenDirectory, let client else { return }
+        guard !isOperationBlocking, !isMutating, !isCheckingConnection, !isUpdatingHiddenDirectory, !isImportingPhotos, let client else { return }
         rejectedTrashPreviewConfiguration = configuration
         isPreparingRejectedTrash = true
         rejectedTrashPreview = nil
@@ -27,7 +27,7 @@ struct PendingRejectedTrash: Codable {
     func canConfirmRejectedTrash(_ text: String) -> Bool {
         guard let preview = rejectedTrashPreview else { return false }
         return rejectedTrashPreviewConfiguration == configuration && preview.status == "draft" && preview.count > 0 && text == String(preview.count)
-            && !isDirectoryOperationBlocking && !isMutating && !isCheckingConnection && !isUpdatingHiddenDirectory
+            && !isOperationBlocking && !isMutating && !isCheckingConnection && !isUpdatingHiddenDirectory && !isImportingPhotos
     }
 
     func submitRejectedTrash(confirmation: String) async {

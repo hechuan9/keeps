@@ -48,15 +48,23 @@ case "$2" in
     uv run --script scripts/app_store_connect.py "$1" status
     ;;
   archive)
+    BUILD_ARGS=()
+    if [[ -n "${BUILD_NUMBER:-}" ]]; then
+      if [[ ! "$BUILD_NUMBER" =~ ^[1-9][0-9]{0,3}$ ]]; then
+        echo "BUILD_NUMBER 必须是 1 到 9999 的整数。" >&2
+        exit 1
+      fi
+      BUILD_ARGS=("CURRENT_PROJECT_VERSION=$BUILD_NUMBER")
+    fi
     mkdir -p "$(dirname "$ARCHIVE")"
     xcodebuild -project "$PROJECT" -scheme "$SCHEME" \
       -configuration Release -destination "$DESTINATION" \
-      -archivePath "$ARCHIVE" -allowProvisioningUpdates ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} archive
+      -archivePath "$ARCHIVE" -allowProvisioningUpdates ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"} ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} archive
     ;;
   upload)
     test -f "$ARCHIVE/Info.plist" || { echo "请先归档: $0 $1 archive" >&2; exit 1; }
     xcodebuild -exportArchive -archivePath "$ARCHIVE" \
-      -exportOptionsPlist scripts/ExportOptions.testflight.plist \
+      -exportOptionsPlist "${EXPORT_OPTIONS_PLIST:-scripts/ExportOptions.testflight.plist}" \
       -exportPath "$(dirname "$ARCHIVE")/upload" -allowProvisioningUpdates ${AUTH_ARGS[@]+"${AUTH_ARGS[@]}"}
     ;;
   *) echo "不支持的操作: $2" >&2; exit 2 ;;

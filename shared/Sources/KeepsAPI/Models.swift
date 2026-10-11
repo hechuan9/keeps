@@ -43,6 +43,7 @@ public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var negativeContentHash: String? = nil
     public var paths: [String]? = nil
     public var gridPreview: KeepsPreview? { thumbnail ?? preview }
+    public var isVideo: Bool { ["mov", "mp4", "m4v", "avi", "mkv", "mts", "m2ts"].contains(URL(fileURLWithPath: originalFilename).pathExtension.lowercased()) }
 }
 
 public struct KeepsAssetPage: Codable, Sendable {
@@ -104,13 +105,19 @@ public struct KeepsDirectory: Decodable, Identifiable, Equatable, Sendable {
 public struct KeepsNavigationDirectory: Codable, Identifiable, Equatable, Sendable {
     public var path: String
     public var name: String
+    public var directPhotoCount: Int?
     public var photoCount: Int
     public var hasChildren: Bool
     public var id: String { path }
+    public var photoCountLabel: String {
+        if directPhotoCount == photoCount { return String(photoCount) }
+        return "\(photoCount)（\(directPhotoCount.map(String.init) ?? "—")）"
+    }
 
-    public init(path: String, name: String, photoCount: Int, hasChildren: Bool) {
+    public init(path: String, name: String, photoCount: Int, hasChildren: Bool, directPhotoCount: Int? = nil) {
         self.path = path
         self.name = name
+        self.directPhotoCount = directPhotoCount
         self.photoCount = photoCount
         self.hasChildren = hasChildren
     }

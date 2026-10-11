@@ -725,7 +725,7 @@ mod tests {
             assert_ne!(store.library_revision("lib")?, before);
             assert_eq!(
                 store.directory_photo_counts("lib", &[source.to_string_lossy().into_owned()])?,
-                vec![0]
+                vec![(0, 0)]
             );
             assert_eq!(store.counts("lib", false)?["all"], i32::from(retain_other));
             assert_eq!(
@@ -776,7 +776,7 @@ mod tests {
         assert_eq!(store.counts("lib", false)?["all"], 1);
         assert_eq!(
             store.directory_photo_counts("lib", &[source.to_string_lossy().into_owned()])?,
-            vec![1]
+            vec![(1, 1)]
         );
         assert!(source.join("retained.jpg").exists());
         assert!(

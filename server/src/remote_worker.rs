@@ -566,7 +566,7 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         .put_generated_role(lib, &t.asset, &hash, &thumb, "thumbnail")?;
     let thumbnail_descriptor = json!({
         "objectRef": object, "width": tm.width, "height": tm.height,
-        "version": format!("{}:{}",cache::spec()?,hash),
+        "version": format!("{}{}:{}",if media::is_video(&t.path) { "video-v3:" } else { "" },cache::spec()?,hash),
         "sizeBytes":fs::metadata(&thumb)?.len()
     });
     let standard_descriptor = json!({
@@ -805,6 +805,80 @@ mod tests {
         assert_eq!(preserved, "preserved");
         drop(migrated);
         Store::open(&path, false)?;
+        Ok(())
+    }
+    #[test]
+    fn schema_thirteen_variants_preserve_edits_ai_state_and_import_leases() -> Result<()> {
+        for imported_schema in [false, true] {
+            let root = tempfile::tempdir()?;
+            let path = root.path().join("db.sqlite");
+            let store = Store::open(&path, true)?;
+            store.lock()?.execute("INSERT INTO photo_edits VALUES('lib','asset','hash',1,'auto-v1','renderer-v1','{}','{}','{}',?)",[json!({"engine":"darktable","recipeJSON":"{}"}).to_string()])?;
+            store.lock()?.execute("INSERT INTO photo_edit_requests VALUES('lib','asset','request','payload','response')",[])?;
+            store.lock()?.execute(
+                "INSERT INTO ai_editing_state VALUES('lib','settings',4,'settings-content')",
+                [],
+            )?;
+            store.lock()?.execute(
+                "INSERT INTO photo_edit_decisions VALUES('lib','asset','decision')",
+                [],
+            )?;
+            if imported_schema {
+                store.lock()?.execute_batch("ALTER TABLE photo_edits RENAME TO photo_edits_current; CREATE TABLE photo_edits(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,negative_hash TEXT NOT NULL,exposure_ev REAL NOT NULL,algorithm_version TEXT NOT NULL,renderer_version TEXT NOT NULL,standard TEXT NOT NULL,thumbnail TEXT NOT NULL,browse TEXT NOT NULL,PRIMARY KEY(library_id,asset_id)); INSERT INTO photo_edits SELECT library_id,asset_id,negative_hash,exposure_ev,algorithm_version,renderer_version,standard,thumbnail,browse FROM photo_edits_current; DROP TABLE photo_edits_current; DROP TABLE ai_editing_state; DROP TABLE photo_edit_decisions;")?;
+                store.lock()?.execute("INSERT INTO import_compute_leases VALUES('lib','batch','/original/photo.jpg','mac',4000000000)",[])?;
+            } else {
+                store
+                    .lock()?
+                    .execute_batch("DROP TABLE import_compute_leases;")?;
+            }
+            store.lock()?.pragma_update(None, "user_version", 13)?;
+            drop(store);
+            let error = Store::open(&path, false)
+                .err()
+                .context("schema13 needs migration")?;
+            assert!(format!("{error:#}").contains("database migration required"));
+            let store = Store::open(&path, true)?;
+            let db = store.lock()?;
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+                14
+            );
+            let edited: (f64, Option<String>) = db.query_row(
+                "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(edited.0, 1.0);
+            assert_eq!(edited.1.is_some(), !imported_schema);
+            assert_eq!(
+                db.query_row("SELECT response FROM photo_edit_requests", [], |r| r
+                    .get::<_, String>(0))?,
+                "response"
+            );
+            if imported_schema {
+                assert_eq!(
+                    db.query_row("SELECT worker_id FROM import_compute_leases", [], |r| {
+                        r.get::<_, String>(0)
+                    })?,
+                    "mac"
+                );
+            } else {
+                assert_eq!(
+                    db.query_row("SELECT content FROM ai_editing_state", [], |r| r
+                        .get::<_, String>(0))?,
+                    "settings-content"
+                );
+                assert_eq!(
+                    db.query_row("SELECT metadata FROM photo_edit_decisions", [], |r| r
+                        .get::<_, String>(0))?,
+                    "decision"
+                );
+            }
+            db.execute("UPDATE photo_edits SET exposure_ev=NULL,recipe='{}'", [])?;
+            drop(db);
+            drop(store);
+            Store::open(&path, false)?;
+        }
         Ok(())
     }
     #[test]

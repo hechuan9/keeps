@@ -6,11 +6,24 @@ struct GallerySelectionActions {
     let deselectAll: () -> Void
 }
 
+struct AIWorkspaceActions {
+    let open: () -> Void
+}
+
+private struct AIWorkspaceKey: FocusedValueKey {
+    typealias Value = AIWorkspaceActions
+}
+
 private struct GallerySelectionKey: FocusedValueKey {
     typealias Value = GallerySelectionActions
 }
 
 extension FocusedValues {
+    var aiWorkspace: AIWorkspaceActions? {
+        get { self[AIWorkspaceKey.self] }
+        set { self[AIWorkspaceKey.self] = newValue }
+    }
+
     var gallerySelection: GallerySelectionActions? {
         get { self[GallerySelectionKey.self] }
         set { self[GallerySelectionKey.self] = newValue }
@@ -19,11 +32,15 @@ extension FocusedValues {
 
 struct ContentView: View {
     @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var exposureTasks: ExposureTaskStore
+    @EnvironmentObject private var batch: AIEditingBatchStore
+    @EnvironmentObject private var geometryTasks: GeometryTaskStore
     @Environment(\.openWindow) private var openWindow
+    @State private var showsAIWorkspace = false
+    @State private var startsAIWorkspace = false
     @State private var showsImport = false
     @EnvironmentObject private var importTasks: ImportTaskOwner
     private var importStore: ImportStore? { importTasks.store }
+    @State private var importWindowID = UUID()
     @FocusState private var galleryFocused: Bool
 
     @State private var showsSidebar = true
@@ -32,8 +49,32 @@ struct ContentView: View {
     @State private var thumbnailSize = 190.0
     @State private var detailMode = false
     @State private var galleryReturnAssetID: UUID?
+    @State private var assetToCrop: KeepsAsset?
 
     var body: some View {
+        Group {
+            if showsAIWorkspace {
+                AIEditingWorkspaceView(autoStart: startsAIWorkspace, returnToLibrary: { showsAIWorkspace = false })
+            } else {
+                libraryScreen
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            AIEditingBackgroundStatus(store: batch) { showsAIWorkspace = true }
+        }
+        .sheet(item: $assetToCrop) { asset in
+            PhotoCropSheet(asset: asset)
+        }
+        .onChange(of: library.configuration, initial: true) { _, _ in configureGeometryTasks() }
+        .onChange(of: library.isOperationBlocking) { _, _ in configureGeometryTasks() }
+        .onChange(of: geometryTasks.completionRevision) { _, _ in library.refresh(force: true) }
+        .focusedSceneValue(\.aiWorkspace, AIWorkspaceActions(open: openAIWorkspace))
+        .sheet(isPresented: $library.showsRejectedTrash) {
+            RejectedTrashSheet(library: library)
+        }
+    }
+
+    private var libraryScreen: some View {
         VStack(spacing: 0) {
             topBar
             Divider()
@@ -60,31 +101,45 @@ struct ContentView: View {
         .foregroundStyle(WorkspaceStyle.text)
         .preferredColorScheme(.dark)
         .tint(WorkspaceStyle.accent)
-        .disabled(library.isDirectoryOperationBlocking)
-        .overlay { if library.isDirectoryOperationBlocking { Color.clear.contentShape(Rectangle()).onTapGesture {} } }
+        .disabled(library.isOperationBlocking)
+        .overlay { if library.isOperationBlocking { Color.clear.contentShape(Rectangle()).onTapGesture {} } }
         .sheet(isPresented: $showsImport, onDismiss: { library.refreshNavigation(); library.refresh(force: true) }) {
-            if let importStore { ImportView(store: importStore, initialTarget: library.query.directory).disabled(library.isDirectoryOperationBlocking) }
+            if let importStore {
+                ImportView(store: importStore, initialTarget: library.query.directory)
+                    .disabled(library.isOperationBlocking)
+                    .onAppear { library.openImportWindows.insert(importWindowID) }
+                    .onDisappear { library.openImportWindows.remove(importWindowID) }
+            }
         }
         .overlay {
-            if library.isMovingDirectory {
+            if library.isAISettingsBusy {
+                VStack(spacing: 16) {
+                    ProgressView()
+                    Text("AI 修图设置正在运行，请在设置中查看进度。")
+                    Button("取消", action: batch.editor.cancel)
+                }.padding(28).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+            } else if library.isMovingDirectory {
                 DirectoryMoveProgressView(library: library)
             } else if library.photoMove != nil {
                 PhotoMoveProgressView(library: library)
             }
         }
+        .sheet(item: $library.directoryToCreate) { directory in
+            DirectoryCreateSheet(library: library, directory: directory)
+                .disabled(library.isAIEditingBlocking || library.isAISettingsBusy)
+        }
         .sheet(item: $library.directoryToRename) { directory in
             DirectoryRenameSheet(library: library, directory: directory)
+                .disabled(library.isAIEditingBlocking || library.isAISettingsBusy)
         }
         .sheet(item: $library.directoryToTrash) { directory in
             DirectoryTrashSheet(library: library, directory: directory)
+                .disabled(library.isAIEditingBlocking || library.isAISettingsBusy)
         }
-        .sheet(isPresented: $library.showsRejectedTrash) {
-            RejectedTrashSheet(library: library)
+        .onChange(of: library.isDirectoryOperationBlocking) { _, blocking in
+            if !blocking { batch.restore(library: library) }
         }
-        .task { library.refresh(); library.refreshNavigation(force: false) }
-        .onChange(of: library.configuration, initial: true) { _, configuration in exposureTasks.configure(library.rejectedTrash == nil ? configuration : nil) }
-        .onChange(of: library.rejectedTrash == nil) { _, idle in exposureTasks.configure(idle ? library.configuration : nil) }
-        .onChange(of: exposureTasks.completionRevision) { _, _ in library.refresh(force: true) }
+        .task { batch.restore(library: library); library.refresh(); library.refreshNavigation(force: false) }
         .onChange(of: library.query) { _, _ in library.refresh() }
         .onChange(of: library.query.directory) { _, _ in
             detailMode = false
@@ -170,7 +225,7 @@ struct ContentView: View {
                 WorkspaceErrorView(title: "请求失败", details: error)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
-            PhotoAdjustmentStatusView(store: exposureTasks, configuration: library.configuration)
+            GeometryTaskStatusView(store: geometryTasks, configuration: library.configuration)
             bottomBar
         }
     }
@@ -210,7 +265,6 @@ struct ContentView: View {
                                 .allowsHitTesting(false)
                         }
                     }
-                    .contextMenu { exposureActions(for: asset) }
             } else {
                 GeometryReader { geometry in
                     let rows = JustifiedAssetGridLayout.rows(
@@ -315,7 +369,7 @@ struct ContentView: View {
             }
             .help(asset.originalFilename)
             .contextMenu {
-                exposureActions(for: asset)
+                rotationActions(for: asset)
                 Divider()
                 Button("选择此照片") { library.select(asset.id, extending: false) }
                 Button("全选当前目录照片") { library.selectAll() }
@@ -327,11 +381,21 @@ struct ContentView: View {
             .accessibilityAddTraits(library.selectedIDs.contains(asset.id) ? [.isSelected] : [])
     }
 
-    @ViewBuilder private func exposureActions(for asset: KeepsAsset) -> some View {
-        Button("自动曝光") { exposureTasks.automaticExposure(assetID: asset.id) }
-            .disabled(asset.trashed || exposureTasks.isPending(assetID: asset.id))
-        Button("还原曝光调整") { exposureTasks.resetExposure(assetID: asset.id) }
-            .disabled(asset.trashed || exposureTasks.isPending(assetID: asset.id))
+    private func configureGeometryTasks() {
+        geometryTasks.configure(library.isOperationBlocking ? nil : library.configuration)
+    }
+
+    @ViewBuilder private func rotationActions(for asset: KeepsAsset) -> some View {
+        Button("向左旋转 90°") { geometryTasks.rotate(assetID: asset.id, quarterTurns: -1) }
+            .disabled(adjustmentUnavailable(for: asset))
+        Button("向右旋转 90°") { geometryTasks.rotate(assetID: asset.id, quarterTurns: 1) }
+            .disabled(adjustmentUnavailable(for: asset))
+        Button("旋转 180°") { geometryTasks.rotate(assetID: asset.id, quarterTurns: 2) }
+            .disabled(adjustmentUnavailable(for: asset))
+    }
+
+    private func adjustmentUnavailable(for asset: KeepsAsset) -> Bool {
+        asset.trashed || library.isOperationBlocking || geometryTasks.isPending(assetID: asset.id) || geometryTasks.storageError != nil || library.configuration == nil
     }
 
     private var bottomBar: some View {
@@ -343,6 +407,21 @@ struct ContentView: View {
                 galleryFocused = true
             }.disabled(library.assets.isEmpty)
             Divider().frame(height: 16)
+            if detailMode, let asset = library.selectedAsset {
+                Button { assetToCrop = asset } label: { Image(systemName: "crop") }
+                    .buttonStyle(.plain).help("裁剪").accessibilityLabel("裁剪")
+                    .disabled(adjustmentUnavailable(for: asset) || asset.standard == nil)
+                Button { geometryTasks.rotate(assetID: asset.id, quarterTurns: -1) } label: { Image(systemName: "rotate.left") }
+                    .buttonStyle(.plain).help("向左旋转 90°").accessibilityLabel("向左旋转 90°")
+                    .disabled(adjustmentUnavailable(for: asset))
+                Button { geometryTasks.rotate(assetID: asset.id, quarterTurns: 1) } label: { Image(systemName: "rotate.right") }
+                    .buttonStyle(.plain).help("向右旋转 90°").accessibilityLabel("向右旋转 90°")
+                    .disabled(adjustmentUnavailable(for: asset))
+                Button("180°") { geometryTasks.rotate(assetID: asset.id, quarterTurns: 2) }
+                    .buttonStyle(.plain).help("旋转 180°").accessibilityLabel("旋转 180°")
+                    .disabled(adjustmentUnavailable(for: asset))
+                Divider().frame(height: 16)
+            }
             if !library.selectedIDs.isEmpty {
                 HStack(spacing: 6) {
                     ForEach(1...5, id: \.self) { rating in
@@ -402,12 +481,35 @@ struct ContentView: View {
                     Text("选择照片以查看信息").font(.system(size: 12)).foregroundStyle(.secondary)
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            Divider()
+            Button { openAIWorkspace() } label: {
+                Label(aiEditingTitle, systemImage: "wand.and.stars").frame(maxWidth: .infinity)
+            }.disabled(!canStartAIEditing).padding(16)
         }.background(WorkspaceStyle.panel)
+    }
+
+    private func openAIWorkspace() {
+        startsAIWorkspace = !library.selectedIDs.isEmpty
+        if startsAIWorkspace { batch.prepare(library: library) }
+        showsAIWorkspace = true
+    }
+
+    private var aiEditingTitle: String {
+        batch.batch != nil ? "打开调色工作台" : library.selectedIDs.count > 1 ? "AI 调色（\(library.selectedIDs.count) 张）" : "AI 调色"
+    }
+
+    private var canStartAIEditing: Bool {
+        (batch.batch != nil || !library.selectedIDs.isEmpty) && library.client != nil && !library.isOperationBlocking &&
+        !library.isMutating && !library.isSelectingAll && !library.isCheckingConnection && !library.isUpdatingHiddenDirectory &&
+        !library.isImportingPhotos && library.directoryToCreate == nil && library.directoryToRename == nil && library.directoryToTrash == nil
     }
 
     private var inspectorRail: some View {
         VStack {
             railButton("照片信息", icon: "info.circle", selected: showsInspector) { showsInspector.toggle() }
+            railButton(aiEditingTitle, icon: "wand.and.stars", selected: false) { openAIWorkspace() }
+                .disabled(!canStartAIEditing)
+                .accessibilityIdentifier("ai-editing-selected-photos")
             Spacer()
         }.padding(.top, 18).frame(width: 48).background(WorkspaceStyle.panel)
     }

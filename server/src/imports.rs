@@ -855,13 +855,12 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
                 .into_owned()
         })
         .collect();
-    let indexed;
     let mut assets = HashSet::new();
     let mut ready = 0;
     let mut media_error: Option<String> = None;
     let paths_json = serde_json::to_string(&paths)?;
     let indexed_assets = db.prepare("SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1")?.query_map(params![library,paths_json],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    indexed = indexed_assets.len();
+    let indexed = indexed_assets.len();
     assets.extend(indexed_assets);
     for asset in &assets {
         let media: Option<(String,Option<String>,bool)> = db.query_row("SELECT c.status,coalesce(CASE WHEN c.status='failed' THEN c.last_error END,CASE WHEN c.browse_attempts>=4 THEN c.browse_last_error END),coalesce(c.status='ready' AND c.spec=?3 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND c.browse_thumbnail IS NOT NULL AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=json_extract(c.thumbnail,'$.version') AND json_extract(c.browse_thumbnail,'$.spec')=?4,0) FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?1 AND c.asset_id=?2",params![library,asset,crate::cache_pipeline::spec()?,crate::browse_cache::SPEC],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?;

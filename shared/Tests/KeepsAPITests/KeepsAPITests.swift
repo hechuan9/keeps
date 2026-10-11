@@ -22,6 +22,24 @@ struct KeepsAPITests {
         #expect(job.status == "pending")
     }
 
+    @Test func navigationCountsShowRecursiveThenDirectTotals() throws {
+        let data = Data(#"{"path":"/photos","name":"photos","photoCount":85,"directPhotoCount":12,"hasChildren":true}"#.utf8)
+        let directory = try JSONDecoder().decode(KeepsNavigationDirectory.self, from: data)
+        #expect(directory.photoCountLabel == "85（12）")
+        #expect(KeepsNavigationDirectory(path: "/photos", name: "photos", photoCount: 3334, hasChildren: true, directPhotoCount: 3334).photoCountLabel == "3334")
+        #expect(KeepsNavigationDirectory(path: "/empty", name: "empty", photoCount: 0, hasChildren: false, directPhotoCount: 0).photoCountLabel == "0")
+        #expect(try JSONDecoder().decode(KeepsNavigationDirectory.self, from: JSONEncoder().encode(directory)) == directory)
+        let old = Data(#"{"path":"/photos","name":"photos","photoCount":85,"hasChildren":true}"#.utf8)
+        #expect(try JSONDecoder().decode(KeepsNavigationDirectory.self, from: old).photoCountLabel == "85（—）")
+    }
+
+    @Test func editRecipeMetadataPreservesOpinionWithParameters() throws {
+        let recipe = KeepsEditRecipe(recipeJSON: "{}", xmp: "xmp", metadata: "{\"opinion\":\"保留暖光\"}")
+        let data = try JSONEncoder().encode(recipe)
+        #expect(try JSONDecoder().decode(KeepsEditRecipe.self, from: data) == recipe)
+        let old = Data("{\"engine\":\"darktable\",\"engineVersion\":\"5.6.2\",\"recipeJSON\":\"{}\",\"xmp\":\"xmp\"}".utf8)
+        #expect(try JSONDecoder().decode(KeepsEditRecipe.self, from: old).metadata == nil)
+    }
     @Test func rejectedTrashUsesPreviewIdentityAndNumericConfirmation() async throws {
         let id = UUID()
         let fixture = Fixture { request in
@@ -39,6 +57,41 @@ struct KeepsAPITests {
         #expect(preview.count == 2)
         #expect(try await fixture.client.submitRejectedTrash(id: preview.id, confirmationCount: 2).id == id)
         #expect(try await fixture.client.rejectedTrashTask(id: id).totalFiles == 3)
+    }
+
+
+    @Test func originalDownloadUsesAuthenticatedVersionRouteAndPreservesExistingDestination() async throws {
+        let id = UUID()
+        let hash = String(repeating: "a", count: 64)
+        let fixture = Fixture { request in
+            #expect(request.httpMethod == "GET")
+            #expect(request.url!.path == "/api/libraries/library/assets/\(id.uuidString)/versions/\(hash)/download")
+            #expect(request.value(forHTTPHeaderField: "Accept") == "application/octet-stream")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")
+            return (200, "raw bytes")
+        }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("sample.ARW")
+        try await fixture.client.downloadVersion(assetID: id, contentHash: hash, to: destination)
+        #expect(try Data(contentsOf: destination) == Data("raw bytes".utf8))
+        await #expect(throws: (any Error).self) {
+            try await fixture.client.downloadVersion(assetID: id, contentHash: hash, to: destination)
+        }
+        #expect(try Data(contentsOf: destination) == Data("raw bytes".utf8))
+    }
+
+    @Test func originalDownloadFailureDoesNotPublishFileOrExposeResponseBody() async throws {
+        let fixture = Fixture { _ in (403, "private response text") }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        do {
+            try await fixture.client.downloadVersion(assetID: UUID(), contentHash: String(repeating: "a", count: 64), to: destination)
+            Issue.record("Expected download failure")
+        } catch {
+            #expect(!error.localizedDescription.contains("private response text"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
     }
 
     @Test func trashDirectorySendsStableRequestIDAndReturnsAcceptedTask() async throws {
