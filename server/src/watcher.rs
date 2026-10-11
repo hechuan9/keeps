@@ -1,4 +1,4 @@
-//! Filesystem events drive durable scoped work; startup and lost events trigger reconciliation.
+//! Filesystem events drive scoped work; full-library scans require a manual request.
 use crate::{
     jobs::{Folder, Jobs},
     media,
@@ -56,14 +56,18 @@ pub fn run(
             refresh = Instant::now() + Duration::from_secs(5);
         }
         if overflow.swap(false, Ordering::Relaxed) {
-            reconcile(&jobs, &folders)?;
+            tracing::warn!(
+                "filesystem event queue overflowed; run a manual scan to recover missed changes"
+            );
             structure_changed = true;
             refresh = Instant::now();
         }
         match receiver.recv_timeout(Duration::from_millis(250)) {
             Ok(Ok(event)) => {
                 if event.need_rescan() {
-                    reconcile(&jobs, &folders)?;
+                    tracing::warn!(
+                        "filesystem events were lost; run a manual scan to recover missed changes"
+                    );
                     structure_changed = true;
                     refresh = Instant::now();
                 } else if meaningful_event(&event.kind) {
@@ -105,24 +109,12 @@ pub fn run(
             }
 
             Ok(Err(error)) => {
-                tracing::error!(error = %error, "filesystem watch failed; scheduling reconciliation");
-                reconcile(&jobs, &folders)?;
+                tracing::error!(error = %error, "filesystem watch failed; run a manual scan to recover missed changes");
                 structure_changed = true;
                 refresh = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(error) => return Err(error).context("filesystem watcher disconnected"),
-        }
-    }
-    Ok(())
-}
-
-fn reconcile(jobs: &Jobs, folders: &[Folder]) -> Result<()> {
-    for folder in folders {
-        if let Err(error) = jobs.enqueue_external_scan(&folder.id)
-            && jobs.is_active(&folder.id)?
-        {
-            tracing::error!(folder_id = %folder.id, error = %format!("{error:#}"), "could not queue reconciliation");
         }
     }
     Ok(())
@@ -177,7 +169,9 @@ fn queue_event_path(
         .iter()
         .filter(|folder| folder.active && path.starts_with(&folder.path))
     {
-        let queued = if directory {
+        let queued = if directory && path == jobs.root() {
+            jobs.enqueue_directory_change(&folder.id, path, 2)
+        } else if directory {
             jobs.enqueue_removed_directory(&folder.id, path, 2)
         } else if sidecar {
             // A stem XMP can describe multiple same-stem originals in this directory.
@@ -285,7 +279,6 @@ fn add_watches(
     folders: &[Folder],
 ) -> Result<()> {
     let mut visited = HashSet::new();
-    let mut added = HashSet::new();
     let mut pending: Vec<PathBuf> = folders.iter().map(|f| PathBuf::from(&f.path)).collect();
     while let Some(path) = pending.pop() {
         if excluded_path(jobs.root(), &path) || !path.is_dir() || !visited.insert(path.clone()) {
@@ -305,7 +298,6 @@ fn add_watches(
                 }
             }
             watched.insert(path.clone());
-            added.insert(path.clone());
         }
         let entries = match std::fs::read_dir(&path) {
             Ok(entries) => entries,
@@ -330,25 +322,52 @@ fn add_watches(
             }
         }
     }
-    for path in &added {
-        if path.parent().is_some_and(|parent| added.contains(parent)) {
-            continue;
-        }
-        for folder in folders.iter().filter(|f| path.starts_with(&f.path)) {
-            if let Err(error) = jobs.enqueue_external_reconcile_scope(&folder.id, path)
-                && jobs.is_active(&folder.id)?
-            {
-                return Err(error)
-                    .with_context(|| format!("queue new watch reconciliation {}", path.display()));
-            }
-        }
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installing_watches_does_not_scan_existing_photos() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("originals");
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        std::fs::write(root.join("child/existing.jpg"), b"existing photo").unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
+        let folder = jobs.add_folder("library", ".").unwrap();
+        let mut watcher = notify::recommended_watcher(|_| {}).unwrap();
+        let mut watched = HashSet::new();
+        for _ in 0..2 {
+            synchronize(
+                &jobs,
+                &mut watcher,
+                &mut watched,
+                std::slice::from_ref(&folder),
+            )
+            .unwrap();
+            assert!(jobs.jobs(10).unwrap().is_empty());
+            invalidate_watches(&mut watcher, &mut watched, jobs.root());
+        }
+        let manual = jobs.enqueue_scan(&folder.id).unwrap();
+        assert_eq!(manual.work_class, "manual");
+        assert_eq!(manual.scope_kind, "recursive");
+    }
+
+    #[test]
+    fn root_directory_event_only_scans_the_direct_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("originals");
+        std::fs::create_dir_all(&root).unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
+        let store = Store::open(&dir.path().join("catalog.sqlite"), true).unwrap();
+        let folder = jobs.add_folder("library", ".").unwrap();
+        queue_event_path(&store, &jobs, &[folder], jobs.root(), true).unwrap();
+        let job = jobs.jobs(10).unwrap().remove(0);
+        assert_eq!(job.work_class, "automatic");
+        assert_eq!(job.scope_kind, "directory");
+    }
 
     #[test]
     fn self_generated_access_events_cannot_overflow_the_change_queue() {

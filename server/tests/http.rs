@@ -2322,3 +2322,209 @@ async fn photo_move_tasks_are_durable_scoped_and_idempotent() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn rejected_trash_requires_auth_frozen_inventory_and_matching_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    state
+        .jobs
+        .add_folder("photos", state.jobs.root().to_str().unwrap())
+        .unwrap();
+    let id = seed(&state, &dir.path().canonicalize().unwrap(), "rejected.jpg");
+    state
+        .store
+        .patch_asset("photos", &id, &json!({"flagState":"rejected"}))
+        .unwrap();
+    let app = router(state.clone());
+    let preview_path = "/libraries/photos/rejected-trash/preview";
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(preview_path)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/libraries/other/rejected-trash/preview",
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, preview) = call(app.clone(), "POST", preview_path, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["count"], 1);
+    assert_eq!(preview["status"], "draft");
+    assert_eq!(preview["completedFiles"], 0);
+    let task_path = format!(
+        "/libraries/photos/rejected-trash/{}",
+        preview["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            &task_path,
+            json!({"confirmationCount":2})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(app.clone(), "GET", &task_path, Value::Null).await.1["status"],
+        "draft"
+    );
+    let (status, submitted) = call(
+        app.clone(),
+        "POST",
+        &task_path,
+        json!({"confirmationCount":1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{submitted}");
+    assert_eq!(submitted["status"], "pending");
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            &task_path,
+            json!({"confirmationCount":1})
+        )
+        .await
+        .1["id"],
+        preview["id"]
+    );
+    let (_, second) = call(app.clone(), "POST", preview_path, Value::Null).await;
+    let second_path = format!(
+        "/libraries/photos/rejected-trash/{}",
+        second["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            &second_path,
+            json!({"confirmationCount":1})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    state
+        .store
+        .patch_asset("photos", &id, &json!({"flagState":"picked"}))
+        .unwrap();
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            &second_path,
+            json!({"confirmationCount":1})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert!(dir.path().join("originals/rejected.jpg").exists());
+}
+
+#[tokio::test]
+async fn directory_metadata_refresh_is_recursive_manual_durable_and_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    let root = state.jobs.root().to_path_buf();
+    std::fs::create_dir_all(root.join("tracked/sub/nested")).unwrap();
+    std::fs::create_dir(root.join("untracked")).unwrap();
+    let folder = state.jobs.add_folder("photos", "tracked").unwrap();
+    let app = router(state.clone());
+    let endpoint = "/libraries/photos/directories/refresh";
+    let path = root.join("tracked/sub");
+    let (status, job) = call(app.clone(), "POST", endpoint, json!({"path":path})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{job}");
+    assert_eq!(job["folderID"], folder.id);
+    assert_eq!(job["path"], path.to_str().unwrap());
+    assert_eq!(job["scopeKind"], "recursive");
+    assert_eq!(job["workClass"], "manual");
+    assert_eq!(job["refreshMetadata"], true);
+    assert_eq!(job["pathSync"], false);
+    assert_eq!(job["waitForQuiet"], false);
+    assert_eq!(job["status"], "pending");
+    let (_, repeated) = call(app.clone(), "POST", endpoint, json!({"path":path})).await;
+    assert_eq!(repeated["id"], job["id"]);
+    let (_, summary) = call(
+        app.clone(),
+        "GET",
+        "/libraries/photos/task-status",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(summary["longTask"]["kind"], "manual");
+    assert_eq!(summary["longTask"]["path"], path.to_str().unwrap());
+    assert_eq!(summary["longTask"]["processed"], 0);
+    assert_eq!(summary["longTask"]["failed"], 0);
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            endpoint,
+            json!({"path":root.join("untracked")})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for rejected in [
+        root.join("tracked/missing"),
+        root.join("tracked/../untracked"),
+        dir.path().to_path_buf(),
+    ] {
+        assert_eq!(
+            call(app.clone(), "POST", endpoint, json!({"path":rejected}))
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let claimed = state.jobs.claim_class("manual").unwrap().unwrap();
+    let current = path.join("nested/photo.jpg");
+    state
+        .jobs
+        .update_progress(&claimed.id, 7, 0, 2, current.to_str())
+        .unwrap();
+    keeps_server::tasks::begin(&state.jobs, "photos", "manual", current.to_str()).unwrap();
+    let (_, running) = call(
+        app.clone(),
+        "GET",
+        "/libraries/photos/task-status",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(running["longTask"]["status"], "running");
+    assert_eq!(running["longTask"]["path"], path.to_str().unwrap());
+    assert_eq!(
+        running["longTask"]["currentPhoto"],
+        current.to_str().unwrap()
+    );
+    assert_eq!(running["longTask"]["processed"], 7);
+    assert_eq!(running["longTask"]["failed"], 2);
+    state.jobs.remove_folder(&folder.id).unwrap();
+    assert_eq!(
+        call(app, "POST", endpoint, json!({"path":path})).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let reopened = Jobs::open(&dir.path().join("keeps/db/jobs.sqlite"), &root).unwrap();
+    let saved = reopened.job(job["id"].as_str().unwrap()).unwrap().unwrap();
+    assert!(saved.refresh_metadata);
+    assert_eq!(saved.path, path.to_str().unwrap());
+}

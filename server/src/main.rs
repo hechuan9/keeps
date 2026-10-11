@@ -55,6 +55,13 @@ async fn main() -> Result<()> {
     };
     let store = Arc::new(Store::open(&database, auto_create)?);
     let jobs = Arc::new(Jobs::open(&root.join("db/jobs.sqlite"), &original)?);
+    let cancelled = jobs.cancel_automatic_full_scans()?;
+    if cancelled > 0 {
+        tracing::info!(
+            cancelled,
+            "cancelled automatic full-library scans; manual scan is required"
+        );
+    }
     keeps_server::directory_move::recover(&jobs, &store)?;
     keeps_server::worker::maintain_revisions(&store, &jobs)?;
     let original_root_names = keeps_server::navigation::parse_root_names(
@@ -85,19 +92,23 @@ async fn main() -> Result<()> {
             .context("NAS watcher task failed during startup")??;
         bail!("NAS watcher stopped before initialization");
     }
-    let mut worker = tokio::task::spawn_blocking({
+    let mut worker = keeps_server::background::spawn("worker", {
         let (store, jobs, previews, stop) =
             (store.clone(), jobs.clone(), previews.clone(), stop.clone());
         move || keeps_server::worker::run(store, jobs, previews, stop)
-    });
-    let mut directory_trash = tokio::task::spawn_blocking({
+    })?;
+    let mut directory_trash = keeps_server::background::spawn("directory_trash", {
         let (store, jobs, stop) = (store.clone(), jobs.clone(), stop.clone());
         move || keeps_server::directory_trash::run(jobs, store, stop)
-    });
-    let mut directory_move = tokio::task::spawn_blocking({
+    })?;
+    let mut directory_move = keeps_server::background::spawn("directory_move", {
         let (store, jobs, stop) = (store.clone(), jobs.clone(), stop.clone());
         move || keeps_server::directory_move::run(jobs, store, stop)
-    });
+    })?;
+    let mut imports = keeps_server::background::spawn("imports", {
+        let (jobs, stop) = (jobs.clone(), stop.clone());
+        move || keeps_server::imports::run(jobs, stop)
+    })?;
     tracing::info!(%address, "Keeps Rust server started");
     let http = axum::serve(
         listener,
@@ -118,11 +129,12 @@ async fn main() -> Result<()> {
         }
     });
     tokio::select! {
-        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;watcher.await??;directory_trash.await??;directory_move.await??;}
-        result=&mut watcher=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("NAS watcher exited unexpectedly");}}
-        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;watcher.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
-        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_move.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
-        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_trash.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
+        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;watcher.await??;directory_trash.await??;directory_move.await??;imports.await??;}
+        result=&mut watcher=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS watcher exited unexpectedly");}}
+        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;watcher.await??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
+        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_move.await??;imports.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
+        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_trash.await??;imports.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
+        result=&mut imports=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("Import worker exited unexpectedly");}}
     }
     Ok(())
 }

@@ -46,6 +46,61 @@ public final class KeepsClient: Sendable {
         let response: KeepsAssetVersions = try await request("PUT", library + ["assets", assetID.uuidString, "default-version"], body: JSONEncoder().encode(["contentHash": contentHash]))
         return response.items
     }
+    public func editState(assetID: UUID) async throws -> KeepsEditState {
+        try await request("GET", library + ["assets", assetID.uuidString, "edit"])
+    }
+    public func setNegativeVersion(assetID: UUID, contentHash: String, expectedRevision: Int64, requestID: UUID) async throws -> KeepsEditState {
+        struct Change: Encodable { let contentHash: String; let expectedRevision: Int64; let requestID: String }
+        return try await request("PUT", library + ["assets", assetID.uuidString, "negative-version"],
+                                 body: JSONEncoder().encode(Change(contentHash: contentHash, expectedRevision: expectedRevision, requestID: requestID.uuidString.lowercased())))
+    }
+    public func resetEdit(assetID: UUID, expectedRevision: Int64, requestID: UUID) async throws -> KeepsEditState {
+        struct Reset: Encodable { let expectedRevision: Int64; let requestID: String }
+        return try await request("DELETE", library + ["assets", assetID.uuidString, "edit"],
+                                 body: JSONEncoder().encode(Reset(expectedRevision: expectedRevision, requestID: requestID.uuidString.lowercased())))
+    }
+    public func prepareEditUploads(assetID: UUID, requestID: UUID) async throws -> KeepsEditUploadSession {
+        try await request("POST", library + ["assets", assetID.uuidString, "edit", "uploads"],
+                          body: JSONEncoder().encode(["requestID": requestID.uuidString.lowercased()]))
+    }
+    public func commitEdit(assetID: UUID, edit: KeepsEditCommit) async throws -> KeepsEditState {
+        try await request("PUT", library + ["assets", assetID.uuidString, "edit"], body: JSONEncoder().encode(edit))
+    }
+    public func downloadNegative(assetID: UUID, contentHash: String, to destination: URL) async throws {
+        var request = try makeRequest("GET", library + ["assets", assetID.uuidString, "edit", "source"],
+                                      query: [URLQueryItem(name: "contentHash", value: contentHash)])
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 60
+        let (temporary, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        guard let http = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
+        guard 200..<300 ~= http.statusCode else {
+            let errorBody = try Data(contentsOf: temporary)
+            throw KeepsAPIError.http(http.statusCode, String(data: errorBody, encoding: .utf8) ?? "响应体无法解码")
+        }
+        try Task.checkCancellation()
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        // The destination is a private task download, never a user photo location.
+        if FileManager.default.fileExists(atPath: destination.path) {
+            _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+        } else {
+            try FileManager.default.moveItem(at: temporary, to: destination)
+        }
+    }
+    public func uploadEditImage(target: KeepsEditUploadTarget, file: URL) async throws {
+        guard ["http", "https"].contains(target.uploadURL.scheme?.lowercased() ?? ""),
+              target.uploadURL.host != nil, target.uploadURL.user == nil, target.uploadURL.password == nil else {
+            throw KeepsAPIError.invalidResponse
+        }
+        var request = URLRequest(url: target.uploadURL)
+        request.httpMethod = "PUT"
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.timeoutInterval = 60
+        request.setValue("image/heic", forHTTPHeaderField: "Content-Type")
+        // Signed media URLs may use the NAS public address; they never need the API credential.
+        let (data, response) = try await session.upload(for: request, fromFile: file)
+        _ = try checkedData(data, response)
+    }
     public func updateAsset(id: UUID, patch: KeepsAssetPatch) async throws -> KeepsAsset {
         try await request("PATCH", library + ["assets", id.uuidString], body: JSONEncoder().encode(patch))
     }
@@ -99,6 +154,16 @@ public final class KeepsClient: Sendable {
         let response: MovedDirectory = try await request("POST", library + ["directories", "move"], body: JSONEncoder().encode(["path": path, "parentPath": parentPath, "requestID": requestID.uuidString.lowercased()]))
         return response.path
     }
+    public func previewRejectedTrash() async throws -> KeepsRejectedTrashTask {
+        try await request("POST", library + ["rejected-trash", "preview"])
+    }
+    public func submitRejectedTrash(id: UUID, confirmationCount: Int) async throws -> KeepsRejectedTrashTask {
+        try await request("POST", library + ["rejected-trash", id.uuidString.lowercased()], body: JSONEncoder().encode(["confirmationCount": confirmationCount]))
+    }
+    public func rejectedTrashTask(id: UUID) async throws -> KeepsRejectedTrashTask {
+        try await request("GET", library + ["rejected-trash", id.uuidString.lowercased()])
+    }
+
     public func trashDirectory(path: String, confirmationName: String, requestID: UUID) async throws -> KeepsDirectoryTrashTask {
         try await request("POST", library + ["directories", "trash"], body: JSONEncoder().encode(["path": path, "confirmationName": confirmationName, "requestID": requestID.uuidString.lowercased()]))
     }
@@ -113,6 +178,9 @@ public final class KeepsClient: Sendable {
     }
     public func scanFolder(id: String) async throws -> KeepsJob {
         try await request("POST", library + ["folders", id, "scan"])
+    }
+    public func refreshDirectoryMetadata(path: String) async throws -> KeepsJob {
+        try await request("POST", library + ["directories", "refresh"], body: JSONEncoder().encode(["path": path]))
     }
     public func taskStatus() async throws -> KeepsTaskStatus {
         try await request("GET", library + ["task-status"])
@@ -134,10 +202,45 @@ public final class KeepsClient: Sendable {
         let (data, response) = try await session.upload(for: request, fromFile: source, delegate: KeepsUploadProgress(progress))
         _ = try checkedData(data, response)
     }
-    public func finishImport(id: UUID) async throws -> KeepsJob {
-        struct Finished: Decodable { var job: KeepsJob }
-        let response: Finished = try await request("POST", library + ["imports", id.uuidString, "finish"])
-        return response.job
+    public func finishImport(id: UUID) async throws -> KeepsImportFinish {
+        try await request("POST", library + ["imports", id.uuidString, "finish"], query: [URLQueryItem(name: "async", value: "true")])
+    }
+    public func importFinishStatus(id: UUID) async throws -> KeepsImportFinish {
+        try await request("GET", library + ["imports", id.uuidString, "finish"])
+    }
+    public func heartbeatImport(id: UUID, workerID: String) async throws {
+        _ = try await send("POST", library + ["imports", id.uuidString, "heartbeat"], body: JSONEncoder().encode(["workerID": workerID]))
+    }
+    public func claimImportMedia(id: UUID, workerID: String) async throws -> KeepsWorkerClaim {
+        try await request("POST", library + ["worker", "claim"], body: JSONEncoder().encode(["workerID": workerID, "importID": id.uuidString]))
+    }
+    public func heartbeatWorker(taskID: String) async throws {
+        _ = try await send("POST", library + ["worker", "tasks", taskID, "heartbeat"])
+    }
+    public func downloadWorkerSource(taskID: String, to destination: URL) async throws {
+        var request = try makeRequest("GET", library + ["worker", "tasks", taskID, "source"])
+        request.timeoutInterval = 3600
+        let (temporary, response) = try await session.download(for: request)
+        guard let http = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
+        if !(200..<300).contains(http.statusCode) {
+            let handle = try FileHandle(forReadingFrom: temporary)
+            defer { try? handle.close() }
+            _ = try checkedData(handle.read(upToCount: 65_536) ?? Data(), response)
+        }
+        try FileManager.default.moveItem(at: temporary, to: destination)
+    }
+    public func uploadWorkerMedia(taskID: String, role: String, source: URL) async throws {
+        var request = try makeRequest("PUT", library + ["worker", "tasks", taskID, role])
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 3600
+        let (data, response) = try await session.upload(for: request, fromFile: source)
+        _ = try checkedData(data, response)
+    }
+    public func completeWorker(taskID: String) async throws {
+        _ = try await send("POST", library + ["worker", "tasks", taskID, "complete"])
+    }
+    public func failWorker(taskID: String, error: String) async throws {
+        _ = try await send("POST", library + ["worker", "tasks", taskID, "fail"], body: JSONEncoder().encode(["error": error]))
     }
     public func refreshPreview(assetID: UUID) async throws -> URL {
         try await refreshPreviewDescriptor(assetID: assetID).downloadURL

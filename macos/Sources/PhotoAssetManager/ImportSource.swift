@@ -1,7 +1,7 @@
 import CryptoKit
 import Foundation
 
-struct ImportSourceFile: Sendable {
+struct ImportSourceFile: Codable, Sendable {
     let url: URL
     let sourcePath: String
     let size: Int64

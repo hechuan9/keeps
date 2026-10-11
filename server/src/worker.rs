@@ -413,6 +413,13 @@ fn process_photo(
     path: &Path,
 ) -> Result<bool> {
     let paths = photo_paths(store, &job.library_id, path)?;
+    // Metadata writers may replace inodes. Keep the whole photo group untouched
+    // until import checkpoints make every published link independently recoverable.
+    if crate::imports::group_pending_publication(jobs, &job.library_id, &paths)? {
+        let queued = jobs.enqueue_file_change(&job.folder_id, path, 2)?;
+        store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
+        return Ok(false);
+    }
     // Wait for the whole pair to finish copying before starting a non-preemptible unit.
     for source in &paths {
         let stamp = file_stamp(source)?;
@@ -466,6 +473,7 @@ fn process_photo(
             ids
         };
         for id in assets {
+            store.initialize_negative(&job.library_id, &id)?;
             if job.work_class == "manual" && (job.refresh_metadata || job.scope_kind == "file") {
                 store.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
             }
@@ -706,6 +714,62 @@ fn recently_modified(mtime_ns: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_uncheckpointed_pair_defers_photo_group_without_touching_metadata() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let originals = directory.path().join("originals");
+        fs::create_dir(&originals)?;
+        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
+        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
+        let path = jobs.root().join("pair.CR3");
+        fs::write(&path, b"unchanged original")?;
+        let previews = PreviewStorage::new(
+            &directory.path().join("keeps"),
+            Some(&originals),
+            "http://localhost",
+            "test-key",
+        )?;
+        let folder = jobs.add_folder("library", ".")?;
+        let job = jobs.enqueue_manual_file(&folder.id, &path)?;
+        let batch_id = uuid::Uuid::new_v4().to_string();
+        let manifest = json!({"id":batch_id, "targetPath":jobs.root(), "finished":false,"jobId":null,
+            "files":[{"id":uuid::Uuid::new_v4().to_string(),"relativePath":"pair.JPG", "fileName":"pair.JPG", "size":8,"uploaded":true,"published":false}]});
+        jobs.db.lock().unwrap().execute(
+            "INSERT INTO imports(id,library_id,manifest) VALUES(?,?,?)",
+            rusqlite::params![batch_id, "library", manifest.to_string()],
+        )?;
+        assert!(!process_photo(&store, &jobs, &previews, &job, &path)?);
+        assert_eq!(fs::read(&path)?, b"unchanged original");
+        assert!(
+            jobs.file_state(&folder.id, path.to_str().unwrap())?
+                .is_none()
+        );
+        let queued = jobs.jobs(100)?;
+        assert!(
+            queued
+                .iter()
+                .any(|pending| pending.work_class == "automatic"
+                    && pending.path == path.to_str().unwrap())
+        );
+        assert!(!crate::imports::group_pending_publication(
+            &jobs,
+            "library",
+            &[jobs.root().join("other.CR3")]
+        )?);
+        assert!(!crate::imports::group_pending_publication(
+            &jobs,
+            "library",
+            &[jobs.root().join("other/pair.CR3")]
+        )?);
+        jobs.db.lock().unwrap().execute("UPDATE imports SET manifest=json_set(manifest,'$.files[0].published',json('true')) WHERE id=?", [&batch_id])?;
+        assert!(!crate::imports::group_pending_publication(
+            &jobs,
+            "library",
+            &[path]
+        )?);
+        Ok(())
+    }
 
     #[test]
     fn bad_file_retries_are_exact_and_do_not_restart_parent_scan() -> Result<()> {

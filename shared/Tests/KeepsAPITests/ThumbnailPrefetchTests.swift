@@ -26,6 +26,53 @@ struct ThumbnailPrefetchTests {
         return value
     }
 
+    @Test func directoryPrefetchKeepsScopeAndDownloadsEveryPage() async throws {
+        let values = try [asset(), asset(), asset()]
+        let suite = "prefetch-test-" + UUID().uuidString
+        defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+        let recorder = PrefetchRecorder()
+        let worker = ThumbnailPrefetch(defaultsSuite: suite, fetchPage: { _, query in
+            await recorder.query(query)
+            return KeepsAssetPage(items: [values[2]], total: 3, nextCursor: nil, revision: 1, isUpdating: false)
+        }, fetchCounts: { _ in KeepsCounts(all: 0, trashed: 0, picked: 0) }, prefetch: { asset, _ in
+            await recorder.download(asset.id)
+            return true
+        })
+        var query = KeepsAssetQuery()
+        query.directory = "/photos"
+        query.recursive = false
+        query.minRating = 2
+        try await worker.runDirectory(configuration: configuration, query: query,
+            firstPage: KeepsAssetPage(items: Array(values.prefix(2)), total: 3, nextCursor: "next", revision: 1, isUpdating: false))
+        #expect(Set(await recorder.downloads) == Set(values.map(\.id)))
+        var expected = query
+        expected.cursor = "next"
+        #expect(await recorder.queries == [expected])
+    }
+
+    @Test func directoryPrefetchStopsAtTenThousandAndRejectsChangedRevision() async throws {
+        let value = try asset()
+        let suite = "prefetch-test-" + UUID().uuidString
+        defer { UserDefaults(suiteName: suite)?.removePersistentDomain(forName: suite) }
+        let recorder = PrefetchRecorder()
+        let worker = ThumbnailPrefetch(defaultsSuite: suite, fetchPage: { _, query in
+            await recorder.query(query)
+            return KeepsAssetPage(items: [value], total: 2, nextCursor: nil, revision: 2, isUpdating: false)
+        }, fetchCounts: { _ in KeepsCounts(all: 0, trashed: 0, picked: 0) }, prefetch: { asset, _ in
+            await recorder.download(asset.id)
+            return true
+        })
+        var query = KeepsAssetQuery()
+        query.directory = "/photos"
+        try await worker.runDirectory(configuration: configuration, query: query,
+            firstPage: KeepsAssetPage(items: [value], total: 10_000, nextCursor: "next", revision: 1, isUpdating: false))
+        #expect(await recorder.downloads.isEmpty)
+        #expect(await recorder.queries.isEmpty)
+        try await worker.runDirectory(configuration: configuration, query: query,
+            firstPage: KeepsAssetPage(items: [value], total: 2, nextCursor: "next", revision: 1, isUpdating: false))
+        #expect(await recorder.downloads == [value.id])
+    }
+
     @Test func finitePassReportsFailuresMissingAndIncludesTrash() async throws {
         let values = try [asset(), asset(), asset(thumbnail: false), asset()]
         let suite = "prefetch-test-" + UUID().uuidString

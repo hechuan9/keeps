@@ -6,6 +6,7 @@ public struct KeepsPreviewImage: View {
     private let contentMode: ContentMode
     private let loadStandard: Bool
     private let previewScale: CGFloat
+    private let placeholderDelay: Duration
     @Environment(\.displayScale) private var displayScale
     @State private var image: CGImage?
     @State private var imageQuality = 0
@@ -13,17 +14,23 @@ public struct KeepsPreviewImage: View {
     @State private var imageConfiguration: KeepsConfiguration?
     @State private var error: String?
     @State private var retry = 0
+    @State private var revealedPlaceholderKey: String?
 
-    public init(asset: KeepsAsset, configuration: KeepsConfiguration?, contentMode: ContentMode = .fit, loadStandard: Bool = false, previewScale: CGFloat = 1) {
+    public init(asset: KeepsAsset, configuration: KeepsConfiguration?, contentMode: ContentMode = .fit, loadStandard: Bool = false, previewScale: CGFloat = 1, placeholderDelay: Duration = .zero) {
         self.asset = asset
         self.configuration = configuration
         self.contentMode = contentMode
         self.loadStandard = loadStandard
         self.previewScale = previewScale
+        self.placeholderDelay = placeholderDelay
     }
 
     private var identity: String {
         "\(asset.id)|\(asset.gridPreview?.version ?? "")|\(asset.standard?.version ?? "")"
+    }
+
+    private var placeholderKey: String {
+        "\(identity)|\(configuration?.baseURL.absoluteString ?? "")|\(configuration?.libraryID ?? "")|\(configuration?.accessCredential ?? "")|\(retry)"
     }
 
     public var body: some View {
@@ -32,8 +39,11 @@ public struct KeepsPreviewImage: View {
             let standardSize = asset.standard.map { max($0.width, $0.height) } ?? maxPixelSize
             let standardPixels = previewScale >= 5 ? standardSize : min(standardSize, Int(ceil(CGFloat(maxPixelSize) * max(1, previewScale))))
             ZStack {
-                Image(decorative: KeepsThumbnailPlaceholder.image, scale: 1)
-                    .resizable().frame(width: geometry.size.width, height: geometry.size.height)
+                Color(white: 0.15)
+                if placeholderDelay == .zero || revealedPlaceholderKey == placeholderKey {
+                    Image(decorative: KeepsThumbnailPlaceholder.image, scale: 1)
+                        .resizable().frame(width: geometry.size.width, height: geometry.size.height)
+                }
                 if let image, imageIdentity == identity, imageConfiguration == configuration {
                     Image(decorative: image, scale: displayScale)
                         .resizable().aspectRatio(contentMode: contentMode)
@@ -51,6 +61,19 @@ public struct KeepsPreviewImage: View {
             }
             .accessibilityLabel(error ?? (asset.gridPreview == nil ? "缩略图尚未生成" : asset.originalFilename))
             .accessibilityAction(named: "重新载入缩略图") { retry += 1 }
+            .task(id: placeholderKey) {
+                let key = placeholderKey
+                revealedPlaceholderKey = nil
+                do {
+                    try await Task.sleep(for: placeholderDelay)
+                    try Task.checkCancellation()
+                    revealedPlaceholderKey = key
+                } catch is CancellationError {
+                    return
+                } catch {
+                    assertionFailure(String(reflecting: error))
+                }
+            }
             .task(id: "\(identity)|\(asset.browseThumbnail?.version ?? "")|\(configuration?.baseURL.absoluteString ?? "")|\(configuration?.libraryID ?? "")|\(configuration?.accessCredential ?? "")|\(loadStandard)|\(maxPixelSize)|\(standardPixels)|\(retry)") {
                 await load(maxPixelSize: maxPixelSize, standardPixels: standardPixels)
             }

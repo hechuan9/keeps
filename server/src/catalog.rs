@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 11;
+const VERSION: i64 = 13;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -43,10 +43,16 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         "database schema {version} is newer than this server supports ({VERSION})"
     );
     if version == VERSION {
+        db.prepare("SELECT negative_hash,edit_revision,negative_selected,last_edit_request FROM catalog_assets LIMIT 0")?;
+        db.prepare(
+            "SELECT negative_hash,exposure_ev,standard,thumbnail,browse FROM photo_edits LIMIT 0",
+        )?;
+        db.prepare("SELECT request_id,payload,response FROM photo_edit_requests LIMIT 0")?;
         db.prepare("SELECT library_id,path,retained_path,basis,reason FROM catalog_deprecated_files LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,root_id FROM catalog_identity_roots LIMIT 0")?;
         db.prepare("SELECT library_id,root_id,asset_id FROM catalog_identity_aliases LIMIT 0")?;
         db.prepare("SELECT id,expires_at,completed FROM remote_cache_tasks LIMIT 0")?;
+        db.prepare("SELECT library_id,batch_id,path,worker_id,expires_at FROM import_compute_leases LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,role,file_object,object_bucket,object_key,object_etag,pixel_width,pixel_height,updated_at FROM derivative_objects LIMIT 0")?;
         db.prepare("SELECT library_id,bucket,object_key,not_before,attempts,last_error FROM media_cache_gc LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM photos LIMIT 0")?;
@@ -139,6 +145,12 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         crate::photo_relations::migrate(&tx)?;
     }
     crate::browse_cache::migrate(&tx)?;
+    if version < 12 {
+        crate::edits::migrate(&tx)?;
+    }
+    if version < 13 {
+        crate::remote_worker::migrate(&tx)?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
@@ -159,7 +171,7 @@ fn existing(db: &Connection, lib: &str, id: &str) -> Result<Option<Value>> {
         .transpose()
 }
 fn save(db: &Connection, lib: &str, a: &Value) -> Result<()> {
-    db.execute("INSERT INTO catalog_assets VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,id) DO UPDATE SET snapshot=excluded.snapshot,content_hash=excluded.content_hash,fingerprint=excluded.fingerprint,sort_time=excluded.sort_time,filename=excluded.filename,rating=excluded.rating,flag=excluded.flag,color=excluded.color,trashed=excluded.trashed",params![lib,text(a,"id")?,a.to_string(),text(a,"contentFingerprint")?,text(a,"metadataFingerprint")?,a["captureTime"].as_str().unwrap_or(text(a,"createdAt")?),text(a,"originalFilename")?,a["rating"].as_i64().unwrap_or(0),a["flagState"].as_str().unwrap_or("unflagged"),a["colorLabel"].as_str(),a["trashed"].as_bool().unwrap_or(false)])?;
+    db.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(library_id,id) DO UPDATE SET snapshot=excluded.snapshot,content_hash=excluded.content_hash,fingerprint=excluded.fingerprint,sort_time=excluded.sort_time,filename=excluded.filename,rating=excluded.rating,flag=excluded.flag,color=excluded.color,trashed=excluded.trashed",params![lib,text(a,"id")?,a.to_string(),text(a,"contentFingerprint")?,text(a,"metadataFingerprint")?,a["captureTime"].as_str().unwrap_or(text(a,"createdAt")?),text(a,"originalFilename")?,a["rating"].as_i64().unwrap_or(0),a["flagState"].as_str().unwrap_or("unflagged"),a["colorLabel"].as_str(),a["trashed"].as_bool().unwrap_or(false)])?;
     Ok(())
 }
 
@@ -223,6 +235,11 @@ fn not_found() -> anyhow::Error {
 }
 fn decorate(db: &Connection, lib: &str, mut a: Value) -> Result<Value> {
     let id = text(&a, "id")?.to_owned();
+    a["negativeContentHash"] = json!(db.query_row(
+        "SELECT negative_hash FROM catalog_assets WHERE library_id=? AND id=?",
+        params![lib, id],
+        |r| r.get::<_, Option<String>>(0)
+    )?);
     let mut paths = db.prepare_cached(ASSET_PATHS)?;
     a["paths"] = json!(
         paths
@@ -254,7 +271,7 @@ fn hidden_filter(
 
 impl Store {
     pub fn hidden_directories(&self, lib: &str) -> Result<Value> {
-        let db = self.lock()?;
+        let db = self.read()?;
         let mut statement = db.prepare(
             "SELECT path FROM catalog_hidden_directories WHERE library_id=? ORDER BY path",
         )?;
@@ -370,7 +387,7 @@ impl Store {
         if !q.show_hidden.unwrap_or(false) {
             hidden_filter(&mut filter, &mut values, lib, q.directory.as_deref());
         }
-        let mut connection = self.lock()?;
+        let mut connection = self.read()?;
         let db = connection.transaction()?;
         let revision = crate::revisions::read(&db, lib, q.directory.as_deref())?;
         let is_updating = crate::revisions::is_updating(&db, lib, q.directory.as_deref())?;
@@ -420,11 +437,12 @@ impl Store {
     }
 
     pub fn asset(&self, lib: &str, id: &str) -> Result<Value> {
-        let db = self.lock()?;
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
         decorate(&db, lib, existing(&db, lib, id)?.ok_or_else(not_found)?)
     }
     pub fn counts(&self, lib: &str, show_hidden: bool) -> Result<Value> {
-        let db = self.lock()?;
+        let db = self.read()?;
         let mut filter = "a.library_id=? AND EXISTS(SELECT 1 FROM catalog_paths live WHERE live.library_id=a.library_id AND live.asset_id=a.id)".to_string();
         let mut values: Vec<rusqlite::types::Value> = vec![lib.to_string().into()];
         if !show_hidden {
@@ -435,7 +453,8 @@ impl Store {
     }
     /// Indexed descendant counts; each asset counts once even with multiple paths.
     pub fn directory_photo_counts(&self, lib: &str, paths: &[String]) -> Result<Vec<i64>> {
-        let db = self.lock()?;
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
         let mut statement = db.prepare("SELECT count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0")?;
         paths
             .iter()
@@ -449,7 +468,7 @@ impl Store {
             .collect()
     }
     pub fn directories(&self, lib: &str) -> Result<Value> {
-        let db = self.lock()?;
+        let db = self.read()?;
         let mut statement =
             db.prepare("SELECT path,asset_id FROM catalog_paths WHERE library_id=?")?;
         let paths = statement.query_map([lib], |r| {
@@ -604,6 +623,7 @@ pub(crate) fn merge_unlocated_identity(
         return Ok(());
     };
     let mut current = existing(db, lib, target)?.context("identity merge target missing")?;
+    crate::edits::merge(db, lib, old, target)?;
     let tags: BTreeSet<String> = [&current, &previous]
         .into_iter()
         .flat_map(|s| {
@@ -682,6 +702,8 @@ fn metadata_identity_updated(
     metadata: (&str, u64, &str),
 ) -> Result<()> {
     let (new, size, mtime) = metadata;
+    db.execute("UPDATE catalog_assets SET negative_hash=?4,edit_revision=edit_revision+1 WHERE library_id=?1 AND id=?2 AND negative_hash=?3",params![lib,id,old,new])?;
+    db.execute("UPDATE photo_edits SET negative_hash=?4 WHERE library_id=?1 AND asset_id=?2 AND negative_hash=?3",params![lib,id,old,new])?;
     let size = i64::try_from(size)?;
     db.execute("INSERT OR REPLACE INTO catalog_files SELECT library_id,asset_id,?4,?5,role,holder,availability FROM catalog_files WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3",params![lib,id,old,new,size])?;
     db.execute("INSERT OR IGNORE INTO catalog_versions SELECT library_id,asset_id,?4,visual_hash,capture_key,width,height,priority,json_set(evidence,'$.capture.contentFingerprint',?4) FROM catalog_versions WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3",params![lib,id,old,new])?;
@@ -746,26 +768,48 @@ impl Store {
     where
         F: FnOnce() -> Result<Option<(String, u64, String)>>,
     {
+        // Source mutation precedes the database lock; media claims use the same
+        // order, while ordinary catalog reads and edits never wait for file I/O.
+        let _source = self
+            .source_mutation
+            .write()
+            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
+        let indexed: Option<(String, String)> = {
+            let db = self.lock()?;
+            let indexed: Option<(String, String)> = db
+                .query_row(
+                    "SELECT asset_id,content_hash FROM catalog_paths WHERE library_id=? AND path=?",
+                    params![lib, path],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((id, hash)) = &indexed {
+                ensure!(
+                    hash == expected_hash,
+                    "identity update source changed in catalog"
+                );
+                let processing: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM media_cache WHERE library_id=? AND asset_id=? AND status='processing')", params![lib,id], |r| r.get(0))?;
+                if processing {
+                    return Ok(false);
+                }
+            }
+            indexed
+        };
+        let updated = action()?;
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let indexed: Option<(String, String)> = tx
+        let current: Option<(String, String)> = tx
             .query_row(
                 "SELECT asset_id,content_hash FROM catalog_paths WHERE library_id=? AND path=?",
                 params![lib, path],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if let Some((id, hash)) = &indexed {
-            ensure!(
-                hash == expected_hash,
-                "identity update source changed in catalog"
-            );
-            let processing:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM media_cache WHERE library_id=? AND asset_id=? AND status='processing')",params![lib,id],|r|r.get(0))?;
-            if processing {
-                return Ok(false);
-            }
-        }
-        if let Some((hash, size, mtime)) = action()?
+        ensure!(
+            current == indexed,
+            "identity update source changed in catalog during file update"
+        );
+        if let Some((hash, size, mtime)) = updated
             && let Some((id, old)) = indexed
         {
             metadata_identity_updated(&tx, lib, &id, path, &old, (&hash, size, &mtime))?;
@@ -1060,7 +1104,7 @@ mod tests {
             asset["id"] = json!(id);
             asset["captureTime"] = json!(time);
             store.lock()?.execute(
-                "INSERT INTO catalog_assets VALUES ('lib',?,?, 'hash','fingerprint',?,'photo.jpg',1,'unflagged',NULL,0)",
+                "INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES ('lib',?,?, 'hash','fingerprint',?,'photo.jpg',1,'unflagged',NULL,0)",
                 params![id, asset.to_string(), time],
             )?;
             store.lock()?.execute(
@@ -1436,6 +1480,7 @@ mod tests {
         drop(store);
         let db = Connection::open(&path)?;
         crate::revisions::remove_schema(&db)?;
+        crate::edits::remove_schema(&db)?;
         db.execute_batch("DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; DROP TABLE catalog_hidden_directories; DROP TABLE catalog_versions; DROP TABLE catalog_version_paths; DROP TABLE catalog_defaults; PRAGMA user_version=1;")?;
         drop(db);
         assert!(Store::open(&path, false).is_err());

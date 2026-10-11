@@ -8,12 +8,13 @@ MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 
 cd "$ROOT_DIR"
-swift build >&2
+swift build --arch arm64 >&2
+BIN_DIR="$(swift build --arch arm64 --show-bin-path)"
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
-cp "$ROOT_DIR/.build/debug/PhotoAssetManager" "$MACOS_DIR/Keeps"
+cp "$BIN_DIR/PhotoAssetManager" "$MACOS_DIR/Keeps"
 chmod +x "$MACOS_DIR/Keeps"
 cp "$ROOT_DIR/Sources/PhotoAssetManager/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
 MARKETING_VERSION="$(awk '$1 == "MARKETING_VERSION" { print $3 }' "$ROOT_DIR/Version.xcconfig")"

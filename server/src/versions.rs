@@ -230,7 +230,7 @@ impl Store {
             let target = source.with_file_name(name);
             let path = target.to_str().context("standard path must be UTF-8")?;
             let owners: Vec<(String, Option<String>)> = {
-                let db = self.lock()?;
+                let db = self.read()?;
                 let mut q = db.prepare("SELECT p.asset_id,json_extract(v.evidence,'$.generatedFrom') FROM (SELECT library_id,asset_id,content_hash,path FROM catalog_paths UNION SELECT library_id,asset_id,content_hash,path FROM catalog_version_paths) p LEFT JOIN catalog_versions v USING(library_id,asset_id,content_hash) WHERE p.library_id=? AND p.path=?")?;
                 q.query_map(params![lib, path], |r| Ok((r.get(0)?, r.get(1)?)))?
                     .collect::<rusqlite::Result<_>>()?
@@ -269,7 +269,7 @@ impl Store {
             return Ok(false);
         }
         let hash = crate::media::sha256_file(path)?;
-        Ok(self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths WHERE library_id=? AND asset_id=? AND path=? AND content_hash=?)", params![lib,id,path.to_str().context("path must be UTF-8")?,hash], |r|r.get(0))?)
+        Ok(self.read()?.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths WHERE library_id=? AND asset_id=? AND path=? AND content_hash=?)", params![lib,id,path.to_str().context("path must be UTF-8")?,hash], |r|r.get(0))?)
     }
 
     pub fn publish_generated_standard(
@@ -333,13 +333,14 @@ impl Store {
         // Commit the association before publishing, so a restart can never scan an unregistered
         // generated file. A missing reserved target can be retried for the same source only.
         tx.commit()?;
+        drop(db);
         std::fs::hard_link(staged, target)
             .context("publish standard photo without replacing existing file")?;
         Ok(())
     }
 
     pub fn defaults_needing_previews(&self, lib: &str, scope: &str) -> Result<Vec<String>> {
-        let db = self.lock()?;
+        let db = self.read()?;
         let root = scope.trim_end_matches('/');
         let mut statement=db.prepare("SELECT d.asset_id FROM catalog_defaults d WHERE d.library_id=? AND d.asset_id IN (SELECT p.asset_id FROM catalog_version_paths p WHERE p.library_id=? AND p.path>=? AND p.path<?) AND EXISTS(SELECT 1 FROM catalog_version_paths p WHERE p.library_id=d.library_id AND p.asset_id=d.asset_id AND p.content_hash=d.content_hash AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)) AND NOT EXISTS(SELECT 1 FROM derivative_objects o WHERE o.library_id=d.library_id AND o.asset_id=d.asset_id AND o.role='preview') ORDER BY d.asset_id")?;
         Ok(statement
@@ -350,11 +351,23 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
     pub fn default_version(&self, lib: &str, id: &str) -> Result<Option<DefaultVersion>> {
-        Ok(self.lock()?.query_row("SELECT d.content_hash,p.path FROM catalog_defaults d JOIN catalog_version_paths p USING(library_id,asset_id,content_hash) WHERE d.library_id=? AND d.asset_id=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path LIMIT 1",params![lib,id],|r|Ok(DefaultVersion{content_hash:r.get(0)?,path:r.get(1)?})).optional()?)
+        Ok(self.read()?.query_row("SELECT d.content_hash,p.path FROM catalog_defaults d JOIN catalog_version_paths p USING(library_id,asset_id,content_hash) WHERE d.library_id=? AND d.asset_id=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path LIMIT 1",params![lib,id],|r|Ok(DefaultVersion{content_hash:r.get(0)?,path:r.get(1)?})).optional()?)
     }
     pub fn versions(&self, lib: &str, id: &str) -> Result<Value> {
-        self.asset(lib, id)?;
-        let db = self.lock()?;
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
+        let negative: Option<String> = db
+            .query_row(
+                "SELECT negative_hash FROM catalog_assets WHERE library_id=? AND id=?",
+                params![lib, id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StoreError {
+                status: 404,
+                code: "asset_not_found".into(),
+                message: "asset not found".into(),
+            })?;
         let mut stmt=db.prepare("SELECT v.content_hash,v.width,v.height,v.priority,v.evidence,coalesce(d.content_hash=v.content_hash,0),coalesce(d.user_selected,0),EXISTS(SELECT 1 FROM catalog_version_paths p WHERE p.library_id=v.library_id AND p.asset_id=v.asset_id AND p.content_hash=v.content_hash AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)) FROM catalog_versions v LEFT JOIN catalog_defaults d USING(library_id,asset_id) WHERE v.library_id=? AND v.asset_id=? ORDER BY v.priority DESC,v.width*v.height DESC,v.content_hash")?;
         let rows = stmt
             .query_map(params![lib, id], |r| {
@@ -381,14 +394,27 @@ impl Store {
             if paths.is_empty() {
                 continue;
             }
-            items.push(json!({"contentHash":hash,"width":width,"height":height,"priority":priority,"evidence":serde_json::from_str::<Value>(&evidence)?,"isDefault":default,"userSelected":default&&user,"available":available,"paths":paths}));
+            items.push(json!({"contentHash":hash,"width":width,"height":height,"priority":priority,"evidence":serde_json::from_str::<Value>(&evidence)?,"isNegative":negative.as_deref()==Some(hash.as_str()),"isDefault":default,"userSelected":default&&user,"available":available,"paths":paths}));
         }
         let deprecated = crate::photo_relations::deprecated_files(&db, lib, id)?;
-        Ok(json!({"items":items,"deprecatedFiles":deprecated}))
+        Ok(json!({"items":items,"deprecatedFiles":deprecated,"negativeContentHash":negative}))
     }
     pub fn version_candidates(&self, lib: &str, id: &str) -> Result<Value> {
-        self.asset(lib, id)?;
-        let db = self.lock()?;
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_assets WHERE library_id=? AND id=?)",
+            params![lib, id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            exists,
+            StoreError {
+                status: 404,
+                code: "asset_not_found".into(),
+                message: "asset not found".into(),
+            }
+        );
         let mut stmt=db.prepare("SELECT DISTINCT b.asset_id FROM catalog_versions a JOIN catalog_versions b ON a.library_id=b.library_id AND a.capture_key=b.capture_key WHERE a.library_id=? AND a.asset_id=? AND b.asset_id<>a.asset_id AND (coalesce(json_extract(a.evidence,'$.cameraSerial'),'')='' OR coalesce(json_extract(b.evidence,'$.cameraSerial'),'')='' OR json_extract(a.evidence,'$.cameraSerial')=json_extract(b.evidence,'$.cameraSerial')) ORDER BY b.asset_id")?;
         let items=stmt.query_map(params![lib,id],|r|Ok(json!({"assetID":r.get::<_,String>(0)?,"evidence":"matching_capture_metadata","requiresVisualConfirmation":true})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(json!({"items":items}))
@@ -979,6 +1005,7 @@ mod tests {
         {
             let db = store.lock()?;
             crate::revisions::remove_schema(&db)?;
+            crate::edits::remove_schema(&db)?;
             db.execute_batch("DROP TABLE catalog_versions;DROP TABLE catalog_defaults;DROP TABLE catalog_version_paths;DROP TABLE catalog_version_revision;DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=2;")?;
         }
         drop(store);

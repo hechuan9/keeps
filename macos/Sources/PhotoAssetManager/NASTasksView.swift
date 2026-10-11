@@ -55,6 +55,20 @@ struct NASTasksView: View {
                         if let kind = taskStatus.longTask.kind {
                             Text(Self.kindLabel(kind))
                         }
+                        if let path = taskStatus.longTask.path {
+                            Text("目录：\(path)").lineLimit(2).truncationMode(.middle)
+                                .textSelection(.enabled).help(path)
+                        }
+                        if let photo = taskStatus.longTask.currentPhoto {
+                            Text("当前照片：\(photo)").lineLimit(2).truncationMode(.middle)
+                                .textSelection(.enabled).help(photo)
+                        }
+                        if let processed = taskStatus.longTask.processed {
+                            Text("已处理 \(processed) 个文件").monospacedDigit()
+                        }
+                        if let failed = taskStatus.longTask.failed, failed > 0 {
+                            Text("失败 \(failed) 个文件").foregroundStyle(.red)
+                        }
                         if let error = taskStatus.longTask.error {
                             Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                         }
@@ -65,7 +79,7 @@ struct NASTasksView: View {
             }
             Spacer(minLength: 0)
         }
-        .padding(20).frame(width: 680, height: 420)
+        .padding(20).frame(width: 680, height: 540)
         .background(TaskWindowConfiguration())
         .task {
             await refresh()

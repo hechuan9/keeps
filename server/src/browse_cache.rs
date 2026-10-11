@@ -40,19 +40,15 @@ pub fn status(db: &Connection, library: &str) -> Result<Value> {
 
 impl Store {
     pub fn browse_descriptor(&self, library: &str, asset: &str) -> Result<Option<Value>> {
-        let row: Option<String> = self.lock()?.query_row(
-            "SELECT c.browse_thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?1 AND c.asset_id=?2 AND c.status='ready' AND c.spec=?3 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?4 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=?4",
-            params![library,asset,cache_pipeline::spec()?,SPEC], |r| r.get(0),
-        ).optional()?.flatten();
-        row.map(|v| serde_json::from_str(&v).map_err(Into::into))
-            .transpose()
+        let media = self.media_snapshot(library, asset)?;
+        Ok((!media["browse"].is_null()).then(|| media["browse"].clone()))
     }
 }
 
 pub fn process_next(store: &Store, previews: &PreviewStorage) -> Result<bool> {
     let selected = {
         let db = store.lock()?;
-        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail FROM media_cache c INDEXED BY media_cache_browse_pending JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND (c.browse_thumbnail IS NULL OR json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion') IS NOT c.browse_source_version OR json_extract(c.browse_thumbnail,'$.spec') IS NOT c.browse_spec) AND c.browse_attempts<?2 AND c.browse_available_at<=unixepoch() ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,MAX_ATTEMPTS], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?
+        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail FROM media_cache c INDEXED BY media_cache_browse_pending JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND (c.browse_thumbnail IS NULL OR json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion') IS NOT c.browse_source_version OR json_extract(c.browse_thumbnail,'$.spec') IS NOT c.browse_spec) AND c.browse_attempts<?2 AND c.browse_available_at<=unixepoch() AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,MAX_ATTEMPTS], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?
     };
     let Some((lib, id, hash, thumbnail)) = selected else {
         return Ok(false);
@@ -79,7 +75,7 @@ pub fn process_next(store: &Store, previews: &PreviewStorage) -> Result<bool> {
     Ok(true)
 }
 
-fn publish(
+pub(crate) fn publish(
     store: &Store,
     lib: &str,
     id: &str,
@@ -131,7 +127,7 @@ fn publish(
 mod tests {
     use super::*;
     fn seed(store: &Store) -> Result<()> {
-        store.lock()?.execute("INSERT INTO catalog_assets VALUES('lib','asset','{}','hash','fingerprint','2024-01-01','photo.jpg',0,'none',NULL,1)", [])?;
+        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','fingerprint','2024-01-01','photo.jpg',0,'none',NULL,1)", [])?;
         store.lock()?.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec,status,thumbnail,browse_source_version,browse_spec) VALUES('lib','asset','hash',?,'ready',?, 'preview-v1',?)",params![cache_pipeline::spec()?,json!({"version":"preview-v1","objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/thumbnail/missing.heic"}}).to_string(),SPEC])?;
         Ok(())
     }

@@ -19,7 +19,7 @@ use std::{fs, path::PathBuf, sync::Arc};
 const LEASE: i64 = 1800;
 static COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn migrate(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS remote_cache_tasks(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,asset_id TEXT NOT NULL,source_hash TEXT NOT NULL,input_hash TEXT NOT NULL,input_path TEXT NOT NULL,worker_id TEXT NOT NULL,expires_at INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS remote_cache_expiry ON remote_cache_tasks(completed,expires_at);")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS import_compute_leases(library_id TEXT NOT NULL,batch_id TEXT NOT NULL,path TEXT NOT NULL,worker_id TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(library_id,batch_id,path)); CREATE INDEX IF NOT EXISTS import_compute_path ON import_compute_leases(library_id,path,expires_at); CREATE TABLE IF NOT EXISTS remote_cache_tasks(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,asset_id TEXT NOT NULL,source_hash TEXT NOT NULL,input_hash TEXT NOT NULL,input_path TEXT NOT NULL,worker_id TEXT NOT NULL,expires_at INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS remote_cache_expiry ON remote_cache_tasks(completed,expires_at);")?;
     Ok(())
 }
 pub fn expire(db: &Connection) -> Result<()> {
@@ -144,6 +144,10 @@ pub fn router() -> Router<Arc<AppState>> {
             put(thumbnail).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route(
+            "/libraries/{library}/worker/tasks/{id}/browse",
+            put(browse).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
+        .route(
             "/libraries/{library}/worker/tasks/{id}/standard",
             put(standard).layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
@@ -174,15 +178,28 @@ async fn claim(
     })
     .await
 }
+#[cfg(test)]
 fn claim_pending(
     store: &Store,
     lib: &str,
     worker: &str,
 ) -> Result<Option<(String, String, String)>> {
+    claim_pending_scoped(store, lib, worker, None)
+}
+fn claim_pending_scoped(
+    store: &Store,
+    lib: &str,
+    worker: &str,
+    batch: Option<&str>,
+) -> Result<Option<(String, String, String)>> {
+    let _source = store
+        .source_mutation
+        .read()
+        .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
     let mut db = store.lock()?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     expire(&tx)?;
-    let row = tx.query_row("SELECT asset_id,source_hash FROM media_cache WHERE library_id=? AND status='pending' AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) LIMIT 1", [lib], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?;
+    let row = tx.query_row("SELECT asset_id,source_hash FROM media_cache WHERE library_id=? AND (status='pending' OR (?2 IS NOT NULL AND status='ready' AND (browse_thumbnail IS NULL OR json_extract(browse_thumbnail,'$.sourceThumbnailVersion') IS NOT json_extract(thumbnail,'$.version') OR json_extract(browse_thumbnail,'$.spec') IS NOT 'browse-heic-64-q50-v1'))) AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.batch_id=?2 AND l.worker_id=?3 AND l.expires_at>unixepoch())) AND (?2 IS NOT NULL OR NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.expires_at>unixepoch())) LIMIT 1", params![lib,batch,worker], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?;
     let Some((asset, hash)) = row else {
         tx.commit()?;
         return Ok(None);
@@ -204,7 +221,13 @@ fn remote_worker_enabled(value: Option<&str>) -> Result<bool> {
     }
 }
 fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Result<Value> {
-    if !remote_worker_enabled(enabled)? {
+    let batch_id = body["importID"]
+        .as_str()
+        .map(uuid::Uuid::parse_str)
+        .transpose()?
+        .map(|id| id.to_string());
+    let batch = batch_id.as_deref();
+    if batch.is_none() && !remote_worker_enabled(enabled)? {
         return Ok(json!({"task":null,"enabled":false}));
     }
     {
@@ -227,7 +250,7 @@ fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Re
         if deferred_count >= crate::cache_pipeline::BATCH {
             return Ok(json!({"task":null}));
         }
-        let Some(candidate) = claim_pending(&s.store, lib, worker)? else {
+        let Some(candidate) = claim_pending_scoped(&s.store, lib, worker, batch)? else {
             return Ok(json!({"task":null}));
         };
         if !s.store.defer_cache_for_scan(&s.jobs, lib, &candidate.1)? {
@@ -265,7 +288,7 @@ fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Re
         Ok(None) => Ok(json!({"task":null})),
         Ok(Some(t)) => Ok(json!({
         "task":{
-        "taskID":t.id,"assetID":t.asset,"sourceHash":t.hash,"inputHash":t.input_hash,"filename":t.path.file_name().context("filename")?.to_str().context("filename utf8")?,"sizeBytes":fs::metadata(&t.path)?.len(),"mediaType":if media::is_video(&t.path) { "video" } else { "photo" },"generateStandard":needs_standard(&t),"deferred":deferred(&t),"thumbnailEdge":512,"thumbnailQuality":cache::thumbnail_quality()?,"leaseSeconds":LEASE}
+        "taskID":t.id,"assetID":t.asset,"sourceHash":t.hash,"inputHash":t.input_hash,"filename":t.path.file_name().context("filename")?.to_str().context("filename utf8")?,"sizeBytes":fs::metadata(&t.path)?.len(),"mediaType":if media::is_video(&t.path) { "video" } else { "photo" },"generateStandard":needs_standard(&t),"generateBrowse":batch.is_some(),"deferred":deferred(&t),"thumbnailEdge":512,"thumbnailQuality":cache::thumbnail_quality()?,"leaseSeconds":LEASE}
         }
         )),
         Err(e) => {
@@ -431,6 +454,13 @@ async fn thumbnail(
 ) -> Result<Json<Value>, ApiError> {
     upload(s, lib, id, body, "thumbnail").await
 }
+async fn browse(
+    State(s): State<Arc<AppState>>,
+    Path((lib, id)): Path<(String, String)>,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    upload(s, lib, id, body, "browse").await
+}
 async fn standard(
     State(s): State<Arc<AppState>>,
     Path((lib, id)): Path<(String, String)>,
@@ -452,6 +482,24 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         .map_err(|_| anyhow::anyhow!("worker commit poisoned"))?;
     let t = task(&s.store, lib, id)?;
     if t.completed == 1 {
+        let root = scratch(s, &t)?;
+        let browse = root.join("browse.heic");
+        if browse.exists() {
+            let thumbnail = s.store.media_snapshot(lib, &t.asset)?["thumbnail"].clone();
+            let bm = MediaProcessor::new().extract(&browse)?;
+            ensure!(
+                bm.width > 0 && bm.height > 0 && bm.width <= 64 && bm.height <= 64,
+                "invalid browse thumbnail"
+            );
+            let hash = media::sha256_file(&browse)?;
+            let object = s
+                .previews
+                .put_generated_role(lib, &t.asset, &hash, &browse, "browse")?;
+            let version = thumbnail["version"].as_str().context("thumbnail version")?;
+            let descriptor = json!({"objectRef":object,"width":bm.width,"height":bm.height,"sizeBytes":fs::metadata(&browse)?.len(),"version":format!("{}:{}",crate::browse_cache::SPEC,hash),"spec":crate::browse_cache::SPEC,"sourceThumbnailVersion":version});
+            crate::browse_cache::publish(&s.store, lib, &t.asset, &t.hash, version, &descriptor)?;
+        }
+        fs::remove_dir_all(root)?;
         return Ok(json!({"ok":true}));
     }
     s.store.lock()?.execute(
@@ -526,6 +574,32 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         "version":media::sha256_file(&standard)?,"sizeBytes":fs::metadata(&standard)?.len(),
         "mtimeNs":cache::file_mtime(&standard)?,"deferred":deferred(&t)
     });
+    let browse_path = root.join("browse.heic");
+    let reserved: bool = s.store.lock()?.query_row(
+        "SELECT EXISTS(SELECT 1 FROM import_compute_leases WHERE library_id=? AND path=?)",
+        params![lib, t.path.to_string_lossy()],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        !reserved || browse_path.exists(),
+        "import browse thumbnail required"
+    );
+    let browse_descriptor = if browse_path.exists() {
+        let bm = MediaProcessor::new().extract(&browse_path)?;
+        ensure!(
+            bm.width > 0 && bm.height > 0 && bm.width <= 64 && bm.height <= 64,
+            "invalid browse thumbnail"
+        );
+        let bh = media::sha256_file(&browse_path)?;
+        let object = s
+            .previews
+            .put_generated_role(lib, &t.asset, &bh, &browse_path, "browse")?;
+        Some(
+            json!({"objectRef":object,"width":bm.width,"height":bm.height,"sizeBytes":fs::metadata(&browse_path)?.len(),"version":format!("{}:{}",crate::browse_cache::SPEC,bh),"spec":crate::browse_cache::SPEC,"sourceThumbnailVersion":thumbnail_descriptor["version"]}),
+        )
+    } else {
+        None
+    };
     s.store.cache_publish(
         lib,
         &t.asset,
@@ -537,6 +611,18 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         task(&s.store, lib, id)?.completed == 1,
         "source changed before publication"
     );
+    if let Some(descriptor) = browse_descriptor {
+        crate::browse_cache::publish(
+            &s.store,
+            lib,
+            &t.asset,
+            &t.hash,
+            thumbnail_descriptor["version"]
+                .as_str()
+                .context("thumbnail version")?,
+            &descriptor,
+        )?;
+    }
     fs::remove_dir_all(root)?;
     Ok(json!({"ok":true}))
 }
@@ -578,6 +664,71 @@ async fn fail(
 mod tests {
     use super::*;
     #[test]
+    fn identity_io_allows_catalog_edits_but_cache_claim_waits_for_new_hash() -> Result<()> {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+        let dir = tempfile::tempdir()?;
+        let store = Arc::new(Store::open(&dir.path().join("db"), true)?);
+        let id = store.ingest_original("lib", "/photo.jpg",
+            &json!({"contentHash":"old-hash","sizeBytes":8,"role":"jpeg_original"}),
+            &json!({"contentFingerprint":"old-hash","metadataFingerprint":"fp","createdAt":"2024-01-01","originalFilename":"photo.jpg","rating":0,"flagState":"unflagged","tags":[]}))?;
+        store.reconcile_cache()?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let identity = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                store.with_identity_update("lib", "/photo.jpg", "old-hash", || {
+                    started_tx.send(())?;
+                    release_rx.recv_timeout(Duration::from_secs(5))?;
+                    Ok(Some(("new-hash".into(), 9, "2".into())))
+                })
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let (claimed_tx, claimed_rx) = mpsc::channel();
+        let claim = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                claimed_tx
+                    .send(claim_pending(&store, "lib", "test-worker"))
+                    .unwrap();
+            }
+        });
+        let (patched_tx, patched_rx) = mpsc::channel();
+        let foreground = std::thread::spawn({
+            let (store, id) = (store.clone(), id.clone());
+            move || {
+                let result = store
+                    .patch_asset("lib", &id, &json!({"rating":5}))
+                    .and_then(|_| store.asset("lib", &id));
+                patched_tx.send(result).unwrap();
+            }
+        });
+        let patched = patched_rx.recv_timeout(Duration::from_secs(2));
+        let claim_blocked = matches!(
+            claimed_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        release_tx.send(())?;
+        assert!(identity.join().unwrap()?);
+        foreground.join().unwrap();
+        claim.join().unwrap();
+        assert_eq!(patched??["rating"], 5);
+        assert!(
+            claim_blocked,
+            "cache claim must wait while the source is changing"
+        );
+        let (_, asset, hash) = claimed_rx
+            .recv_timeout(Duration::from_secs(2))??
+            .context("cache claim")?;
+        assert_eq!(asset, id);
+        assert_eq!(hash, "new-hash");
+        assert_eq!(store.asset("lib", &id)?["rating"], 5);
+        Ok(())
+    }
+
+    #[test]
     fn remote_workers_require_explicit_enablement() -> Result<()> {
         for value in [None, Some("0"), Some("false")] {
             assert!(!remote_worker_enabled(value)?);
@@ -602,7 +753,7 @@ mod tests {
     fn setup() -> Result<(tempfile::TempDir, Store)> {
         let root = tempfile::tempdir()?;
         let store = Store::open(&root.path().join("db.sqlite"), true)?;
-        store.lock()?.execute("INSERT INTO catalog_assets VALUES('lib','asset','{}','hash','fingerprint','2024-01-01','photo.jpg',0,'none',NULL,0)",[])?;
+        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','fingerprint','2024-01-01','photo.jpg',0,'none',NULL,0)",[])?;
         store.reconcile_cache()?;
         store
             .lock()?
@@ -628,6 +779,85 @@ mod tests {
             .lock()?
             .execute("UPDATE media_cache SET status='pending'", [])?;
         Ok((root, store))
+    }
+    #[test]
+    fn schema_twelve_requires_explicit_migration_and_installs_import_leases() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("db.sqlite");
+        let store = Store::open(&path, true)?;
+        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','asset','{}','hash','fp','2024-01-01','photo.jpg',0,'none',NULL,0)",[])?;
+        store.reconcile_cache()?;
+        store.lock()?.execute(
+            "UPDATE media_cache SET status='ready',thumbnail=?",
+            [json!({"version":"preserved"}).to_string()],
+        )?;
+        store
+            .lock()?
+            .execute_batch("DROP TABLE import_compute_leases; PRAGMA user_version=12;")?;
+        drop(store);
+        let error = Store::open(&path, false)
+            .err()
+            .context("old schema unexpectedly opened")?;
+        assert!(format!("{error:#}").contains("database migration required"));
+        let migrated = Store::open(&path, true)?;
+        migrated.lock()?.prepare("SELECT library_id,batch_id,path,worker_id,expires_at FROM import_compute_leases LIMIT 0")?;
+        let preserved: String=migrated.lock()?.query_row("SELECT json_extract(thumbnail,'$.version') FROM media_cache WHERE status='ready' AND asset_id='asset'",[],|r|r.get(0))?;
+        assert_eq!(preserved, "preserved");
+        drop(migrated);
+        Store::open(&path, false)?;
+        Ok(())
+    }
+    #[test]
+    fn import_claim_requires_live_owned_batch_and_excludes_global_workers() -> Result<()> {
+        let (root, store) = pending_setup()?;
+        add_indexed_source(root.path(), &store)?;
+        store.lock()?.execute(
+            "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()+3600)",
+            [root.path().join("photo.jpg").to_str().unwrap()],
+        )?;
+        assert!(claim_pending(&store, "lib", "other")?.is_none());
+        assert!(claim_pending_scoped(&store, "lib", "mac", Some("other-batch"))?.is_none());
+        assert!(claim_pending_scoped(&store, "lib", "other", Some("batch"))?.is_none());
+        assert_eq!(
+            claim_pending_scoped(&store, "lib", "mac", Some("batch"))?
+                .unwrap()
+                .1,
+            "asset"
+        );
+        store
+            .lock()?
+            .execute("DELETE FROM remote_cache_tasks", [])?;
+        store
+            .lock()?
+            .execute("UPDATE media_cache SET status='pending'", [])?;
+        store.lock()?.execute(
+            "UPDATE import_compute_leases SET expires_at=unixepoch()-1",
+            [],
+        )?;
+        assert!(claim_pending_scoped(&store, "lib", "mac", Some("batch"))?.is_none());
+        assert!(claim_pending(&store, "lib", "other")?.is_some());
+        Ok(())
+    }
+    #[test]
+    fn batch_claim_recovers_ready_preview_without_browse_after_worker_restart() -> Result<()> {
+        let (root, store) = pending_setup()?;
+        add_indexed_source(root.path(), &store)?;
+        store.lock()?.execute(
+            "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()+3600)",
+            [root.path().join("photo.jpg").to_str().unwrap()],
+        )?;
+        store.lock()?.execute(
+            "UPDATE media_cache SET status='ready',thumbnail=?",
+            [json!({"version":"preview"}).to_string()],
+        )?;
+        assert!(claim_pending(&store, "lib", "other")?.is_none());
+        assert_eq!(
+            claim_pending_scoped(&store, "lib", "mac", Some("batch"))?
+                .unwrap()
+                .1,
+            "asset"
+        );
+        Ok(())
     }
     #[test]
     fn claims_skip_trashed_assets() -> Result<()> {
@@ -736,7 +966,7 @@ mod tests {
             )?,
             0
         );
-        state.store.lock()?.execute("INSERT INTO catalog_assets VALUES('lib','other','{}','otherhash','fp','2024-01-01','other.jpg',0,'none',NULL,0)",[])?;
+        state.store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','other','{}','otherhash','fp','2024-01-01','other.jpg',0,'none',NULL,0)",[])?;
         state.store.reconcile_cache()?;
         assert_eq!(
             claim_pending(&state.store, "lib", "worker")?.unwrap().1,
@@ -767,7 +997,7 @@ mod tests {
     fn concurrent_claims_lease_each_asset_once() -> Result<()> {
         let (_root, store) = pending_setup()?;
         for i in 0..24 {
-            store.lock()?.execute("INSERT INTO catalog_assets SELECT library_id,?1,snapshot,?1,?1,sort_time,filename,rating,flag,color,trashed FROM catalog_assets WHERE id='asset'", [format!("asset-{i}")])?;
+            store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) SELECT library_id,?1,snapshot,?1,?1,sort_time,filename,rating,flag,color,trashed FROM catalog_assets WHERE id='asset'", [format!("asset-{i}")])?;
         }
         store.reconcile_cache()?;
         let store = Arc::new(store);

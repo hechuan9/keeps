@@ -23,11 +23,42 @@ public actor ThumbnailPrefetch {
     }
 
     public static let shared = ThumbnailPrefetch()
+
+    public func runDirectory(configuration: KeepsConfiguration, query: KeepsAssetQuery,
+                             firstPage: KeepsAssetPage) async throws {
+        guard query.directory != nil, firstPage.total < 10_000 else { return }
+        var page = firstPage
+        var requested = query
+        while true {
+            try Task.checkCancellation()
+            guard page.total < 10_000, page.revision == firstPage.revision else { return }
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                var pending = page.items.makeIterator()
+                func enqueue(_ asset: KeepsAsset) {
+                    group.addTask { [directoryPrefetch] in
+                        try Task.checkCancellation()
+                        guard try await directoryPrefetch(asset, configuration) else {
+                            throw CocoaError(.fileWriteOutOfSpace)
+                        }
+                    }
+                }
+                for _ in 0..<4 { if let asset = pending.next() { enqueue(asset) } }
+                while try await group.next() != nil {
+                    try Task.checkCancellation()
+                    if let asset = pending.next() { enqueue(asset) }
+                }
+            }
+            guard let cursor = page.nextCursor else { return }
+            requested.cursor = cursor
+            page = try await fetchPage(configuration, requested)
+        }
+    }
     private var running: Set<String> = []
     private let defaults: UserDefaults
     private let fetchPage: @Sendable (KeepsConfiguration, KeepsAssetQuery) async throws -> KeepsAssetPage
     private let fetchCounts: @Sendable (KeepsConfiguration) async throws -> KeepsCounts
     private let prefetch: @Sendable (KeepsAsset, KeepsConfiguration) async throws -> Bool
+    private let directoryPrefetch: @Sendable (KeepsAsset, KeepsConfiguration) async throws -> Bool
     private let browseCache: PreviewCache
     private let localCache: PreviewCache
     private let delay: Duration
@@ -38,6 +69,14 @@ public actor ThumbnailPrefetch {
         defaults = .standard
         fetchPage = { try await KeepsClient(configuration: $0).assets(query: $1) }
         fetchCounts = { try await KeepsClient(configuration: $0).counts(showHidden: true) }
+        directoryPrefetch = { asset, configuration in
+            for (descriptor, target) in [(asset.thumbnail, cache), (asset.browseThumbnail, browseCache)] {
+                guard let descriptor else { continue }
+                guard try await target.prefetch(assetID: asset.id, preview: descriptor,
+                                                configuration: configuration, skipWhenBusy: false) else { return false }
+            }
+            return true
+        }
         prefetch = { asset, configuration in
             while await PreviewCache.standards.isDownloading {
                 try await Task.sleep(for: .seconds(1))
@@ -61,6 +100,7 @@ public actor ThumbnailPrefetch {
         self.fetchPage = fetchPage
         self.fetchCounts = fetchCounts
         self.prefetch = prefetch
+        directoryPrefetch = prefetch
         delay = .zero
     }
 

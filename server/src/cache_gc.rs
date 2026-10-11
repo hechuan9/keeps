@@ -43,7 +43,8 @@ fn generated_key(object: &Value) -> Result<(&str, &str)> {
         && parts[0] == "libraries"
         && parts[2] == "assets"
         && parts[4] == "derivatives"
-        && ["preview", "thumbnail", "browse"].contains(&parts[5])
+        && (["preview", "thumbnail", "browse"].contains(&parts[5])
+            || parts[5] == "standard" && parts[6].starts_with("edit-"))
         && parts[6].ends_with(".heic")
         && parts.iter().all(|part| {
             !part.is_empty() && ![".", ".."].contains(part) && !part.contains(['\\', '\0'])
@@ -105,10 +106,9 @@ impl Store {
         Ok(self.lock()?.execute("UPDATE media_cache_gc SET attempts=0,last_error=NULL,not_before=unixepoch()+1200 WHERE rowid IN(SELECT rowid FROM media_cache_gc WHERE library_id=? AND attempts>=4 ORDER BY not_before LIMIT 20)",[library])?)
     }
     pub fn switch_ready_previews(&self, previews: &PreviewStorage) -> Result<usize> {
-        let mut db = self.lock()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = {
-            let mut q=tx.prepare("SELECT c.library_id,c.asset_id,c.thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=c.library_id AND d.asset_id=c.asset_id LEFT JOIN derivative_objects o ON o.library_id=c.library_id AND o.asset_id=c.asset_id AND o.role='preview' WHERE c.status='ready' AND c.spec=? AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND (o.object_key IS NULL OR o.object_key!=json_extract(c.thumbnail,'$.objectRef.key') OR o.object_bucket!=json_extract(c.thumbnail,'$.objectRef.bucket')) LIMIT 20")?;
+            let db = self.lock()?;
+            let mut q=db.prepare("SELECT c.library_id,c.asset_id,c.thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=c.library_id AND d.asset_id=c.asset_id LEFT JOIN derivative_objects o ON o.library_id=c.library_id AND o.asset_id=c.asset_id AND o.role='preview' WHERE c.status='ready' AND c.spec=? AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND (o.object_key IS NULL OR o.object_key!=json_extract(c.thumbnail,'$.objectRef.key') OR o.object_bucket!=json_extract(c.thumbnail,'$.objectRef.bucket')) LIMIT 20")?;
             q.query_map([crate::cache_pipeline::spec()?], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -122,6 +122,18 @@ impl Store {
         for (library, asset, thumbnail) in rows {
             let thumbnail: Value = serde_json::from_str(&thumbnail)?;
             if previews.contains(&thumbnail["objectRef"])? {
+                let mut db = self.lock()?;
+                let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                let current: Option<String> = tx.query_row("SELECT c.thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=c.library_id AND d.asset_id=c.asset_id WHERE c.library_id=? AND c.asset_id=? AND c.status='ready' AND c.spec=? AND c.source_hash=coalesce(d.content_hash,a.content_hash)", params![library,asset,crate::cache_pipeline::spec()?], |row| row.get(0)).optional()?;
+                if current
+                    .as_deref()
+                    .map(serde_json::from_str::<Value>)
+                    .transpose()?
+                    .as_ref()
+                    != Some(&thumbnail)
+                {
+                    continue;
+                }
                 switch_preview(
                     &tx,
                     &library,
@@ -129,18 +141,17 @@ impl Store {
                     &thumbnail,
                     chrono::Utc::now().timestamp(),
                 )?;
+                crate::revisions::flush(&tx)?;
+                tx.commit()?;
                 count += 1;
             }
         }
-        crate::revisions::flush(&tx)?;
-        tx.commit()?;
         Ok(count)
     }
     pub fn collect_cache_garbage(&self, previews: &PreviewStorage, now: i64) -> Result<usize> {
-        let mut db = self.lock()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let rows = {
-            let mut q=tx.prepare("SELECT bucket,object_key,attempts FROM media_cache_gc WHERE not_before<=? AND attempts<? ORDER BY not_before LIMIT 20")?;
+            let db = self.lock()?;
+            let mut q=db.prepare("SELECT bucket,object_key,attempts FROM media_cache_gc WHERE not_before<=? AND attempts<? ORDER BY not_before LIMIT 20")?;
             q.query_map(params![now, MAX_ATTEMPTS], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -151,13 +162,23 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut deleted = 0;
-        for (bucket, key, attempts) in rows.into_iter().take(LIMIT) {
+        for (bucket, key, _) in rows.into_iter().take(LIMIT) {
+            // One object is the atomic reference-check/delete unit, so foreground
+            // requests can use the database between filesystem operations.
+            let mut db = self.lock()?;
+            let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let attempts: Option<i64> = tx.query_row("SELECT attempts FROM media_cache_gc WHERE bucket=? AND object_key=? AND not_before<=? AND attempts<?", params![bucket,key,now,MAX_ATTEMPTS], |row| row.get(0)).optional()?;
+            let Some(attempts) = attempts else {
+                continue;
+            };
             let referenced: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM derivative_objects WHERE object_bucket=?1 AND object_key=?2) OR EXISTS(SELECT 1 FROM media_cache WHERE json_extract(thumbnail,'$.objectRef.bucket')=?1 AND json_extract(thumbnail,'$.objectRef.key')=?2) OR EXISTS(SELECT 1 FROM media_cache WHERE json_extract(browse_thumbnail,'$.objectRef.bucket')=?1 AND json_extract(browse_thumbnail,'$.objectRef.key')=?2)",params![bucket,key],|r|r.get(0))?;
+            let referenced = referenced || tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_edits WHERE json_extract(standard,'$.objectRef.key')=?1 OR json_extract(thumbnail,'$.objectRef.key')=?1 OR json_extract(browse,'$.objectRef.key')=?1)", [&key], |r|r.get::<_,bool>(0))?;
             if referenced {
                 tx.execute(
                     "UPDATE media_cache_gc SET not_before=? WHERE bucket=? AND object_key=?",
                     params![now + GRACE_SECONDS, bucket, key],
                 )?;
+                tx.commit()?;
                 continue;
             }
             let object = json!({"bucket":bucket,"key":key});
@@ -176,8 +197,8 @@ impl Store {
                     tx.execute("UPDATE media_cache_gc SET attempts=attempts+1,last_error=?,not_before=? WHERE bucket=? AND object_key=?",params![error,now+60*(attempts+1)*(attempts+1),bucket,key])?;
                 }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(deleted)
     }
 }

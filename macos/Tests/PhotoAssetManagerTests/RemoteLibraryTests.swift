@@ -5,6 +5,73 @@ import KeepsAPI
 @testable import PhotoAssetManager
 
 @MainActor struct RemoteLibraryTests {
+    @Test func metadataRefreshTargetsRightClickedDirectoryWithoutChangingSelection() async throws {
+        _ = NSApplication.shared
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://tree.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        store.refreshNavigation()
+        try await waitUntil { !store.isLoadingNavigation }
+        store.query.directory = "root"
+        let outline = DirectoryOutlineView.DirectoryOutline()
+        let column = NSTableColumn(identifier: .init("directory"))
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+        let coordinator = DirectoryOutlineView.Coordinator(library: store)
+        coordinator.outline = outline
+        outline.dataSource = coordinator
+        outline.delegate = coordinator
+        coordinator.update()
+        var openedTracking = false
+        coordinator.openTaskWindow = { openedTracking = true }
+        let clicked = try #require(outline.item(atRow: 1))
+        let menu = try #require(coordinator.contextMenu(for: clicked))
+        let entry = try #require(menu.items.first { $0.title == "刷新目录全部元数据" })
+        #expect(!openedTracking)
+        #expect(NSApp.sendAction(try #require(entry.action), to: entry.target, from: entry))
+        try await waitUntil { openedTracking }
+        #expect(store.query.directory == "root")
+        #expect(outline.selectedRow == -1)
+        #expect(store.submittingMetadataRefreshPaths.isEmpty)
+        #expect(!store.isDirectoryOperationBlocking)
+    }
+
+    @Test func startupPublishesLibraryOnlyAfterSuccessfulLoad() async {
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://nas.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        #expect(!store.isStartupReady)
+        await store.loadStartupLibrary(sleep: { _ in Issue.record("successful startup should not retry") })
+        #expect(store.isStartupReady)
+        #expect(store.hasLoadedResults)
+        #expect(store.counts != nil)
+        #expect(store.startupAttempt == 1)
+        #expect(!store.startupExhausted)
+    }
+
+    @Test func startupStopsAfterTenFailuresWithExponentialBackoff() async {
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://unauthorized.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        var delays: [Duration] = []
+        await store.loadStartupLibrary(sleep: { delays.append($0) })
+        #expect(delays == [1, 2, 4, 8, 16, 32, 64, 128, 256].map { Duration.seconds($0) })
+        #expect(store.startupAttempt == 10)
+        #expect(store.startupExhausted)
+        #expect(!store.isStartupReady)
+        #expect(!store.hasLoadedResults)
+        #expect(store.startupError != nil)
+    }
+
+    @Test func cancelledStartupDoesNotExhaustRetriesAndCanResume() async {
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://unauthorized.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false, persistConfiguration: { _ in })
+        await store.loadStartupLibrary(sleep: { _ in throw CancellationError() })
+        #expect(store.startupAttempt == 1)
+        #expect(!store.startupExhausted)
+        #expect(!store.isStartupReady)
+        let saved = await store.checkConnection(baseURL: "https://nas.invalid", libraryID: "test", accessCredential: "", save: true)
+        #expect(saved)
+        #expect(!store.isStartupReady)
+        try? await waitUntil { !store.isLoading }
+        await store.loadStartupLibrary()
+        #expect(store.isStartupReady)
+        #expect(store.startupAttempt == 1)
+    }
+
     @Test func directoryTrashMenuTargetsClickedFolderAndRejectsWrongConfirmation() async throws {
         _ = NSApplication.shared
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://tree.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
@@ -406,9 +473,10 @@ import KeepsAPI
 
     @Test func revisionPollingRefreshesOnlyWhenChangedAndStopsWhileInactive() async throws {
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://revision.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        await store.loadStartupLibrary()
         store.setActive(true)
         defer { store.setActive(false) }
-        try await waitUntil { store.assets.count == 2 && !store.isLoading }
+        try await waitUntil { LibraryStubProtocol.treeRequests.count(for: "revision-poll") == 1 && !store.isLoading }
         #expect(LibraryStubProtocol.treeRequests.count(for: "revision-assets") == 1)
         store.setActive(false)
         store.setActive(true)
@@ -495,6 +563,35 @@ import KeepsAPI
         #expect(store.nextCursor == nil)
     }
 
+    @Test func slowCountsDoNotBlockRevisionChecks() async throws {
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://slow-counts.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        store.refresh()
+        try await waitUntil { LibraryStubProtocol.treeRequests.count(for: "slow-counts-started") == 1 }
+        #expect(!store.isLoading)
+        #expect(store.counts == nil)
+        store.refresh()
+        try await waitUntil { LibraryStubProtocol.treeRequests.count(for: "slow-counts-revision") == 2 && !store.isLoading }
+        #expect(store.counts == nil)
+        #expect(LibraryStubProtocol.treeRequests.count(for: "slow-counts-started") == 1)
+        try await waitUntil { store.counts != nil }
+        #expect(store.lastError == nil)
+    }
+
+    @Test func metadataMutationSurvivesConcurrentRefresh() async throws {
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://slow-mutation.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        store.refresh()
+        try await waitUntil { !store.isLoading }
+        store.select(try #require(store.assets.first).id)
+        store.updateSelected(KeepsAssetPatch(rating: 5))
+        try await waitUntil { LibraryStubProtocol.treeRequests.count(for: "slow-mutation-started") == 1 }
+        store.refresh()
+        #expect(!store.isLoading)
+        try await waitUntil { !store.isMutating && !store.isLoading }
+        #expect(store.assets.first?.rating == 5)
+        #expect(LibraryStubProtocol.treeRequests.count(for: "slow-mutation-assets") == 2)
+        #expect(store.lastError == nil)
+    }
+
     private func stubSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [LibraryStubProtocol.self]
@@ -522,6 +619,34 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        if request.url?.host == "slow-counts.invalid" {
+            if request.url?.path.hasSuffix("/revision") == true { Self.treeRequests.record("slow-counts-revision") }
+            if request.url?.path.hasSuffix("/counts") == true {
+                Self.treeRequests.record("slow-counts-started")
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.4) { [self] in
+                    deliver(body: "{\"all\":2,\"picked\":0,\"trashed\":0}", status: 200)
+                }
+                return
+            }
+        }
+        if request.url?.host == "slow-mutation.invalid" {
+            if request.httpMethod == "PATCH" {
+                Self.treeRequests.record("slow-mutation-started")
+                DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { [self] in
+                    Self.treeRequests.record("slow-mutation-completed")
+                    deliver(body: Self.asset("00000000-0000-0000-0000-000000000001").replacingOccurrences(of: "\"rating\":0", with: "\"rating\":5"), status: 200)
+                }
+                return
+            }
+            if request.url?.path.hasSuffix("/assets") == true {
+                Self.treeRequests.record("slow-mutation-assets")
+                if Self.treeRequests.count(for: "slow-mutation-completed") > 0 {
+                    let updated = Self.asset("00000000-0000-0000-0000-000000000001").replacingOccurrences(of: "\"rating\":0", with: "\"rating\":5")
+                    deliver(body: "{\"items\":[\(updated)],\"total\":1,\"revision\":2,\"isUpdating\":false}", status: 200)
+                    return
+                }
+            }
+        }
         if request.url?.host == "directory-trash.invalid" {
             if request.url?.path.hasSuffix("/directories/trash") == true {
                 Self.treeRequests.record("directory-trash")
@@ -587,6 +712,23 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
         let path = request.url!.path
         let body: String
         let status = request.url?.host == "unauthorized.invalid" || (request.url?.host == "sources-unavailable.invalid" && path.hasSuffix("/navigation")) ? 401 : 200
+        if path.hasSuffix("/directories/refresh"), request.httpMethod == "POST" {
+            var data = request.httpBody ?? Data()
+            if let stream = request.httpBodyStream {
+                stream.open()
+                defer { stream.close() }
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while stream.hasBytesAvailable {
+                    let count = stream.read(&buffer, maxLength: buffer.count)
+                    if count <= 0 { break }
+                    data.append(buffer, count: count)
+                }
+            }
+            let submitted = try! JSONDecoder().decode([String: String].self, from: data)
+            #expect(submitted == ["path": "other"])
+            deliver(body: "{\"id\":\"refresh-1\",\"folderID\":\"folder-1\",\"libraryID\":\"test\",\"path\":\"other\",\"status\":\"pending\"}", status: 202)
+            return
+        }
         if status == 401 { body = "access denied" }
         else if request.url?.host == "invalid-api.invalid" && path.hasSuffix("/assets") { body = "{}" }
         else if request.httpMethod == "PATCH" { body = second }

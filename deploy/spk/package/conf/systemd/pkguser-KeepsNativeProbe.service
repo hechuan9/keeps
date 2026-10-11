@@ -4,9 +4,9 @@ Description=Keeps isolated native feasibility probe
 [Service]
 Type=simple
 Slice=KeepsNativeProbe.slice
-Nice=10
+Nice=0
 IOSchedulingClass=best-effort
-IOSchedulingPriority=7
+IOSchedulingPriority=4
 WorkingDirectory=/var/packages/KeepsNativeProbe/var
 ExecStart=/var/packages/KeepsNativeProbe/target/bin/launch-probe
 Restart=no

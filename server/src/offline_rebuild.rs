@@ -190,7 +190,7 @@ impl Manager {
         self.save(&status)?;
         let manager = self.clone();
         let mut work = status.clone();
-        tokio::task::spawn_blocking(move || {
+        crate::background::spawn("offline-rebuild", move || {
             if let Err(error) = manager.build(&mut work) {
                 tracing::error!(error=?error, id=%work.id,"offline rebuild failed");
                 work.state = "failed".into();
@@ -199,7 +199,8 @@ impl Manager {
                     tracing::error!(error=?error,"persist failed offline rebuild");
                 }
             }
-        });
+            Ok(())
+        })?;
         Ok(status)
     }
     fn read_status(&self, id: &str) -> Result<Status> {
@@ -363,7 +364,7 @@ impl Manager {
             paths.entry(id).or_default().push(path);
         }
         let mut thumbnails = Vec::new();
-        let mut statement=source.prepare("SELECT a.id,a.snapshot,c.thumbnail,c.standard,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) ORDER BY a.id")?;
+        let mut statement=source.prepare("SELECT a.id,a.snapshot,coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) ORDER BY a.id")?;
         let rows = statement.query_map(
             params![
                 lib,
@@ -377,16 +378,18 @@ impl Manager {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )?;
         for (index, row) in rows.enumerate() {
-            let (id, snapshot, thumbnail, standard, browse) = row?;
+            let (id, snapshot, thumbnail, standard, browse, negative) = row?;
             let mut asset: Value = serde_json::from_str(&snapshot)?;
             let upper = Uuid::parse_str(&id)?.to_string().to_uppercase();
             let asset_paths = paths.remove(&id).unwrap_or_default();
             asset["id"] = json!(upper);
             asset["paths"] = json!(asset_paths);
+            asset["negativeContentHash"] = json!(negative);
             asset["preview"] = Value::Null;
             asset["thumbnail"] = Value::Null;
             asset["browseThumbnail"] = Value::Null;
@@ -994,6 +997,67 @@ mod tests {
             )?,
             2
         );
+        Ok(())
+    }
+    #[test]
+    fn bundle_uses_client_rendered_edit_images_and_negative() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = fixture(root.path());
+        let id = seed(&app, root.path(), "edited.jpg");
+        app.store.initialize_negative("photos", &id)?;
+        let hash = app.store.edit_state("photos", &id)?["negativeContentHash"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let image = root.path().join("edited.heic");
+        fs::write(&image, b"edited image bytes")?;
+        let object =
+            app.previews
+                .put_generated_role("photos", &id, "edit-version", &image, "thumbnail")?;
+        let descriptor =
+            json!({"objectRef":object,"width":64,"height":48,"version":"edit-version"});
+        app.store.lock()?.execute(
+            "INSERT INTO photo_edits VALUES('photos',?,?,1,'test','test',?,?,?)",
+            params![
+                id,
+                hash,
+                descriptor.to_string(),
+                descriptor.to_string(),
+                descriptor.to_string()
+            ],
+        )?;
+        let manager = manager(app);
+        let mut status = fresh();
+        manager.save(&status)?;
+        manager.build(&mut status)?;
+        let bytes = fs::read(manager.directory(&status.id)?.join("library.tar"))?;
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut images = 0;
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let name = entry.path()?.to_string_lossy().to_string();
+            if name == "catalog.sqlite" {
+                entry.unpack(root.path().join("edited-client.sqlite"))?;
+            }
+            if name.starts_with("thumbnails/") || name.starts_with("browse-thumbnails/") {
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                assert_eq!(bytes, b"edited image bytes");
+                images += 1;
+            }
+        }
+        assert_eq!(images, 2);
+        let db = Connection::open(root.path().join("edited-client.sqlite"))?;
+        let snapshot: String = db.query_row(
+            "SELECT snapshot FROM assets WHERE id=?",
+            [id.to_uppercase()],
+            |r| r.get(0),
+        )?;
+        let asset: Value = serde_json::from_str(&snapshot)?;
+        for role in ["thumbnail", "standard", "browseThumbnail"] {
+            assert_eq!(asset[role]["version"], "edit-version");
+        }
+        assert_eq!(asset["negativeContentHash"], hash);
         Ok(())
     }
     #[test]

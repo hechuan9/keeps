@@ -7,6 +7,40 @@ private let assetJSON = """
 """
 
 struct KeepsAPITests {
+    @Test func directoryMetadataRefreshSubmitsServerPathAndReturnsPersistentJob() async throws {
+        let fixture = Fixture { request in
+            #expect(request.httpMethod == "POST")
+            #expect(request.url!.path == "/api/libraries/library/directories/refresh")
+            let body = try JSONDecoder().decode([String: String].self, from: request.bodyData)
+            #expect(body == ["path": "/photos/旅行 & RAW"])
+            return (202, """
+            {"id":"refresh-1","folderID":"folder-1","libraryID":"library","path":"/photos/旅行 & RAW","status":"pending","processed":0}
+            """)
+        }
+        let job = try await fixture.client.refreshDirectoryMetadata(path: "/photos/旅行 & RAW")
+        #expect(job.id == "refresh-1")
+        #expect(job.status == "pending")
+    }
+
+    @Test func rejectedTrashUsesPreviewIdentityAndNumericConfirmation() async throws {
+        let id = UUID()
+        let fixture = Fixture { request in
+            let preview = request.url!.path.hasSuffix("/preview")
+            #expect(request.url!.path == "/api/libraries/library/rejected-trash/" + (preview ? "preview" : id.uuidString.lowercased()))
+            if request.httpMethod == "POST" && !preview {
+                let body = try JSONSerialization.jsonObject(with: request.bodyData) as! [String: Int]
+                #expect(body == ["confirmationCount": 2])
+            }
+            return (preview ? 200 : 202, """
+            {"id":"\(id)","count":2,"status":"\(preview ? "draft" : "pending")","phase":"waiting","completedFiles":0,"totalFiles":3,"createdAt":1,"updatedAt":1}
+            """)
+        }
+        let preview = try await fixture.client.previewRejectedTrash()
+        #expect(preview.count == 2)
+        #expect(try await fixture.client.submitRejectedTrash(id: preview.id, confirmationCount: 2).id == id)
+        #expect(try await fixture.client.rejectedTrashTask(id: id).totalFiles == 3)
+    }
+
     @Test func trashDirectorySendsStableRequestIDAndReturnsAcceptedTask() async throws {
         let id = UUID()
         let fixture = Fixture { request in
@@ -59,6 +93,16 @@ struct KeepsAPITests {
         #expect(status.longTask.error == nil)
     }
 
+    @Test func manualTaskStatusDecodesDirectoryRefreshProgress() throws {
+        let status = try JSONDecoder().decode(KeepsTaskStatus.self, from: Data("""
+        {"automatic":{"status":"idle","remainingPhotos":0,"failedPhotos":0},"longTask":{"status":"running","kind":"manual","path":"/photos/旅行","currentPhoto":"/photos/旅行/nested/IMG.ARW","processed":7,"failed":2}}
+        """.utf8))
+        #expect(status.longTask.path == "/photos/旅行")
+        #expect(status.longTask.currentPhoto == "/photos/旅行/nested/IMG.ARW")
+        #expect(status.longTask.processed == 7)
+        #expect(status.longTask.failed == 2)
+    }
+
     @Test func idleTaskStatusDecodesNullableFields() throws {
         let status = try JSONDecoder().decode(KeepsTaskStatus.self, from: Data("""
         {"automatic":{"status":"idle","currentPhoto":null,"remainingPhotos":0,"failedPhotos":0,"error":null},"longTask":{"status":"idle","kind":null,"error":null}}
@@ -103,7 +147,7 @@ struct KeepsAPITests {
             if request.url!.path.hasSuffix("/finish") {
                 #expect(request.url!.path.contains(batchID.uuidString))
                 return (200, """
-                {"job":{"id":"job","folderID":"folder","libraryID":"library","path":"/volume2/photo/旅行","status":"pending"}}
+                {"id":"\(batchID)","status":"finished","completedFiles":1,"totalFiles":1,"job":{"id":"job","folderID":"folder","libraryID":"library","path":"/volume2/photo/旅行","status":"pending"}}
                 """)
             }
             #expect(request.url!.path == "/api/libraries/library/imports")
@@ -120,7 +164,7 @@ struct KeepsAPITests {
         #expect(batch.id == batchID)
         #expect(batch.files.first?.fileName == "IMG.1.3FR")
         #expect(batch.files.first?.uploaded == true)
-        #expect(try await fixture.client.finishImport(id: batchID).status == "pending")
+        #expect(try await fixture.client.finishImport(id: batchID).job?.status == "pending")
     }
 
     @Test func scopedRevisionsPreserveUpdatingAndEncodeDirectory() async throws {

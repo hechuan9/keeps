@@ -443,7 +443,7 @@ impl Store {
         include_children: bool,
     ) -> Result<Value> {
         let path = path.map(normalize_directory).transpose()?;
-        let mut connection = self.lock()?;
+        let mut connection = self.read()?;
         let db = connection.transaction()?;
         let mut result =
             json!({"revision":read(&db, lib, path)?, "isUpdating":is_updating(&db, lib, path)?});
@@ -680,18 +680,19 @@ mod tests {
         assert_eq!(store.library_revision("lib")?["isUpdating"], false);
         {
             let db = store.lock()?;
+            crate::edits::remove_schema(&db)?;
             db.execute_batch("DROP TABLE catalog_revision_updates; DROP TABLE catalog_revision_sequence; DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=4;")?;
         }
         drop(store);
         assert!(Store::open(&path, false).is_err());
         let store = Store::open(&path, true)?;
-        assert_eq!(revision(&store, "lib", None)?, old);
+        assert_eq!(revision(&store, "lib", None)?, old + 1);
         assert_eq!(
             store.catalog_revision("lib", Some("/photos"), false)?["isUpdating"],
             false
         );
         note_at(&store, "after-upgrade", "/photos", 200)?;
-        assert_eq!(revision(&store, "lib", None)?, old + 1);
+        assert_eq!(revision(&store, "lib", None)?, old + 2);
         Ok(())
     }
 
@@ -707,6 +708,7 @@ mod tests {
             "/photos",
             chrono::Utc::now().timestamp(),
         )?;
+        store.initialize_negative("lib", &id)?;
         let asset = store.asset("lib", &id)?;
         let versions = store.versions("lib", &id)?;
         let (sequence, updates) = {
@@ -721,6 +723,7 @@ mod tests {
                 |r| r.get::<_, i64>(0),
             )?;
             let updates=db.query_row("SELECT json_group_array(json_array(library_id,path,owner,last_changed_at)) FROM (SELECT * FROM catalog_revision_updates ORDER BY library_id,path,owner)",[],|r|r.get::<_,String>(0))?;
+            crate::edits::remove_schema(&db)?;
             db.execute_batch("DROP TRIGGER photos_insert; DROP TRIGGER photos_update; DROP TRIGGER directories_insert; DROP TABLE photos; DROP TABLE videos; DROP TABLE directories; DROP TABLE media_cache_gc; DROP TABLE media_cache; DROP TABLE cache_runtime; DROP INDEX derivative_object_ref; DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases; PRAGMA user_version=5;")?;
             assert!(db.prepare("SELECT * FROM media_cache").is_err());
             (sequence, updates)
@@ -734,7 +737,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                11
+                13
             );
             assert_eq!(
                 db.query_row(
@@ -742,9 +745,27 @@ mod tests {
                     [],
                     |r| r.get::<_, i64>(0)
                 )?,
-                sequence
+                sequence + 1
             );
-            assert_eq!(db.query_row("SELECT json_group_array(json_array(library_id,path,owner,last_changed_at)) FROM (SELECT * FROM catalog_revision_updates ORDER BY library_id,path,owner)",[],|r|r.get::<_,String>(0))?,updates);
+            let after:String=db.query_row("SELECT json_group_array(json_array(library_id,path,owner,last_changed_at)) FROM (SELECT * FROM catalog_revision_updates ORDER BY library_id,path,owner)",[],|r|r.get(0))?;
+            let before: serde_json::Value = serde_json::from_str(&updates)?;
+            let after: serde_json::Value = serde_json::from_str(&after)?;
+            assert_eq!(
+                after.as_array().unwrap().len(),
+                before.as_array().unwrap().len()
+            );
+            for (before, after) in before
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(after.as_array().unwrap())
+            {
+                assert_eq!(
+                    &before.as_array().unwrap()[..3],
+                    &after.as_array().unwrap()[..3]
+                );
+                assert!(after[3].as_i64() >= before[3].as_i64());
+            }
             assert_eq!(
                 db.query_row(
                     "SELECT count(*) FROM photos WHERE library_id='lib' AND id=?",
@@ -763,7 +784,7 @@ mod tests {
                 [],
                 |r| r.get::<_, i64>(0)
             )?,
-            sequence
+            sequence + 1
         );
         Ok(())
     }
@@ -936,6 +957,7 @@ mod tests {
         let path = dir.path().join("db");
         let store = Store::open(&path, true)?;
         let id = seed(&store, "lib", "/photos/a.jpg")?;
+        store.initialize_negative("lib", &id)?;
         let asset = store.asset("lib", &id)?;
         let versions = store.versions("lib", &id)?;
         let baseline;
@@ -945,6 +967,7 @@ mod tests {
             db.execute_batch(
                 "DROP TABLE catalog_identity_roots; DROP TABLE catalog_identity_aliases;",
             )?;
+            crate::edits::remove_schema(&db)?;
             db.pragma_update(None, "user_version", 3)?;
             baseline = db.query_row(
                 "SELECT revision FROM catalog_version_revision WHERE library_id='lib'",
@@ -957,18 +980,18 @@ mod tests {
         let store = Store::open(&path, true)?;
         assert_eq!(store.asset("lib", &id)?, asset);
         assert_eq!(store.versions("lib", &id)?, versions);
-        assert_eq!(revision(&store, "lib", Some("/photos"))?, baseline + 1);
+        assert_eq!(revision(&store, "lib", Some("/photos"))?, baseline + 2);
         drop(store);
         {
             let db = Connection::open(&path)?;
             db.execute("UPDATE catalog_assets SET rating=4,snapshot=json_set(snapshot,'$.rating',4) WHERE library_id='lib' AND id=?", [&id])?;
         }
         let store = Store::open(&path, false)?;
-        assert_eq!(revision(&store, "lib", Some("/photos"))?, baseline + 2);
+        assert_eq!(revision(&store, "lib", Some("/photos"))?, baseline + 3);
         assert_eq!(store.asset("lib", &id)?["rating"], 4);
         drop(store);
         let store = Store::open(&path, false)?;
-        assert_eq!(revision(&store, "lib", None)?, baseline + 2);
+        assert_eq!(revision(&store, "lib", None)?, baseline + 3);
         Ok(())
     }
 
@@ -980,7 +1003,7 @@ mod tests {
         let mut connection = store.lock()?;
         let db = connection.transaction()?;
         db.execute_batch("WITH RECURSIVE n(i) AS (VALUES(0) UNION ALL SELECT i+1 FROM n WHERE i<99999)
-            INSERT INTO catalog_assets SELECT 'lib',printf('asset-%d',i),'{}','hash','fingerprint','2024','photo.jpg',0,'unflagged',NULL,0 FROM n;
+            INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) SELECT 'lib',printf('asset-%d',i),'{}','hash','fingerprint','2024','photo.jpg',0,'unflagged',NULL,0 FROM n;
             INSERT INTO catalog_paths SELECT 'lib',printf('/photos/%03d/%s.jpg',CAST(substr(id,7) AS INTEGER)/1000,id),id,'hash','jpeg_original' FROM catalog_assets;")?;
         flush(&db)?;
         assert_eq!(read(&db, "lib", None)?, 1);

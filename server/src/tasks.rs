@@ -84,6 +84,9 @@ struct TaskScope {
     error: Option<String>,
     class: String,
     cursor: Option<TaskCursor>,
+    processed: i64,
+    failed: i64,
+    current_path: Option<String>,
 }
 
 fn photo_key(path: &str) -> String {
@@ -160,7 +163,7 @@ impl TaskScope {
 pub fn status(store: &Store, jobs: &Jobs, library: &str) -> Result<Value> {
     let (scopes, activity) = {
         let db = jobs.db.lock().unwrap();
-        let mut q=db.prepare("SELECT COALESCE(j.scope_path,f.path),j.scope_kind,j.status,j.error,j.work_class,j.checkpoint FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=? AND f.active=1 AND j.status IN ('pending','running','failed') ORDER BY j.updated_at DESC")?;
+        let mut q=db.prepare("SELECT COALESCE(j.scope_path,f.path),j.scope_kind,j.status,j.error,j.work_class,j.checkpoint,j.processed,j.failed,j.current_path FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=? AND f.active=1 AND j.status IN ('pending','running','failed') ORDER BY j.updated_at DESC")?;
         let rows = q
             .query_map([library], |r| {
                 Ok((
@@ -170,21 +173,29 @@ pub fn status(store: &Store, jobs: &Jobs, library: &str) -> Result<Value> {
                     r.get::<_, Option<String>>(3)?,
                     r.get::<_, String>(4)?,
                     r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                    r.get::<_, i64>(7)?,
+                    r.get::<_, Option<String>>(8)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let scopes = rows
             .into_iter()
-            .map(|(path, kind, state, error, class, checkpoint)| {
-                Ok(TaskScope {
-                    path,
-                    kind,
-                    state,
-                    error,
-                    class,
-                    cursor: checkpoint.map(|c| serde_json::from_str(&c)).transpose()?,
-                })
-            })
+            .map(
+                |(path, kind, state, error, class, checkpoint, processed, failed, current_path)| {
+                    Ok(TaskScope {
+                        path,
+                        kind,
+                        state,
+                        error,
+                        class,
+                        processed,
+                        failed,
+                        current_path,
+                        cursor: checkpoint.map(|c| serde_json::from_str(&c)).transpose()?,
+                    })
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
         let activity: Option<(String,Option<String>,Option<String>,bool)>=db.query_row("SELECT work_class,current_photo,last_error,active FROM worker_activity WHERE id=1 AND library_id=?",[library],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
         (scopes, activity)
@@ -194,7 +205,8 @@ pub fn status(store: &Store, jobs: &Jobs, library: &str) -> Result<Value> {
     let mut error = None;
     let identity = jobs.identity_status(library)?;
     let (gc_pending, gc_failed, gc_error, runtime_error) = {
-        let db = store.lock()?;
+        let mut connection = store.read()?;
+        let db = connection.transaction()?;
         let mut manual = HashSet::new();
         for scope in scopes
             .iter()
@@ -309,8 +321,22 @@ pub fn status(store: &Store, jobs: &Jobs, library: &str) -> Result<Value> {
     } else {
         ("idle", None, None)
     };
+    let current_scope = if active.is_some() {
+        scopes
+            .iter()
+            .find(|scope| scope.state == "running" && Some(&scope.class) == kind.as_ref())
+    } else if long_status == "failed" {
+        failed_job.filter(|scope| Some(&scope.class) == kind.as_ref())
+    } else {
+        waiting
+    };
+    let long_current = active.and_then(|activity| activity.1.clone()).or_else(|| {
+        current_scope
+            .filter(|scope| scope.state == "running")
+            .and_then(|scope| scope.current_path.clone())
+    });
     Ok(
-        json!({"automatic":{"status":automatic_status,"currentPhoto":current,"remainingPhotos":pending.len(),"failedPhotos":failed.len(),"error":error},"longTask":{"status":long_status,"kind":kind,"error":long_error}}),
+        json!({"automatic":{"status":automatic_status,"currentPhoto":current,"remainingPhotos":pending.len(),"failedPhotos":failed.len(),"error":error},"longTask":{"status":long_status,"kind":kind,"error":long_error,"path":current_scope.map(|scope| &scope.path),"currentPhoto":long_current,"processed":current_scope.map(|scope| scope.processed),"failed":current_scope.map(|scope| scope.failed)}}),
     )
 }
 

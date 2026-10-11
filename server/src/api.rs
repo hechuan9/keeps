@@ -70,6 +70,8 @@ impl IntoResponse for ApiError {
 pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .merge(crate::remote_worker::router())
+        .merge(crate::edits::router())
+        .merge(crate::rejected_trash::router())
         .merge(crate::imports::router())
         .merge(crate::offline_rebuild::router(state.clone()))
         .route("/libraries/{library}/assets", get(assets))
@@ -110,6 +112,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/libraries/{library}/directories",
             get(directories).post(create_directory),
+        )
+        .route(
+            "/libraries/{library}/directories/refresh",
+            post(refresh_directory),
         )
         .route(
             "/libraries/{library}/assets/move-tasks",
@@ -160,6 +166,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(protected)
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/derivatives/local-download/{token}", get(local_download))
+        .route(
+            "/derivatives/local-upload/{token}",
+            axum::routing::put(crate::edits::upload),
+        )
         .route(
             "/derivatives/local-standard/{token}",
             get(standard_download),
@@ -218,6 +228,13 @@ where
         .map_err(anyhow::Error::from)?
         .map_err(ApiError::from)
 }
+async fn interactive<F, T>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+{
+    blocking(move || crate::database::interactive(operation)).await
+}
 fn signed_asset(state: &AppState, mut asset: Value) -> anyhow::Result<Value> {
     let preview = asset
         .as_object_mut()
@@ -228,19 +245,20 @@ fn signed_asset(state: &AppState, mut asset: Value) -> anyhow::Result<Value> {
     } else {
         json!({"downloadURL":state.previews.download_url(&preview["objectRef"])?,"width":preview["width"],"height":preview["height"],"version":preview["version"]})
     };
-    if let Some(id) = asset["id"].as_str().map(str::to_owned)
-        && let Some((thumbnail, standard)) =
-            state.store.cache_descriptors(&state.library_id, &id)?
-    {
-        asset["thumbnail"] = json!({"downloadURL":state.previews.download_url(&thumbnail["objectRef"])?,"width":thumbnail["width"],"height":thumbnail["height"],"version":thumbnail["version"]});
-        asset["standard"] = standard_descriptor(state, &state.library_id, &id, &standard)?;
-    }
     if let Some(id) = asset["id"].as_str().map(str::to_owned) {
-        asset["browseThumbnail"] = match state.store.browse_descriptor(&state.library_id, &id)? {
-            Some(d) => {
-                json!({"downloadURL":state.previews.download_url(&d["objectRef"])?,"width":d["width"],"height":d["height"],"version":d["version"]})
-            }
-            None => Value::Null,
+        let media = state.store.media_snapshot(&state.library_id, &id)?;
+        asset["negativeContentHash"] = media["negativeContentHash"].clone();
+        if !media["thumbnail"].is_null() {
+            let d = &media["thumbnail"];
+            asset["thumbnail"] = json!({"downloadURL":state.previews.download_url(&d["objectRef"])?,"width":d["width"],"height":d["height"],"version":d["version"]});
+            asset["standard"] =
+                standard_descriptor(state, &state.library_id, &id, &media["standard"])?;
+        }
+        asset["browseThumbnail"] = if media["browse"].is_null() {
+            Value::Null
+        } else {
+            let d = &media["browse"];
+            json!({"downloadURL":state.previews.download_url(&d["objectRef"])?,"width":d["width"],"height":d["height"],"version":d["version"]})
         };
     }
     Ok(asset)
@@ -256,7 +274,7 @@ async fn assets(
     Query(mut query): Query<crate::catalog::AssetQuery>,
 ) -> ApiResult {
     Ok(Json(
-        blocking(move || {
+        interactive(move || {
             if let Some(id) = &query.folder_id {
                 query.directory = Some(folder_for(&state, &library, id)?.path);
             }
@@ -276,9 +294,21 @@ async fn asset(
 ) -> ApiResult {
     let id = asset_id(&id)?;
     Ok(
-        Json(blocking(move || signed_asset(&state, state.store.asset(&library, &id)?)).await?)
+        Json(interactive(move || signed_asset(&state, state.store.asset(&library, &id)?)).await?)
             .into_response(),
     )
+}
+fn metadata_guard(jobs: &crate::jobs::Jobs) -> anyhow::Result<std::sync::RwLockReadGuard<'_, ()>> {
+    jobs.directory_mutation
+        .try_read()
+        .map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                resource_error(409, "目录移动或回收正在进行，请稍后重试此状态修改")
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                anyhow::anyhow!("directory mutation lock poisoned")
+            }
+        })
 }
 async fn patch_asset(
     State(state): State<Arc<AppState>>,
@@ -287,8 +317,14 @@ async fn patch_asset(
 ) -> ApiResult {
     let id = asset_id(&id)?;
     Ok(Json(
-        blocking(move || signed_asset(&state, state.store.patch_asset(&library, &id, &patch)?))
-            .await?,
+        interactive(move || {
+            let _guard = patch
+                .get("flagState")
+                .map(|_| metadata_guard(&state.jobs))
+                .transpose()?;
+            signed_asset(&state, state.store.patch_asset(&library, &id, &patch)?)
+        })
+        .await?,
     )
     .into_response())
 }
@@ -300,8 +336,11 @@ async fn set_trashed(
 ) -> ApiResult {
     let id = asset_id(&id)?;
     Ok(Json(
-        blocking(move || signed_asset(&state, state.store.set_trashed(&library, &id, trashed)?))
-            .await?,
+        interactive(move || {
+            let _guard = metadata_guard(&state.jobs)?;
+            signed_asset(&state, state.store.set_trashed(&library, &id, trashed)?)
+        })
+        .await?,
     )
     .into_response())
 }
@@ -350,7 +389,7 @@ async fn set_hidden_directory(
     Json(change): Json<HiddenDirectoryChange>,
 ) -> ApiResult {
     Ok(Json(
-        blocking(move || {
+        interactive(move || {
             state
                 .store
                 .set_hidden_directory(&library, &change.path, change.hidden)
@@ -367,6 +406,40 @@ async fn directories(State(state): State<Arc<AppState>>, Path(library): Path<Str
 struct CreateDirectoryRequest {
     parent_path: String,
     name: String,
+}
+#[derive(Deserialize)]
+struct RefreshDirectoryRequest {
+    path: String,
+}
+async fn refresh_directory(
+    State(state): State<Arc<AppState>>,
+    Path(library): Path<String>,
+    Json(body): Json<RefreshDirectoryRequest>,
+) -> ApiResult {
+    let job = blocking(move || {
+        let _directory_guard = metadata_guard(&state.jobs)?;
+        crate::directory_move::ensure_reconciled(&state.jobs)?;
+        let path = state
+            .jobs
+            .validate_path(std::path::Path::new(&body.path))
+            .map_err(|error| resource_error(422, format!("{error:#}")))?;
+        let folder = state
+            .jobs
+            .folders()?
+            .into_iter()
+            .filter(|folder| {
+                folder.active && folder.library_id == library && path.starts_with(&folder.path)
+            })
+            .max_by_key(|folder| folder.path.len())
+            .ok_or_else(|| resource_error(404, "directory is not tracked in this library"))?;
+        Ok(serde_json::to_value(
+            state
+                .jobs
+                .enqueue_manual_metadata_refresh(&folder.id, &path)?,
+        )?)
+    })
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(job)).into_response())
 }
 async fn create_directory(
     State(state): State<Arc<AppState>>,
@@ -702,7 +775,7 @@ async fn revision(
     Query(query): Query<RevisionQuery>,
 ) -> ApiResult {
     Ok(Json(
-        blocking(move || {
+        interactive(move || {
             state
                 .store
                 .catalog_revision(&library, query.path.as_deref(), query.include_children)
@@ -740,7 +813,7 @@ async fn default_version(
 ) -> ApiResult {
     let id = asset_id(&id)?;
     Ok(Json(
-        blocking(move || {
+        interactive(move || {
             let versions = state.store.versions(&library, &id)?;
             let version = versions["items"]
                 .as_array()
@@ -806,6 +879,11 @@ pub(crate) fn standard_descriptor(
         ))
     {
         return Ok(Value::Null);
+    }
+    if !standard["objectRef"].is_null() {
+        return Ok(
+            json!({"downloadURL":state.previews.download_url(&standard["objectRef"])?,"width":standard["width"],"height":standard["height"],"version":standard["version"]}),
+        );
     }
     let object = json!({"bucket":"keeps-previews","key":format!("libraries/{library}/assets/{asset}/standard/{}",standard["version"].as_str().unwrap_or(""))});
     Ok(
@@ -932,7 +1010,7 @@ async fn cache_rebuild(
 async fn task_status(State(state): State<Arc<AppState>>, Path(library): Path<String>) -> ApiResult {
     require_library(&state, &library)?;
     Ok(
-        Json(blocking(move || crate::tasks::status(&state.store, &state.jobs, &library)).await?)
+        Json(interactive(move || crate::tasks::status(&state.store, &state.jobs, &library)).await?)
             .into_response(),
     )
 }
@@ -1014,4 +1092,74 @@ async fn asset_move_status(
         Json(blocking(move || crate::asset_move::get(&state.jobs, &library, &id)).await?)
             .into_response(),
     )
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // Simulate a directory operation blocking API worker threads.
+    async fn metadata_requests_do_not_wait_for_directory_work() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("photos");
+        std::fs::create_dir(&originals)?;
+        let keeps = dir.path().join("keeps");
+        let token = "test-priority-012345678901234567890123";
+        let previews = Arc::new(PreviewStorage::new(
+            &keeps,
+            Some(&originals),
+            "http://localhost",
+            token,
+        )?);
+        let store = Arc::new(Store::open(&keeps.join("db/catalog.sqlite"), true)?);
+        let jobs = Arc::new(crate::jobs::Jobs::open(
+            &keeps.join("db/jobs.sqlite"),
+            &originals,
+        )?);
+        let id = store.ingest_original("lib", "/sample.jpg", &json!({"contentHash":"sample","sizeBytes":1,"role":"jpeg_original"}), &json!({"contentFingerprint":"sample","metadataFingerprint":"sample","originalFilename":"sample.jpg","rating":0,"tags":[],"flagState":"unflagged","createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}))?;
+        let state = Arc::new(AppState {
+            store,
+            jobs: jobs.clone(),
+            previews,
+            access_token: token.into(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        });
+        let _directory = jobs.directory_mutation.write().unwrap();
+        for (patch, expected) in [
+            (json!({"rating":5,"tags":["edited"]}), StatusCode::OK),
+            (json!({"flagState":"rejected"}), StatusCode::CONFLICT),
+        ] {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                patch_asset(
+                    State(state.clone()),
+                    Path(("lib".into(), id.clone())),
+                    Json(patch),
+                ),
+            )
+            .await?;
+            assert_eq!(
+                response
+                    .unwrap_or_else(IntoResponse::into_response)
+                    .status(),
+                expected
+            );
+        }
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            set_trashed(state.clone(), "lib".into(), id.clone(), true),
+        )
+        .await?;
+        assert_eq!(
+            response
+                .unwrap_or_else(IntoResponse::into_response)
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(state.store.asset("lib", &id)?["rating"], 5);
+        assert_eq!(state.store.asset("lib", &id)?["flagState"], "unflagged");
+        Ok(())
+    }
 }

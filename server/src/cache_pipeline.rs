@@ -166,7 +166,8 @@ impl Store {
         Ok(())
     }
     pub fn cache_status(&self, library: &str) -> Result<Value> {
-        let db = self.lock()?;
+        let mut connection = self.read()?;
+        let db = connection.transaction()?;
         let mut counts = json!({"pending":0,"processing":0,"ready":0,"failed":0});
         let mut q = db.prepare(
             "SELECT status,count(*) FROM media_cache WHERE library_id=? AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) GROUP BY status",
@@ -207,15 +208,25 @@ impl Store {
         Ok(self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,updated_at=0 WHERE rowid IN (SELECT rowid FROM media_cache WHERE library_id=? AND status IN ('pending','failed') AND last_error IS NOT NULL ORDER BY updated_at LIMIT 20)",[library])?)
     }
     pub fn cache_descriptors(&self, library: &str, asset: &str) -> Result<Option<(Value, Value)>> {
-        let row: Option<(String,String)>=self.lock()?.query_row("SELECT thumbnail,standard FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=c.library_id AND d.asset_id=c.asset_id WHERE c.library_id=? AND c.asset_id=? AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?",params![library,asset,spec()?],|r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-        row.map(|(a, b)| Ok((serde_json::from_str(&a)?, serde_json::from_str(&b)?)))
-            .transpose()
+        let media = self.media_snapshot(library, asset)?;
+        if media["thumbnail"].is_null() {
+            return Ok(None);
+        }
+        Ok(Some((
+            media["thumbnail"].clone(),
+            media["standard"].clone(),
+        )))
     }
+
     fn claim_cache(&self) -> Result<Option<(String, String, String)>> {
+        let _source = self
+            .source_mutation
+            .read()
+            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         crate::remote_worker::expire(&tx)?;
-        let row=tx.query_row("SELECT library_id,asset_id,source_hash FROM media_cache WHERE status='pending' AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) ORDER BY updated_at,asset_id LIMIT 1",[],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+        let row=tx.query_row("SELECT library_id,asset_id,source_hash FROM media_cache WHERE status='pending' AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.expires_at>unixepoch()) ORDER BY updated_at,asset_id LIMIT 1",[],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
         if let Some((lib, id, _)) = &row {
             tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
         }
@@ -416,9 +427,18 @@ pub fn process_asset(
     id: &str,
 ) -> Result<()> {
     let selected: Option<(String, String)> = {
+        let _source = store
+            .source_mutation
+            .read()
+            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
         let mut db = store.lock()?;
         let tx = db.transaction()?;
         tx.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec) SELECT a.library_id,a.id,coalesce(d.content_hash,a.content_hash),?3 FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE a.library_id=?1 AND a.id=?2 AND a.trashed=0 ON CONFLICT(library_id,asset_id) DO UPDATE SET source_hash=excluded.source_hash,spec=excluded.spec,status='pending',attempts=0,available_at=0,last_error=NULL WHERE media_cache.source_hash!=excluded.source_hash OR media_cache.spec!=excluded.spec OR (media_cache.status='cancelled' AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=excluded.library_id AND p.asset_id=excluded.asset_id AND p.content_hash=excluded.source_hash AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))",params![lib,id,spec()?])?;
+        let reserved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=? AND p.asset_id=? AND l.expires_at>unixepoch())",params![lib,id],|r|r.get(0))?;
+        if reserved {
+            tx.commit()?;
+            return Ok(());
+        }
         let row: Option<(String, String)> = tx
             .query_row(
                 "SELECT source_hash,status FROM media_cache WHERE library_id=? AND asset_id=?",
@@ -719,8 +739,45 @@ mod tests {
     fn seed(store: &Store, n: usize) -> Result<()> {
         for index in 0..n {
             let id = format!("00000000-0000-0000-0000-{index:012}");
-            store.lock()?.execute("INSERT INTO catalog_assets VALUES('lib',?,?,?,'fingerprint','2024-01-01','photo.jpg',3,'picked',NULL,0)",params![id,json!({"id":id,"rating":3,"tags":["keep"]}).to_string(),format!("hash{index}")])?;
+            store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib',?,?,?,'fingerprint','2024-01-01','photo.jpg',3,'picked',NULL,0)",params![id,json!({"id":id,"rating":3,"tags":["keep"]}).to_string(),format!("hash{index}")])?;
         }
+        Ok(())
+    }
+    #[test]
+    fn import_compute_lease_blocks_nas_claim_and_direct_encoding_until_expiry() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), dir.path())?;
+        seed(&store, 1)?;
+        store.reconcile_cache()?;
+        let id = "00000000-0000-0000-0000-000000000000";
+        let path = dir.path().join("photo.jpg").to_string_lossy().into_owned();
+        store.lock()?.execute(
+            "INSERT INTO catalog_paths VALUES('lib',?,?,'hash0','jpeg_original')",
+            params![path, id],
+        )?;
+        store.lock()?.execute(
+            "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()+3600)",
+            [&path],
+        )?;
+        assert!(store.claim_cache()?.is_none());
+        let previews = PreviewStorage::new(
+            &dir.path().join("previews"),
+            None,
+            "http://localhost",
+            "test-key",
+        )?;
+        process_asset(&store, &jobs, &previews, "lib", id)?;
+        let attempts: i64 =
+            store
+                .lock()?
+                .query_row("SELECT attempts FROM media_cache", [], |r| r.get(0))?;
+        assert_eq!(attempts, 0);
+        store.lock()?.execute(
+            "UPDATE import_compute_leases SET expires_at=unixepoch()-1",
+            [],
+        )?;
+        assert!(store.claim_cache()?.is_some());
         Ok(())
     }
     #[test]
@@ -889,7 +946,7 @@ mod tests {
                 json!({"path":source,"sizeBytes":999,"mtimeNs":0}).to_string()
             ],
         )?;
-        store.lock()?.execute("INSERT INTO catalog_assets VALUES('lib','new','{}','newhash','fingerprint','2024-01-01','photo.jpg',0,'picked',NULL,0)", [])?;
+        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','new','{}','newhash','fingerprint','2024-01-01','photo.jpg',0,'picked',NULL,0)", [])?;
         let stop = AtomicBool::new(false);
         maintain(&store, &jobs, &previews, &stop)?;
         let status = store.cache_status("lib")?;

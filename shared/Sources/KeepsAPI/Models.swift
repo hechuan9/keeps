@@ -40,6 +40,7 @@ public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var browseThumbnail: KeepsPreview? = nil
     public var thumbnail: KeepsPreview? = nil
     public var standard: KeepsPreview? = nil
+    public var negativeContentHash: String? = nil
     public var paths: [String]? = nil
     public var gridPreview: KeepsPreview? { thumbnail ?? preview }
 }
@@ -195,6 +196,10 @@ public struct KeepsLongTaskStatus: Decodable, Equatable, Sendable {
     public var status: String
     public var kind: String?
     public var error: String?
+    public var path: String?
+    public var currentPhoto: String?
+    public var processed: Int?
+    public var failed: Int?
 }
 
 public struct KeepsAssetQuery: Codable, Hashable, Sendable {
@@ -245,6 +250,7 @@ public struct KeepsAssetPatch: Encodable, Sendable {
 
 public struct KeepsAssetVersions: Decodable, Sendable {
     public var items: [KeepsAssetVersion]
+    public var negativeContentHash: String?
     public var deprecatedFiles: [DeprecatedFile]?
 
     public struct DeprecatedFile: Decodable, Sendable {
@@ -262,6 +268,7 @@ public struct KeepsAssetVersion: Decodable, Identifiable, Sendable {
     public var priority: Int
     public var isDefault: Bool
     public var userSelected: Bool
+    public var isNegative: Bool? = nil
     public var available: Bool
     public var paths: [Location]
     public var id: String { contentHash }
@@ -297,4 +304,17 @@ public struct KeepsPhotoMoveTask: Decodable, Sendable {
     public var status: String
     public var phase: String
     public var error: String?
+}
+
+public struct KeepsRejectedTrashTask: Codable, Equatable, Identifiable, Sendable {
+    public var id: UUID
+    public var count: Int
+    public var status: String
+    public var phase: String
+    public var completedFiles: Int
+    public var totalFiles: Int
+    public var error: String?
+    public var createdAt: Double
+    public var updatedAt: Double
+    public var finishedAt: Double?
 }

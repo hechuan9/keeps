@@ -21,12 +21,12 @@ fn error(status: u16, message: impl Into<String>) -> anyhow::Error {
 }
 
 #[derive(Debug)]
-struct SharedFolder {
+pub(crate) struct SharedFolder {
     name: String,
     path: PathBuf,
 }
 
-fn recycle_share(config: &str, source: &Path) -> Result<SharedFolder> {
+pub(crate) fn recycle_share(config: &str, source: &Path) -> Result<SharedFolder> {
     let mut shares = Vec::new();
     let mut path = None;
     let mut name = String::new();
@@ -90,14 +90,18 @@ fn recycle_share(config: &str, source: &Path) -> Result<SharedFolder> {
     Ok(share)
 }
 
-fn recycle_command(share: &SharedFolder, source: &Path) -> Result<std::process::Command> {
+fn recycle_command(
+    share: &SharedFolder,
+    source: &Path,
+    operation: &str,
+) -> Result<std::process::Command> {
     let relative = source
         .strip_prefix(&share.path)?
         .to_str()
         .context("path must be UTF-8")?;
     let mut command = std::process::Command::new("/usr/syno/bin/synorecycle");
     command.args([
-        "--rmdir",
+        operation,
         &format!("share={}", share.name),
         &format!("rpath={relative}"),
     ]);
@@ -105,10 +109,20 @@ fn recycle_command(share: &SharedFolder, source: &Path) -> Result<std::process::
 }
 
 fn recycle_native(share: &SharedFolder, source: &Path) -> Result<()> {
-    let output = recycle_command(share, source)?.output().context(error(
-        503,
-        "DSM native recycle program is unavailable; no fallback deletion was attempted",
-    ))?;
+    recycle_native_operation(share, source, "--rmdir")
+}
+
+pub(crate) fn recycle_file(share: &SharedFolder, source: &Path) -> Result<()> {
+    recycle_native_operation(share, source, "--unlink")
+}
+
+fn recycle_native_operation(share: &SharedFolder, source: &Path, operation: &str) -> Result<()> {
+    let output = recycle_command(share, source, operation)?
+        .output()
+        .context(error(
+            503,
+            "DSM native recycle program is unavailable; no fallback deletion was attempted",
+        ))?;
     ensure!(
         output.status.success(),
         error(
@@ -125,7 +139,7 @@ fn recycle_native(share: &SharedFolder, source: &Path) -> Result<()> {
         !source.try_exists()?,
         error(
             500,
-            "DSM recycle returned success but the source directory still exists"
+            "DSM recycle returned success but the source path still exists"
         )
     );
     Ok(())
@@ -415,7 +429,7 @@ pub fn run(
                 tracing::error!(id=%current.id,error=%format!("{failure:#}"),"Directory recycling task failed");
                 transition(&jobs, &current.id, "failed", Some(&format!("{failure:#}")))?;
             }
-        } else {
+        } else if !crate::rejected_trash::process_next(&jobs, &store)? {
             std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
@@ -585,11 +599,34 @@ mod tests {
             name: "photo".into(),
             path: "/volume2/photo".into(),
         };
-        let command = recycle_command(&share, Path::new("/volume2/photo/家庭/旅行 & RAW $(test)"))?;
+        let command = recycle_command(
+            &share,
+            Path::new("/volume2/photo/家庭/旅行 & RAW $(test)"),
+            "--rmdir",
+        )?;
         assert_eq!(command.get_program(), "/usr/syno/bin/synorecycle");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             ["--rmdir", "share=photo", "rpath=家庭/旅行 & RAW $(test)"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn file_recycle_uses_native_unlink_with_literal_arguments() -> Result<()> {
+        let share = SharedFolder {
+            name: "photo".into(),
+            path: "/volume2/photo".into(),
+        };
+        let command = recycle_command(
+            &share,
+            Path::new("/volume2/photo/family/a & b.raw"),
+            "--unlink",
+        )?;
+        assert_eq!(command.get_program(), "/usr/syno/bin/synorecycle");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--unlink", "share=photo", "rpath=family/a & b.raw"]
         );
         Ok(())
     }

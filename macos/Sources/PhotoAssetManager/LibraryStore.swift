@@ -5,6 +5,68 @@ import OSLog
 
 @MainActor
 final class LibraryStore: ObservableObject {
+    @Published private(set) var isStartupReady = false
+    @Published private(set) var startupAttempt = 0
+    @Published private(set) var startupRetrySeconds: Int?
+    @Published private(set) var startupError: String?
+    @Published private(set) var startupExhausted = false
+
+    func loadStartupLibrary(sleep: (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) async {
+        guard !isStartupReady else { return }
+        startupExhausted = false
+        startupAttempt = 0
+        startupRetrySeconds = nil
+        startupError = nil
+        guard let client, let configuration else {
+            startupError = lastError ?? "请设置服务器地址和资料库。"
+            return
+        }
+        let requestedQuery = effectiveQuery
+        for attempt in 1...10 {
+            guard !Task.isCancelled else { return }
+            startupAttempt = attempt
+            startupRetrySeconds = nil
+            do {
+                let summary = try await client.counts(showHidden: requestedQuery.showHidden)
+                let page = try await client.assets(query: requestedQuery)
+                try Task.checkCancellation()
+                guard self.configuration == configuration else { return }
+                counts = summary
+                countsShowHidden = requestedQuery.showHidden
+                lastCountsFetch = Date()
+                displayedQuery = requestedQuery
+                display(page)
+                assetCache.store(page, for: requestedQuery)
+                lastAssetFetch = Date()
+                startupError = nil
+                isStartupReady = true
+                setActive(isActive)
+                return
+            } catch {
+                guard !Task.isCancelled, self.configuration == configuration else { return }
+                startupError = Self.describe(error)
+                Self.navigationLogger.error("Startup library attempt \(attempt) failed: \(String(reflecting: error), privacy: .public)")
+            }
+            if attempt == 10 {
+                startupExhausted = true
+                return
+            }
+            let delay = 1 << (attempt - 1)
+            startupRetrySeconds = delay
+            do { try await sleep(.seconds(delay)) }
+            catch { return }
+        }
+    }
+
+    @Published var showsRejectedTrash = false
+    @Published var rejectedTrashPreview: KeepsRejectedTrashTask?
+    var rejectedTrashPreviewConfiguration: KeepsConfiguration?
+    @Published var rejectedTrash: PendingRejectedTrash?
+    @Published var rejectedTrashMessage: String?
+    @Published var rejectedTrashFinished = false
+    @Published var isPreparingRejectedTrash = false
+    var rejectedTrashTracking: Task<Void, Never>?
+    var rejectedTrashPollInterval: Duration = .seconds(1)
     @Published var directoryToRename: KeepsNavigationDirectory?
     @Published var directoryToTrash: KeepsNavigationDirectory?
     @Published var directoryTrash: PendingDirectoryTrash?
@@ -27,7 +89,7 @@ final class LibraryStore: ObservableObject {
     @Published var photoMoveFinished = false
     var photoMoveTracking: Task<Void, Never>?
     var photoMovePollInterval: Duration = .seconds(1)
-    var isDirectoryOperationBlocking: Bool { isDirectoryTrashBlocking || isMovingDirectory || photoMove != nil }
+    var isDirectoryOperationBlocking: Bool { isDirectoryTrashBlocking || isMovingDirectory || photoMove != nil || rejectedTrash != nil || isPreparingRejectedTrash }
     @Published private(set) var hiddenDirectoryPaths: Set<String> = []
     @Published private(set) var isUpdatingHiddenDirectory = false
     @Published var hiddenDirectoryFilterEnabled = true {
@@ -43,7 +105,12 @@ final class LibraryStore: ObservableObject {
     private var selectionAnchor: UUID?
     private var selectionFocus: UUID?
     @Published var query = KeepsAssetQuery() {
-        didSet { if query != oldValue { isSelectingAll = false } }
+        didSet {
+            if query != oldValue {
+                isSelectingAll = false
+                cancelDirectoryPrefetch()
+            }
+        }
     }
     @Published private(set) var counts: KeepsCounts?
     @Published private(set) var directories: [KeepsNavigationDirectory] = []
@@ -76,11 +143,17 @@ final class LibraryStore: ObservableObject {
     private let session: URLSession
     private let persistConfiguration: (KeepsConfiguration) throws -> Void
 
+    private var countsTask: Task<Void, Never>?
+    private var countsGeneration = 0
+    private var requestedCountsShowHidden: Bool?
     private var revisionTask: Task<Void, Never>?
     private var isActive = false
     private let assetCache = KeepsAssetCache()
     private var displayedQuery: KeepsAssetQuery?
     private var displayedPage: KeepsAssetPage?
+    private var directoryPrefetchTask: Task<Void, Never>?
+    private var directoryPrefetchQuery: KeepsAssetQuery?
+    private var directoryPrefetchRevision: Int64?
     private var lastAssetFetch = Date.distantPast
     private var lastNavigationFetch = Date.distantPast
     private var lastCountsFetch = Date.distantPast
@@ -90,11 +163,11 @@ final class LibraryStore: ObservableObject {
         isActive = active
         revisionTask?.cancel()
         revisionTask = nil
-        guard active, configuration != nil else { return }
+        guard active, configuration != nil, isStartupReady else { return }
         revisionTask = Task {
             while !Task.isCancelled {
                 if Date().timeIntervalSince(lastNavigationFetch) >= 300 { refreshNavigation(force: false) }
-                if !isLoading { refresh() }
+                if !isLoading && !isMutating { refresh() }
                 do { try await Task.sleep(for: .seconds(5)) }
                 catch { return }
             }
@@ -122,6 +195,7 @@ final class LibraryStore: ObservableObject {
         restoreDirectoryTrash()
         restoreDirectoryMove()
         restorePhotoMove()
+        restoreRejectedTrash()
     }
 
     var selectedAsset: KeepsAsset? { return assets.first { selectedIDs.contains($0.id) } }
@@ -218,12 +292,30 @@ final class LibraryStore: ObservableObject {
     }
 
     private func clearResults() {
+        cancelDirectoryPrefetch()
         loadTask?.cancel()
         loadGeneration += 1
         isLoading = false
         paginationVisible = false
         deselectAll()
         assets = []; total = 0; nextCursor = nil; lastError = nil
+    }
+
+    @Published private(set) var submittingMetadataRefreshPaths: Set<String> = []
+
+    func refreshDirectoryMetadata(path: String) async -> Bool {
+        guard let client, !submittingMetadataRefreshPaths.contains(path) else { return false }
+        let requestedConfiguration = configuration
+        submittingMetadataRefreshPaths.insert(path)
+        defer { submittingMetadataRefreshPaths.remove(path) }
+        do {
+            _ = try await client.refreshDirectoryMetadata(path: path)
+            guard configuration == requestedConfiguration else { return false }
+            return true
+        } catch {
+            if configuration == requestedConfiguration { lastError = Self.describe(error) }
+            return false
+        }
     }
 
     func refreshNavigation(force: Bool = true) {
@@ -294,6 +386,7 @@ final class LibraryStore: ObservableObject {
     }
 
     func pauseLibraryForDirectoryOperation() {
+        cancelDirectoryPrefetch()
         isSelectingAll = false
         loadTask?.cancel()
         loadGeneration += 1
@@ -348,6 +441,9 @@ final class LibraryStore: ObservableObject {
                 assetCache.removeAll()
                 displayedQuery = nil
                 displayedPage = nil
+                countsTask?.cancel()
+                countsTask = nil
+                countsGeneration += 1
                 lastCountsFetch = .distantPast
                 lastNavigationFetch = .distantPast
                 setActive(isActive)
@@ -379,6 +475,7 @@ final class LibraryStore: ObservableObject {
         assets = page.items
         total = page.total
         nextCursor = page.nextCursor
+        startDirectoryPrefetch(page)
         let available = Set(assets.map(\.id))
         selectedIDs.formIntersection(available)
         if let selectionAnchor, !available.contains(selectionAnchor) { self.selectionAnchor = nil }
@@ -390,12 +487,41 @@ final class LibraryStore: ObservableObject {
         }
     }
 
+    private func cancelDirectoryPrefetch() {
+        directoryPrefetchTask?.cancel()
+        directoryPrefetchTask = nil
+        directoryPrefetchQuery = nil
+        directoryPrefetchRevision = nil
+    }
+
+    private func startDirectoryPrefetch(_ page: KeepsAssetPage) {
+        let requested = effectiveQuery
+        guard let configuration, requested.directory != nil, page.total < 10_000 else {
+            cancelDirectoryPrefetch()
+            return
+        }
+        guard directoryPrefetchQuery != requested || directoryPrefetchRevision != page.revision else { return }
+        cancelDirectoryPrefetch()
+        directoryPrefetchQuery = requested
+        directoryPrefetchRevision = page.revision
+        directoryPrefetchTask = Task(priority: .background) {
+            do {
+                try await ThumbnailPrefetch.shared.runDirectory(configuration: configuration, query: requested, firstPage: page)
+            } catch {
+                guard !Task.isCancelled else { return }
+                Self.navigationLogger.error("Directory thumbnail prefetch failed: \(String(reflecting: error), privacy: .public)")
+                directoryPrefetchQuery = nil
+                directoryPrefetchRevision = nil
+            }
+        }
+    }
+
     func refresh(force: Bool = false) {
         guard !isDirectoryOperationBlocking else { return }
         guard let client else { isLoading = false; return }
         let requestedQuery = effectiveQuery
         let changedQuery = displayedQuery != requestedQuery
-        if !changedQuery && isLoading && !force { return }
+        if !changedQuery && (isMutating || (isLoading && !force)) { return }
         loadTask?.cancel()
         loadGeneration += 1
         if changedQuery {
@@ -443,15 +569,7 @@ final class LibraryStore: ObservableObject {
                     assetCache.store(combined, for: requestedQuery)
                     lastAssetFetch = Date()
                 }
-                // Counts describe the whole library, independently of the selected directory.
-                if force || counts == nil || countsShowHidden != requestedQuery.showHidden || Date().timeIntervalSince(lastCountsFetch) >= 60 {
-                    let summary = try await client.counts(showHidden: requestedQuery.showHidden)
-                    try Task.checkCancellation()
-                    guard requestGeneration == loadGeneration else { return }
-                    counts = summary
-                    countsShowHidden = requestedQuery.showHidden
-                    lastCountsFetch = Date()
-                }
+                refreshCounts(client: client, showHidden: requestedQuery.showHidden, force: force)
             } catch {
                 if !Task.isCancelled && requestGeneration == loadGeneration { lastError = Self.describe(error) }
             }
@@ -461,6 +579,28 @@ final class LibraryStore: ObservableObject {
     func setPaginationVisible(_ visible: Bool) {
         paginationVisible = visible
         if visible { loadMoreIfNeeded() }
+    }
+
+    private func refreshCounts(client: KeepsClient, showHidden: Bool, force: Bool) {
+        guard force || counts == nil || countsShowHidden != showHidden || Date().timeIntervalSince(lastCountsFetch) >= 60 else { return }
+        if countsTask != nil, !force, requestedCountsShowHidden == showHidden { return }
+        countsTask?.cancel()
+        countsGeneration += 1
+        let generation = countsGeneration
+        requestedCountsShowHidden = showHidden
+        countsTask = Task {
+            defer { if generation == countsGeneration { countsTask = nil } }
+            do {
+                let summary = try await client.counts(showHidden: showHidden)
+                try Task.checkCancellation()
+                guard generation == countsGeneration, effectiveQuery.showHidden == showHidden else { return }
+                counts = summary
+                countsShowHidden = showHidden
+                lastCountsFetch = Date()
+            } catch {
+                if !Task.isCancelled && generation == countsGeneration { lastError = Self.describe(error) }
+            }
+        }
     }
 
     private func loadMoreIfNeeded() {
@@ -559,6 +699,10 @@ final class LibraryStore: ObservableObject {
     private func mutateSelected(refreshDirectories: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
         guard !isDirectoryOperationBlocking, !isSelectingAll, let client, !isMutating, !selectedIDs.isEmpty else { return }
         let ids = selectedIDs
+        loadTask?.cancel()
+        loadGeneration += 1
+        isLoading = false
+        isCheckingRevision = false
         let generation = loadGeneration
         isMutating = true
         assetCache.removeAll()
@@ -572,6 +716,7 @@ final class LibraryStore: ObservableObject {
                     if generation == loadGeneration, let index = assets.firstIndex(where: { $0.id == id }) { assets[index] = updated }
                     completed += 1
                 }
+                isMutating = false
                 if generation == loadGeneration { refresh(force: true); if refreshDirectories { refreshNavigation() } }
             } catch { if generation == loadGeneration { lastError = "已完成 \(completed)/\(ids.count) 项。\n" + Self.describe(error) } }
         }

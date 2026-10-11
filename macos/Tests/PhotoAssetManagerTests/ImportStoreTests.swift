@@ -86,42 +86,105 @@ import Testing
         try await waitForCompletion(fixture.store)
         #expect(fixture.store.completedFiles == 1)
         let previousEvents = fixture.state.snapshot().events
-        try Data("changed source".utf8).write(to: fixture.root.appendingPathComponent("a.nef"))
+        try Data("changed source".utf8).write(to: fixture.root.appendingPathComponent("nested/b.heic"))
         fixture.store.start(targetPath: "incoming")
         try await waitForCompletion(fixture.store)
         #expect(fixture.store.errorMessage?.contains("来源文件发生变化") == true)
         #expect(fixture.store.job == nil)
-        #expect(fixture.state.snapshot().events == previousEvents)
+        #expect(fixture.state.snapshot().events == previousEvents + ["prepare"])
     }
 
-    @Test func finishFailureResumesWithoutUploadingAgain() async throws {
+    @Test func finishTimeoutQueriesSameBatchWithoutUploadingAgain() async throws {
         let fixture = try makeFixture(failFinish: true)
         defer { try? FileManager.default.removeItem(at: fixture.root) }
-        fixture.store.start(targetPath: "incoming")
-        try await waitForCompletion(fixture.store)
-        #expect(fixture.store.errorMessage != nil)
-        #expect(fixture.store.job == nil)
-        #expect(fixture.store.completedFiles == 2)
-        let firstID = fixture.store.manifest?.id
-
         fixture.store.start(targetPath: "incoming")
         try await waitForCompletion(fixture.store)
         #expect(fixture.store.errorMessage == nil)
         #expect(fixture.store.job?.id == "import-job")
         #expect(fixture.store.sentBytes == 6)
         let snapshot = fixture.state.snapshot()
-        #expect(snapshot.events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish", "prepare", "finish"])
-        #expect(snapshot.manifests.count == 2)
-        #expect(snapshot.manifests.allSatisfy { $0.id == firstID })
+        #expect(snapshot.events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish", "status"])
+        #expect(snapshot.manifests.count == 1)
     }
 
-    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
+    @Test func publishingPollsUntilFilesAreCommitted() async throws {
+        let fixture = try makeFixture(publishing: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.store.job?.id == "import-job")
+        #expect(fixture.store.publishedFiles == 2)
+        #expect(fixture.state.snapshot().events.suffix(2) == ["finish", "status"])
+    }
+
+    @Test func prepareTimeoutRetriesOriginalManifest() async throws {
+        let fixture = try makeFixture(failPrepare: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.store.job?.id == "import-job")
+        let manifests = fixture.state.snapshot().manifests
+        #expect(manifests.count == 2)
+        #expect(manifests.first?.id == manifests.last?.id)
+    }
+
+    @Test func failedPublicationCanResumeWithoutSourceFiles() async throws {
+        let fixture = try makeFixture(failPublication: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage?.contains("publication failed") == true)
+        #expect(fixture.store.job == nil)
+        try FileManager.default.removeItem(at: fixture.root)
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.store.job?.id == "import-job")
+        #expect(fixture.state.snapshot().events == ["prepare", "upload:a.nef", "upload:nested/b.heic", "finish", "finish"])
+    }
+
+    @Test func restartRestoresBatchAndUploadedFiles() async throws {
+        let fixture = try makeFixture(failUpload: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        let previous = try #require(fixture.store.manifest)
+        let restored = ImportStore(client: fixture.store.client)
+        #expect(restored.manifest?.id == previous.id)
+        #expect(restored.fileCount == 2)
+        restored.reset()
+        #expect(restored.manifest?.id == previous.id)
+        restored.start(targetPath: "other")
+        try await waitForCompletion(restored)
+        #expect(restored.job?.id == "import-job")
+        #expect(fixture.state.snapshot().events.filter { $0 == "upload:a.nef" }.count == 1)
+    }
+
+    @Test func lostFinalUploadResponseResumesAfterSourceRemoval() async throws {
+        let fixture = try makeFixture(failUpload: true, acceptFailedUpload: true)
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        let id = try #require(fixture.store.manifest?.id)
+        #expect(fixture.store.job == nil)
+        try FileManager.default.removeItem(at: fixture.root)
+        let restored = ImportStore(client: fixture.store.client)
+        #expect(restored.manifest?.id == id)
+        restored.start(targetPath: "incoming")
+        try await waitForCompletion(restored)
+        #expect(restored.errorMessage == nil)
+        #expect(restored.job?.id == "import-job")
+        #expect(fixture.state.snapshot().events.filter { $0 == "upload:nested/b.heic" }.count == 1)
+    }
+
+    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
         try Data("abc".utf8).write(to: root.appendingPathComponent("a.nef"))
         try Data("abc".utf8).write(to: root.appendingPathComponent("nested/b.heic"))
         let host = UUID().uuidString.lowercased() + ".invalid"
-        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst)
+        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst, publishing: publishing, failPrepare: failPrepare, failPublication: failPublication, acceptFailedUpload: acceptFailedUpload)
         ImportProtocol.scenarios.register(state, host: host)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ImportProtocol.self]
@@ -143,13 +206,21 @@ import Testing
 private final class ImportScenario: @unchecked Sendable {
     private let lock = NSLock()
     private var failUpload: Bool
+    private var failPrepare: Bool
+    private var failPublication: Bool
     private var failFinish: Bool
+    private let acceptFailedUpload: Bool
     private let skipFirst: Bool
+    private let publishing: Bool
     private var manifests: [KeepsImportManifest] = []
     private var uploaded: Set<UUID> = []
     private var events: [String] = []
 
-    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool) {
+    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool, publishing: Bool, failPrepare: Bool, failPublication: Bool, acceptFailedUpload: Bool) {
+        self.acceptFailedUpload = acceptFailedUpload
+        self.failPrepare = failPrepare
+        self.failPublication = failPublication
+        self.publishing = publishing
         self.skipFirst = skipFirst
         self.failUpload = failUpload
         self.failFinish = failFinish
@@ -168,6 +239,10 @@ private final class ImportScenario: @unchecked Sendable {
             let manifest = try JSONDecoder().decode(KeepsImportManifest.self, from: body)
             manifests.append(manifest)
             events.append("prepare")
+            if failPrepare {
+                failPrepare = false
+                throw URLError(.timedOut)
+            }
             return try JSONSerialization.data(withJSONObject: [
                 "id": manifest.id.uuidString, "targetPath": manifest.targetPath, "finished": false,
                 "files": manifest.files.map { file in
@@ -183,18 +258,30 @@ private final class ImportScenario: @unchecked Sendable {
             events.append("upload:" + file.relativePath)
             if failUpload && file.relativePath == "nested/b.heic" {
                 failUpload = false
-                throw URLError(.networkConnectionLost)
+                if acceptFailedUpload { uploaded.insert(file.id) }
+                throw NSError(domain: "ImportTest", code: 422, userInfo: [NSLocalizedDescriptionKey: "source rejected"])
             }
             uploaded.insert(file.id)
             return Data("{}".utf8)
         }
         if path.hasSuffix("/finish") {
-            events.append("finish")
+            events.append(request.httpMethod == "GET" ? "status" : "finish")
+            #expect(path.contains(manifest.id.uuidString))
+            if request.httpMethod == "POST" {
+                #expect(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems == [URLQueryItem(name: "async", value: "true")])
+            }
             if failFinish {
                 failFinish = false
-                throw URLError(.networkConnectionLost)
+                throw URLError(.timedOut)
             }
-            return Data("{\"job\":{\"id\":\"import-job\",\"folderID\":\"folder\",\"libraryID\":\"test\",\"path\":\"incoming\",\"status\":\"queued\"}}".utf8)
+            if failPublication {
+                failPublication = false
+                return Data("{\"id\":\"\(manifest.id)\",\"status\":\"failed\",\"completedFiles\":1,\"totalFiles\":2,\"error\":\"publication failed\"}".utf8)
+            }
+            if publishing, request.httpMethod == "POST" {
+                return Data("{\"id\":\"\(manifest.id)\",\"status\":\"publishing\",\"completedFiles\":1,\"totalFiles\":2}".utf8)
+            }
+            return Data("{\"id\":\"\(manifest.id)\",\"status\":\"finished\",\"completedFiles\":2,\"totalFiles\":2,\"job\":{\"id\":\"import-job\",\"folderID\":\"folder\",\"libraryID\":\"test\",\"path\":\"incoming\",\"status\":\"queued\"}}".utf8)
         }
         throw URLError(.unsupportedURL)
     }

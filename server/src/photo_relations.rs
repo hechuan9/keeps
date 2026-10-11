@@ -401,6 +401,7 @@ mod tests {
                 params![crate::versions::capture_key(&heif_metadata), raw_id],
             )?;
             db.execute("UPDATE media_cache SET status='ready',thumbnail='{}',standard='{}' WHERE asset_id=?",[&heif_id])?;
+            crate::edits::remove_schema(&db)?;
             db.execute_batch("DROP TABLE catalog_deprecated_files; PRAGMA user_version=9;")?;
         }
         drop(store);

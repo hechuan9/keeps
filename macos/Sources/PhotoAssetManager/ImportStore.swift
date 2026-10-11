@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import KeepsAPI
 import SwiftUI
@@ -18,16 +19,77 @@ final class ImportStore: ObservableObject {
     @Published private(set) var totalBytes: Int64 = 0
     @Published private(set) var job: KeepsJob?
     @Published private(set) var manifest: KeepsImportManifest?
+    @Published private(set) var isFinishing = false
+    @Published private(set) var publishedFiles = 0
     private var sources: [ImportSourceFile] = []
     private var operation: Task<Void, Never>?
     private var activeFileID: UUID?
 
-    init(client: KeepsClient) { self.client = client }
+    @Published private(set) var indexTotal = 0
+    @Published private(set) var indexedFiles = 0
+    @Published private(set) var thumbnailTotal = 0
+    @Published private(set) var thumbnailCompleted = 0
+    var onCompletion: (() -> Void)?
+    private var workerID = UUID().uuidString
+    private var bookmark: Data?
+    private var mediaTask: KeepsWorkerTask?
+    private struct Checkpoint: Codable {
+        var manifest: KeepsImportManifest
+        var sources: [ImportSourceFile]
+        var bookmark: Data
+        var isFinishing: Bool
+        var workerID: String
+        var mediaTask: KeepsWorkerTask?
+    }
+    private let checkpointURL: URL
+
+    init(client: KeepsClient, persistenceDirectory: URL? = nil) {
+        self.client = client
+        let key = SHA256.hash(data: Data((client.configuration.baseURL.absoluteString + "|" + client.configuration.libraryID).utf8)).map { String(format: "%02x", $0) }.joined()
+        checkpointURL = (persistenceDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Keeps/ImportTasks")).appendingPathComponent(key + ".json")
+        do {
+            if FileManager.default.fileExists(atPath: checkpointURL.path) {
+                let saved = try JSONDecoder().decode(Checkpoint.self, from: Data(contentsOf: checkpointURL))
+                manifest = saved.manifest; sources = saved.sources; bookmark = saved.bookmark
+                isFinishing = saved.isFinishing; workerID = saved.workerID; mediaTask = saved.mediaTask
+                preserveStructure = saved.manifest.preserveStructure; deduplicate = saved.manifest.deduplicate
+                fileCount = saved.sources.count; totalBytes = saved.sources.reduce(0) { $0 + $1.size }
+                if let first = saved.sources.first {
+                    var root = first.url
+                    for _ in first.sourcePath.split(separator: "/") { root.deleteLastPathComponent() }
+                    source = root
+                }
+                var stale = false
+                if !saved.isFinishing {
+                    source = try URL(resolvingBookmarkData: saved.bookmark, options: [.withSecurityScope], bookmarkDataIsStale: &stale)
+                }
+                message = "发现未完成的导入，点击继续导入可恢复同一批次。"
+            }
+        } catch { report(error); message = "导入恢复失败，请重新授权原来源文件夹后继续同一批次。" }
+    }
+
+    private func persist() throws {
+        guard let manifest, let bookmark else { throw KeepsAPIError.invalidResponse }
+        try FileManager.default.createDirectory(at: checkpointURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try JSONEncoder().encode(Checkpoint(manifest: manifest, sources: sources, bookmark: bookmark, isFinishing: isFinishing, workerID: workerID, mediaTask: mediaTask)).write(to: checkpointURL, options: .atomic)
+    }
 
     func selectSource(_ url: URL) {
-        guard !isBusy, manifest == nil else { return }
+        guard !isBusy else { return }
+        if let oldSource = source, manifest != nil, url.standardizedFileURL != oldSource.standardizedFileURL {
+            report(NSError(domain: "KeepsImport", code: 6, userInfo: [NSLocalizedDescriptionKey: "请选择同一导入来源文件夹：" + oldSource.path]))
+            return
+        }
         source = url
         errorMessage = nil
+        if manifest != nil {
+            let access = url.startAccessingSecurityScopedResource()
+            defer { if access { url.stopAccessingSecurityScopedResource() } }
+            do {
+                bookmark = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+                try persist()
+            } catch { report(error) }
+        }
     }
 
     func report(_ error: Error) {
@@ -36,25 +98,54 @@ final class ImportStore: ObservableObject {
     }
 
     func start(targetPath: String) {
-        guard !isBusy, job == nil, let source, !targetPath.isEmpty else { return }
+        guard !isBusy, job == nil, (source != nil || manifest != nil), !targetPath.isEmpty else { return }
         isBusy = true
         errorMessage = nil
         operation = Task {
-            let access = source.startAccessingSecurityScopedResource()
+            let access = source?.startAccessingSecurityScopedResource() ?? false
             defer {
-                if access { source.stopAccessingSecurityScopedResource() }
+                if access { source?.stopAccessingSecurityScopedResource() }
                 activeFileID = nil
                 isBusy = false
                 operation = nil
             }
             do {
-                if manifest == nil { try await inventory(source: source, targetPath: targetPath) }
+                if manifest == nil {
+                    guard let source else { throw KeepsAPIError.invalidResponse }
+                    bookmark = try source.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+                    try await inventory(source: source, targetPath: targetPath)
+                    try persist()
+                }
+                let heartbeat = Task {
+                    while !Task.isCancelled {
+                        do {
+                            try await Task.sleep(for: .seconds(60))
+                            if let id = self.manifest?.id { try await self.client.heartbeatImport(id: id, workerID: self.workerID) }
+                        } catch is CancellationError { return }
+                        catch { self.report(error) }
+                    }
+                }
+                defer { heartbeat.cancel() }
                 try Task.checkCancellation()
-                try await upload()
+                while true {
+                    do {
+                        if isFinishing, let manifest { try await finish(id: manifest.id) }
+                        else { try await upload() }
+                        break
+                    } catch KeepsAPIError.http(let status, let body) where status == 429 || status >= 500 {
+                        report(KeepsAPIError.http(status, body))
+                        message = "服务器暂时不可用，正在恢复同一导入批次…"
+                        try await Task.sleep(for: .seconds(3))
+                    } catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
+                        report(error)
+                        message = "连接中断，正在恢复同一导入批次…"
+                        try await Task.sleep(for: .seconds(3))
+                    }
+                }
             } catch is CancellationError {
-                message = "导入已暂停，可以继续。已上传的文件保留在 NAS。"
+                message = isFinishing ? "已停止查看进度，NAS 继续后台导入。点击继续导入可恢复查询。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
             } catch let error as URLError where error.code == .cancelled {
-                message = "导入已暂停，可以继续。已上传的文件保留在 NAS。"
+                message = isFinishing ? "已停止查看进度，NAS 继续后台导入。点击继续导入可恢复查询。" : "导入已暂停，可以继续。已上传的文件保留在 NAS。"
             } catch {
                 report(error)
                 message = "导入未完成。可重试此批次，已上传的文件不会重复上传。"
@@ -65,8 +156,12 @@ final class ImportStore: ObservableObject {
     func pause() { operation?.cancel() }
 
     func reset() {
-        guard !isBusy else { return }
+        guard !isBusy, job != nil else { return }
+        do { if FileManager.default.fileExists(atPath: checkpointURL.path) { try FileManager.default.removeItem(at: checkpointURL) } }
+        catch { report(error); return }
         manifest = nil
+        isFinishing = false
+        publishedFiles = 0
         sources = []
         completedFiles = 0
         skippedFiles = 0
@@ -96,7 +191,7 @@ final class ImportStore: ObservableObject {
         totalBytes = files.reduce(0) { $0 + $1.size }
         manifest = KeepsImportManifest(id: UUID(), targetPath: targetPath, files: files.map {
             KeepsImportFile(id: UUID(), relativePath: $0.sourcePath, size: $0.size, sha256: $0.sha256)
-        }, deduplicate: calculateHashes, preserveStructure: preserveStructure)
+        }, deduplicate: calculateHashes, preserveStructure: preserveStructure, workerID: workerID)
     }
 
     private func validateSource(_ file: ImportSourceFile) throws {
@@ -107,11 +202,26 @@ final class ImportStore: ObservableObject {
         }
     }
 
+    private func prepare(_ manifest: KeepsImportManifest) async throws -> KeepsImportBatch {
+        for attempt in 0..<3 {
+            do {
+                let batch = try await client.prepareImport(manifest)
+                errorMessage = nil
+                return batch
+            } catch let error as URLError where error.code == .timedOut || error.code == .networkConnectionLost {
+                guard attempt < 2 else { throw error }
+                report(error)
+                message = "连接暂时中断，正在恢复同一导入批次…"
+                try await Task.sleep(for: .seconds(1))
+            }
+        }
+        throw KeepsAPIError.invalidResponse
+    }
+
     private func upload() async throws {
         guard let manifest else { return }
-        for file in sources { try validateSource(file) }
         message = manifest.deduplicate ? "正在检查目标目录中的重复文件并保持配对…" : "正在准备 NAS 目标文件名…"
-        let batch = try await client.prepareImport(manifest)
+        let batch = try await prepare(manifest)
         let sourceByPath = Dictionary(uniqueKeysWithValues: sources.map { ($0.sourcePath, $0) })
         skippedFiles = batch.files.filter { $0.skipped == true }.count
         completedFiles = batch.files.filter(\.uploaded).count
@@ -130,16 +240,122 @@ final class ImportStore: ObservableObject {
                     self.sentBytes = base + min(bytes, file.size)
                 }
             }
-            try validateSource(sourceFile)
             activeFileID = nil
             completeBytes += file.size
             sentBytes = completeBytes
             completedFiles += 1
         }
         try Task.checkCancellation()
-        for file in sources { try validateSource(file) }
         message = "上传完成，正在提交 NAS 整理任务…"
-        job = try await client.finishImport(id: batch.id)
-        message = "已导入 \(fileCount - skippedFiles) 个文件，跳过 \(skippedFiles) 个重复文件。NAS 正在索引并安排缩略图与版本整理，可在“任务追踪”查看。"
+        isFinishing = true
+        try persist()
+        try await finish(id: batch.id)
+    }
+
+    private func processMedia(id: UUID) async throws {
+        if mediaTask == nil {
+            mediaTask = try await client.claimImportMedia(id: id, workerID: workerID).task
+            if mediaTask != nil { try persist() }
+        }
+        guard let task = mediaTask else { return }
+        let heartbeat = Task {
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(60)); try await client.heartbeatWorker(taskID: task.taskID) }
+                catch is CancellationError { return }
+                catch { self.report(error) }
+            }
+        }
+        defer { heartbeat.cancel() }
+        do {
+            while true {
+                do { try await ImportRenderer.process(task, client: client); mediaTask = nil; try persist(); break }
+                catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
+                    report(error)
+                    try await Task.sleep(for: .seconds(3))
+                } catch KeepsAPIError.http(let status, let body) where status == 429 || status >= 500 {
+                    report(KeepsAPIError.http(status, body))
+                    try await Task.sleep(for: .seconds(3))
+                } catch KeepsAPIError.http(let status, _) where status == 409 {
+                    mediaTask = nil
+                    try persist()
+                    return
+                }
+            }
+        }
+        catch {
+            if !(error is CancellationError), !(error is URLError), !(error is KeepsAPIError) {
+                do { try await client.failWorker(taskID: task.taskID, error: String(reflecting: error) + "\n" + error.localizedDescription); mediaTask = nil; try persist() }
+                catch let failure { report(NSError(domain: "KeepsImport", code: 7, userInfo: [NSLocalizedDescriptionKey: String(reflecting: error) + "\n任务失败通知：" + String(reflecting: failure)])) }
+            }
+            throw error
+        }
+    }
+
+    private func finish(id: UUID) async throws {
+        var submit = true
+        while job == nil {
+            try Task.checkCancellation()
+            do {
+                let status = try await (submit ? client.finishImport(id: id) : client.importFinishStatus(id: id))
+                submit = false
+                publishedFiles = status.completedFiles
+                indexTotal = status.indexTotal ?? fileCount
+                indexedFiles = status.indexedFiles ?? 0
+                thumbnailTotal = status.thumbnailTotal ?? 0
+                thumbnailCompleted = status.thumbnailCompleted ?? 0
+                errorMessage = nil
+                switch status.status {
+                case "finished":
+                    guard let completedJob = status.job else { throw KeepsAPIError.invalidResponse }
+                    job = completedJob
+                case "indexing":
+                    message = "正在提取元数据：\(indexedFiles) / \(indexTotal)"
+                case "thumbnails":
+                    message = "正在生成缩略图：\(thumbnailCompleted) / \(thumbnailTotal)"
+                    try await processMedia(id: id)
+                case "failed":
+                    throw NSError(domain: "KeepsImport", code: 3, userInfo: [NSLocalizedDescriptionKey: status.error ?? "NAS 导入失败，请重试此批次。"])
+                case "uploading":
+                    submit = true
+                case "publishing":
+                    message = "NAS 正在提交文件：\(status.completedFiles) / \(status.totalFiles)，关闭进度查询不会中断后台任务。"
+                default:
+                    throw KeepsAPIError.invalidResponse
+                }
+            } catch let error as URLError where [.timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet].contains(error.code) {
+                submit = false
+                report(error)
+                message = "连接暂时中断，正在恢复查询同一导入批次。NAS 已接收的任务会继续运行。"
+            }
+            if job == nil { try await Task.sleep(for: .seconds(1)) }
+        }
+        try FileManager.default.removeItem(at: checkpointURL)
+        onCompletion?()
+        message = "导入完成：\(fileCount - skippedFiles) 个文件，跳过 \(skippedFiles) 个重复文件。元数据与缩略图已就绪。"
+    }
+}
+
+@MainActor
+final class ImportTaskOwner: ObservableObject {
+    @Published var store: ImportStore?
+    private var stores: [ImportStore] = []
+
+    func configure(_ client: KeepsClient?, completed: @escaping () -> Void) {
+        guard let client else { store = nil; return }
+        let current: ImportStore
+        if let existing = stores.first(where: { $0.client.configuration == client.configuration }) { current = existing }
+        else {
+            current = ImportStore(client: client)
+            stores.append(current)
+        }
+        store = current
+        current.onCompletion = completed
+        if let manifest = current.manifest, current.job == nil, !current.isBusy, current.errorMessage == nil {
+            current.start(targetPath: manifest.targetPath)
+        }
+    }
+
+    func prepareNewIfCompleted() {
+        if store?.job != nil { store?.reset() }
     }
 }

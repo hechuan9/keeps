@@ -51,7 +51,8 @@ pub struct FileState {
 }
 pub struct Jobs {
     pub(crate) directory_mutation: RwLock<()>,
-    pub(crate) db: Mutex<Connection>,
+    pub(crate) import_mutation: Mutex<()>,
+    pub(crate) db: crate::database::Database,
     pub(crate) trash_db: Mutex<Connection>,
     root: std::path::PathBuf,
 }
@@ -217,10 +218,12 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let trash_db = Connection::open(path)?;
         trash_db.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::directory_trash::initialize(&trash_db)?;
+        crate::rejected_trash::initialize(&trash_db)?;
         let jobs = Self {
             trash_db: Mutex::new(trash_db),
             directory_mutation: RwLock::new(()),
-            db: Mutex::new(db),
+            import_mutation: Mutex::new(()),
+            db: crate::database::Database::new(db),
             root,
         };
         jobs.coalesce_pending()?;
@@ -289,6 +292,13 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         tx.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE folder_id=?1 AND status IN ('pending','running')",[id])?;
         tx.commit()?;
         Ok(found)
+    }
+    pub fn cancel_automatic_full_scans(&self) -> Result<usize> {
+        // Retire queued reconciliation from deployments that scanned on startup.
+        Ok(self.db.lock().unwrap().execute(
+            "UPDATE jobs SET status='cancelled',rerun=0,finished_at=unixepoch(),updated_at=unixepoch() WHERE status IN ('pending','running') AND work_class<>'manual' AND scope_kind='recursive' AND scope_path=?1",
+            [self.root.to_str().context("originals root must be UTF-8")?],
+        )?)
     }
     pub fn enqueue_scan(&self, folder_id: &str) -> Result<Job> {
         self.enqueue_scan_with_quiet(folder_id, false)
@@ -432,6 +442,18 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             false,
             true,
             "directory",
+            "manual",
+        )
+    }
+    pub fn enqueue_manual_metadata_refresh(&self, folder_id: &str, path: &Path) -> Result<Job> {
+        self.enqueue_scope(
+            folder_id,
+            path,
+            0,
+            true,
+            false,
+            false,
+            "recursive",
             "manual",
         )
     }
@@ -819,6 +841,30 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manual_only_full_scans_cancel_legacy_work_and_preserve_incremental_jobs() {
+        let (dir, jobs, folder) = setup();
+        std::fs::create_dir(jobs.root().join("child")).unwrap();
+        let legacy = jobs.enqueue_external_scan(&folder.id).unwrap();
+        let manual = jobs.enqueue_scan(&folder.id).unwrap();
+        let child = jobs
+            .enqueue_removed_directory(&folder.id, &jobs.root().join("child"), 0)
+            .unwrap();
+        let file = jobs
+            .enqueue_file_change(&folder.id, &jobs.root().join("new.jpg"), 0)
+            .unwrap();
+        assert_eq!(jobs.cancel_automatic_full_scans().unwrap(), 1);
+        assert_eq!(jobs.job(&legacy.id).unwrap().unwrap().status, "cancelled");
+        for id in [&manual.id, &child.id, &file.id] {
+            assert_eq!(jobs.job(id).unwrap().unwrap().status, "pending");
+        }
+        let root = jobs.root().to_path_buf();
+        drop(jobs);
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
+        assert_eq!(jobs.cancel_automatic_full_scans().unwrap(), 0);
+        assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "pending");
+    }
+
     fn setup() -> (tempfile::TempDir, Jobs, Folder) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("originals");

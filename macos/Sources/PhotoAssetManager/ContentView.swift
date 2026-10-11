@@ -19,9 +19,11 @@ extension FocusedValues {
 
 struct ContentView: View {
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var exposureTasks: ExposureTaskStore
     @Environment(\.openWindow) private var openWindow
     @State private var showsImport = false
-    @State private var importStore: ImportStore?
+    @EnvironmentObject private var importTasks: ImportTaskOwner
+    private var importStore: ImportStore? { importTasks.store }
     @FocusState private var galleryFocused: Bool
 
     @State private var showsSidebar = true
@@ -29,6 +31,7 @@ struct ContentView: View {
     @State private var showsFilters = false
     @State private var thumbnailSize = 190.0
     @State private var detailMode = false
+    @State private var galleryReturnAssetID: UUID?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -75,10 +78,18 @@ struct ContentView: View {
         .sheet(item: $library.directoryToTrash) { directory in
             DirectoryTrashSheet(library: library, directory: directory)
         }
+        .sheet(isPresented: $library.showsRejectedTrash) {
+            RejectedTrashSheet(library: library)
+        }
         .task { library.refresh(); library.refreshNavigation(force: false) }
-        .prefetchKeepsThumbnails(configuration: library.configuration)
+        .onChange(of: library.configuration, initial: true) { _, configuration in exposureTasks.configure(library.rejectedTrash == nil ? configuration : nil) }
+        .onChange(of: library.rejectedTrash == nil) { _, idle in exposureTasks.configure(idle ? library.configuration : nil) }
+        .onChange(of: exposureTasks.completionRevision) { _, _ in library.refresh(force: true) }
         .onChange(of: library.query) { _, _ in library.refresh() }
-        .onChange(of: library.query.directory) { _, _ in detailMode = false }
+        .onChange(of: library.query.directory) { _, _ in
+            detailMode = false
+            galleryReturnAssetID = nil
+        }
     }
 
     private var topBar: some View {
@@ -87,9 +98,8 @@ struct ContentView: View {
             Text("Keeps").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
             Button {
                 guard let client = library.client else { return }
-                if importStore == nil || importStore?.job != nil || importStore?.client.configuration != client.configuration {
-                    importStore = ImportStore(client: client)
-                }
+                importTasks.configure(client) { library.refreshNavigation(); library.refresh(force: true) }
+                importTasks.prepareNewIfCompleted()
                 showsImport = true
             } label: { Label("导入", systemImage: "square.and.arrow.down") }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
@@ -160,6 +170,7 @@ struct ContentView: View {
                 WorkspaceErrorView(title: "请求失败", details: error)
                     .frame(maxWidth: .infinity, alignment: .leading).padding(10)
             }
+            PhotoAdjustmentStatusView(store: exposureTasks, configuration: library.configuration)
             bottomBar
         }
     }
@@ -188,6 +199,18 @@ struct ContentView: View {
         Group {
             if detailMode, let asset = library.selectedAsset {
                 RemotePreview(asset: asset, loadStandard: true).padding(24)
+                    .overlay(alignment: .topLeading) {
+                        if asset.flagState == "rejected" {
+                            Label("已弃用", systemImage: "xmark.circle.fill")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(WorkspaceStyle.text)
+                                .padding(.horizontal, 12).padding(.vertical, 8)
+                                .background(WorkspaceStyle.panel, in: RoundedRectangle(cornerRadius: 6))
+                                .padding(24)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .contextMenu { exposureActions(for: asset) }
             } else {
                 GeometryReader { geometry in
                     let rows = JustifiedAssetGridLayout.rows(
@@ -195,26 +218,36 @@ struct ContentView: View {
                         availableWidth: max(1, geometry.size.width - 2),
                         targetHeight: thumbnailSize * 0.78
                     )
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 1) {
-                            ForEach(rows, id: \.indices.lowerBound) { row in
-                                HStack(spacing: 1) {
-                                    ForEach(row.indices, id: \.self) { index in
-                                        let asset = library.assets[index]
-                                        galleryTile(asset, height: row.height)
+                    ScrollViewReader { proxy in
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 1) {
+                                ForEach(rows, id: \.indices.lowerBound) { row in
+                                    HStack(spacing: 1) {
+                                        ForEach(row.indices, id: \.self) { index in
+                                            let asset = library.assets[index]
+                                            galleryTile(asset, height: row.height)
+                                        }
                                     }
+                                    .id(row.indices.lowerBound)
                                 }
-                            }
-                            if library.nextCursor != nil {
-                                ProgressView()
-                                    .opacity(library.isLoading && !library.isCheckingRevision ? 1 : 0)
-                                    .frame(maxWidth: .infinity)
-                                    .padding()
-                                    .onAppear { library.setPaginationVisible(true) }
-                                    .onDisappear { library.setPaginationVisible(false) }
-                            }
-                        }.padding(1)
-                            .background(OverlayScrollerConfiguration())
+                                if library.nextCursor != nil {
+                                    ProgressView()
+                                        .opacity(library.isLoading && !library.isCheckingRevision ? 1 : 0)
+                                        .frame(maxWidth: .infinity)
+                                        .padding()
+                                        .onAppear { library.setPaginationVisible(true) }
+                                        .onDisappear { library.setPaginationVisible(false) }
+                                }
+                            }.padding(1)
+                                .background(OverlayScrollerConfiguration())
+                        }
+                        .onAppear {
+                            guard let assetID = galleryReturnAssetID,
+                                  let index = library.assets.firstIndex(where: { $0.id == assetID }),
+                                  let row = rows.first(where: { $0.indices.contains(index) }) else { return }
+                            proxy.scrollTo(row.indices.lowerBound, anchor: .center)
+                            galleryReturnAssetID = nil
+                        }
                     }
                 }
             }
@@ -237,12 +270,19 @@ struct ContentView: View {
         }
         .onKeyPress(.escape) {
             if detailMode {
-                detailMode = false
+                returnToGallery()
             } else {
                 library.deselectAll()
             }
             return .handled
         }
+    }
+
+    private func returnToGallery() {
+        guard detailMode else { return }
+        galleryReturnAssetID = library.selectedAsset?.id
+        detailMode = false
+        galleryFocused = true
     }
 
     private func galleryTile(_ asset: KeepsAsset, height: CGFloat) -> some View {
@@ -275,6 +315,8 @@ struct ContentView: View {
             }
             .help(asset.originalFilename)
             .contextMenu {
+                exposureActions(for: asset)
+                Divider()
                 Button("选择此照片") { library.select(asset.id, extending: false) }
                 Button("全选当前目录照片") { library.selectAll() }
                 Button("取消选择") { library.deselectAll() }
@@ -285,9 +327,16 @@ struct ContentView: View {
             .accessibilityAddTraits(library.selectedIDs.contains(asset.id) ? [.isSelected] : [])
     }
 
+    @ViewBuilder private func exposureActions(for asset: KeepsAsset) -> some View {
+        Button("自动曝光") { exposureTasks.automaticExposure(assetID: asset.id) }
+            .disabled(asset.trashed || exposureTasks.isPending(assetID: asset.id))
+        Button("还原曝光调整") { exposureTasks.resetExposure(assetID: asset.id) }
+            .disabled(asset.trashed || exposureTasks.isPending(assetID: asset.id))
+    }
+
     private var bottomBar: some View {
         HStack(spacing: 16) {
-            railButton("网格视图", icon: "square.grid.2x2", selected: !detailMode) { detailMode = false }
+            railButton("网格视图", icon: "square.grid.2x2", selected: !detailMode) { returnToGallery() }
             railButton("单张视图", icon: "rectangle", selected: detailMode) {
                 if library.selectedAsset == nil, let first = library.assets.first { library.select(first.id, extending: false) }
                 detailMode = true
@@ -305,12 +354,21 @@ struct ContentView: View {
                     Button { library.updateSelected(KeepsAssetPatch(flagState: library.selectedAsset?.flagState == "picked" ? "unflagged" : "picked")) } label: {
                         Image(systemName: "flag.fill").foregroundStyle(library.selectedAsset?.flagState == "picked" ? WorkspaceStyle.text : Color(white: 0.4))
                     }.buttonStyle(.plain).help("留用")
+                    Button { library.updateSelected(KeepsAssetPatch(flagState: library.selectedAsset?.flagState == "rejected" ? "unflagged" : "rejected")) } label: {
+                        Label("弃用", systemImage: library.selectedAsset?.flagState == "rejected" ? "xmark.circle.fill" : "xmark.circle")
+                            .foregroundStyle(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.text : Color(white: 0.4))
+                            .padding(.horizontal, 8).padding(.vertical, 5)
+                            .background(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.field : Color.clear, in: RoundedRectangle(cornerRadius: 4))
+                    }.buttonStyle(.plain)
+                        .help(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
+                        .accessibilityLabel(library.selectedAsset?.flagState == "rejected" ? "取消弃用" : "标记为弃用")
+                        .accessibilityAddTraits(library.selectedAsset?.flagState == "rejected" ? [.isSelected] : [])
                 }.disabled(library.isMutating || library.isSelectingAll)
             }
             Group {
                 if library.isLoading && !library.hasLoadedResults { Text("正在读取…") }
                 else if library.configuration != nil && library.lastError == nil {
-                    Text(library.selectedIDs.isEmpty ? "\(library.assets.count) / \(library.total) 张" : "已选 \(library.selectedIDs.count) 张").foregroundStyle(.secondary)
+                    Text(selectionSummary).foregroundStyle(.secondary)
                 }
             }
             Spacer(minLength: 4)
@@ -322,6 +380,15 @@ struct ContentView: View {
                     .accessibilityLabel("缩略图大小")
             }
         }.font(.system(size: 11)).padding(.horizontal, 20).frame(height: 46).background(WorkspaceStyle.panel)
+    }
+
+    private var selectionSummary: String {
+        if detailMode, let selected = library.selectedAsset,
+           library.selectedIDs.count == 1,
+           let index = library.assets.firstIndex(where: { $0.id == selected.id }) {
+            return "第 \(index + 1) / \(max(library.total, library.assets.count)) 张"
+        }
+        return library.selectedIDs.isEmpty ? "\(library.assets.count) / \(library.total) 张" : "已选 \(library.selectedIDs.count) 张"
     }
 
     private var inspector: some View {
@@ -403,12 +470,14 @@ struct RemotePreview: View {
     @EnvironmentObject private var library: LibraryStore
 
     var body: some View {
-        KeepsPreviewImage(asset: asset, configuration: library.configuration, loadStandard: loadStandard)
+        KeepsPreviewImage(asset: asset, configuration: library.configuration, loadStandard: loadStandard,
+                          placeholderDelay: loadStandard ? .milliseconds(150) : .zero)
     }
 }
 
 struct AssetDetailView: View {
     @EnvironmentObject private var library: LibraryStore
+    @EnvironmentObject private var exposureTasks: ExposureTaskStore
     var asset: KeepsAsset
     @State private var tags = ""
     var body: some View {
@@ -416,7 +485,7 @@ struct AssetDetailView: View {
             VStack(alignment: .leading, spacing: 18) {
                 RemotePreview(asset: asset).frame(height: 164).background(WorkspaceStyle.canvas)
                 Text(asset.originalFilename).font(.headline).textSelection(.enabled)
-                if library.selectedIDs.count > 1 { Text("编辑将应用于所选 \(library.selectedIDs.count) 张照片").font(.caption).foregroundStyle(.secondary) }
+                if library.selectedIDs.count > 1 { Text("评分、标记、颜色及标签将应用于所选 \(library.selectedIDs.count) 张照片；底片设置仅作用于当前照片。").font(.caption).foregroundStyle(.secondary) }
                 Text([asset.cameraMake, asset.cameraModel, asset.lensModel].filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption).textSelection(.enabled)
                 if let captureTime = asset.captureTime { Text(captureTime).font(.caption).foregroundStyle(.secondary) }
@@ -436,7 +505,9 @@ struct AssetDetailView: View {
                 }
                 Divider()
                 if let configuration = library.configuration {
-                    KeepsAssetVersionsView(assetID: asset.id, revision: asset.updatedAt, configuration: configuration) { _ in
+                    KeepsAssetVersionsView(assetID: asset.id, revision: asset.updatedAt, configuration: configuration,
+                        onSetNegative: { version in exposureTasks.setNegative(assetID: asset.id, contentHash: version.contentHash) },
+                        negativeChangePending: asset.trashed || exposureTasks.isPending(assetID: asset.id)) { _ in
                         guard library.configuration == configuration else { return }
                         library.refresh(force: true)
                     }.id(asset.id.uuidString + configuration.baseURL.absoluteString + configuration.libraryID)

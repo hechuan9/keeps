@@ -31,7 +31,7 @@ struct ImportView: View {
                 Text("来源：\(store.source?.path ?? "未选择")").lineLimit(2).textSelection(.enabled)
                 Spacer()
                 Button("选择文件夹…") { choosingSource = true }
-                    .disabled(store.isBusy || store.manifest != nil)
+                    .disabled(store.isBusy)
             }
             targetBrowser
             Toggle("保持导入结构", isOn: $store.preserveStructure)
@@ -52,6 +52,11 @@ struct ImportView: View {
                 ProgressView().progressViewStyle(.linear)
                     .accessibilityLabel(store.message)
             }
+            if store.isFinishing {
+                ProgressView("NAS 保存文件", value: Double(store.publishedFiles), total: Double(max(1, store.fileCount)))
+                ProgressView("元数据", value: Double(store.indexedFiles), total: Double(max(1, store.indexTotal)))
+                ProgressView("缩略图", value: Double(store.thumbnailCompleted), total: Double(max(1, store.thumbnailTotal)))
+            }
             if store.fileCount > 0 {
                 ProgressView("上传数据", value: Double(store.sentBytes), total: Double(max(1, store.totalBytes)))
                     .progressViewStyle(.linear)
@@ -62,27 +67,23 @@ struct ImportView: View {
                 ScrollView { Text(error).foregroundStyle(.red).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                     .frame(maxHeight: 100)
             }
-            Text("上传期间请保持 Mac 和应用运行；提交成功后，NAS 会继续后台整理。")
+            Text("导入进度自动保存。断网、退出或休眠后可继续同一批次；Mac 失联一小时后 NAS 接手缩略图。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Button(store.job == nil ? "关闭" : "完成") { dismiss() }
-                    .keyboardShortcut(.cancelAction).disabled(store.isBusy || creatingDirectory)
-                if !store.isBusy, store.manifest != nil, store.job == nil {
-                    Button("重新选择…") { store.reset() }
-                        .help("保留 NAS 已接收的文件，以新批次重新导入")
-                }
+                    .keyboardShortcut(.cancelAction).disabled(creatingDirectory)
                 Spacer()
                 if store.isBusy {
-                    Button("暂停上传") { store.pause() }
+                    Button(store.isFinishing ? "停止查看进度" : "暂停上传") { store.pause() }
                 } else if store.job == nil {
                     Button(store.manifest == nil ? "开始导入" : "继续导入") { store.start(targetPath: targetPath ?? "") }
                         .keyboardShortcut(.defaultAction)
-                        .disabled(store.source == nil || targetPath == nil || loadingDirectories || creatingDirectory || directoryError != nil)
+                        .disabled((store.source == nil && !store.isFinishing) || targetPath == nil || loadingDirectories || creatingDirectory || directoryError != nil)
                 }
             }
         }
         .padding(24).frame(width: 660)
-        .interactiveDismissDisabled(store.isBusy || creatingDirectory)
+        .interactiveDismissDisabled(creatingDirectory)
         .fileImporter(isPresented: $choosingSource, allowedContentTypes: [.folder]) { result in
             switch result {
             case let .success(url): store.selectSource(url)
