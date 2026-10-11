@@ -1195,7 +1195,7 @@ mod priority_tests {
         let originals = dir.path().join("photos");
         std::fs::create_dir(&originals)?;
         let keeps = dir.path().join("keeps");
-        let token = "test-priority-012345678901234567890123";
+        let token = "test-priority";
         let previews = Arc::new(PreviewStorage::new(
             &keeps,
             Some(&originals),
