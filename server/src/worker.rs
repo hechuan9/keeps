@@ -1047,6 +1047,75 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the Linux media runtime (ExifTool and ImageMagick)"]
+    fn manual_recursive_refresh_reloads_unchanged_metadata_in_nested_directory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let originals = directory.path().join("originals");
+        fs::create_dir_all(originals.join("selected/nested"))?;
+        let jobs = Jobs::open(&directory.path().join("jobs.sqlite"), &originals)?;
+        let path = jobs.root().join("selected/nested/photo.jpg");
+        media::run(
+            std::process::Command::new("convert")
+                .args(["-size", "8x8", "xc:red"])
+                .arg(&path),
+        )?;
+        media::run(
+            std::process::Command::new("exiftool")
+                .args([
+                    "-overwrite_original",
+                    "-Make=ActualCamera",
+                    "-Model=ActualModel",
+                    "-XMP-xmpMM:OriginalDocumentID=xmp.did:metadata-refresh-fixture",
+                ])
+                .arg(&path),
+        )?;
+        fs::File::open(&path)?.set_modified(
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
+        )?;
+        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
+        let previews = PreviewStorage::new(
+            &directory.path().join("keeps"),
+            Some(&originals),
+            "http://localhost",
+            "test-key",
+        )?;
+        let folder = jobs.add_folder("library", ".")?;
+        let (size, mtime) = file_stamp(&path)?;
+        let hash = media::sha256_file(&path)?;
+        let file = json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"});
+        let snapshot = json!({"cameraMake":"StaleCamera","cameraModel":"StaleModel","originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"stale","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"});
+        let id = store.ingest_original("library", path.to_str().unwrap(), &file, &snapshot)?;
+        jobs.record_file(
+            &folder.id,
+            path.to_str().unwrap(),
+            size,
+            mtime,
+            &id,
+            &hash,
+            None,
+        )?;
+        jobs.record_metadata_stamp(
+            &folder.id,
+            path.to_str().unwrap(),
+            &media::sidecar_stamp(&path)?,
+        )?;
+        jobs.enqueue_manual_metadata_refresh(&folder.id, &jobs.root().join("selected"))?;
+        let job = jobs.claim_class("manual")?.unwrap();
+        run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
+        let refreshed = store.asset("library", &id)?;
+        assert_eq!(refreshed["cameraMake"], "ActualCamera");
+        assert_eq!(refreshed["cameraModel"], "ActualModel");
+        let progress = jobs.job(&job.id)?.unwrap();
+        assert_eq!(
+            (progress.processed, progress.skipped, progress.failed),
+            (1, 0, 0)
+        );
+        assert_eq!(media::sha256_file(&path)?, hash);
+        assert_eq!(file_stamp(&path)?, (size, mtime));
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_resumes_after_last_entry_and_preserves_progress() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
