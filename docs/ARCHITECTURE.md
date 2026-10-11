@@ -54,7 +54,7 @@ Rust 主要模块：
 
 ## 客户端边界
 
-macOS 使用标准 Settings scene（⌘,）配置 Keeps Server 的服务地址、资料库和访问令牌；先验证服务鉴权与资产查询，成功后才持久化并切换连接。设置的“来源”页管理服务器目录追踪和手动扫描；独立的“任务追踪”原生窗口每 5 秒读取 `/libraries/{library}/task-status`，仅显示当前自动更新的照片、已知待更新照片数，以及一个后台长任务状态；不逐目录列出任务。数量按照片去重并扣除断点前已完成部分，未发现的文件不虚构总数。关闭使用系统窗口按钮；滚动条采用自动隐藏的浮动样式。设置不管理 NAS 设备、SMB 挂载或 SSH 登录。
+macOS 使用标准 Settings scene（⌘,）配置 Keeps Server 的服务地址、资料库和访问令牌；先验证服务鉴权与资产查询，成功后才持久化并切换连接。设置的“来源”页管理服务器目录追踪和手动扫描；主界面顶部的紧凑任务栏每 5 秒读取 `/libraries/{library}/task-status`，仅在后台任务等待、执行或失败时显示；可在主界面展开详情，并一键复制完整错误。数量按照片去重并扣除断点前已完成部分，未发现的文件不虚构总数。任务完成且无错误后自动隐藏。设置不管理 NAS 设备、SMB 挂载或 SSH 登录。
 
 macOS 查询、两端修改及 iOS 修订号检查经过 `shared/Sources/KeepsAPI/KeepsClient.swift`；iOS 离线包任务、下载与导入由共享包的 `KeepsOfflineRebuild` 执行。iOS 浏览查询经过 `KeepsLibraryDatabase`，在 Application Support/Keeps/Catalogs 保存本地 SQLite，服务器、图库及凭据摘要决定文件身份。客户端不生成、上传或回放 ledger，不扫描原片资料库。macOS 显式导入时枚举所选文件夹并上传文件，随后通过批次范围的媒体任务 API 生成并上传两级缩略图及必要标准图；用户发起曝光调整时通过 API 下载指定底片，在客户端解码、测光和生成展示图。
 

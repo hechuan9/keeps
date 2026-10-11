@@ -7,80 +7,79 @@ struct NASTasksView: View {
     @State private var isBusy = false
     @State private var errorMessage: String?
 
+    @State private var expanded = false
+
+    private var errors: String {
+        ([errorMessage, taskStatus?.automatic.error, taskStatus?.longTask.error]
+            .compactMap { $0 }).joined(separator: "\n\n")
+    }
+
+    static func isVisible(_ status: String) -> Bool {
+        ["running", "pending", "failed"].contains(status)
+    }
+
+    private var hasWork: Bool {
+        guard let taskStatus else { return false }
+        return Self.isVisible(taskStatus.automatic.status)
+            || Self.isVisible(taskStatus.longTask.status)
+            || taskStatus.automatic.failedPhotos > 0
+            || (taskStatus.longTask.failed ?? 0) > 0
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            if let errorMessage {
-                Text(errorMessage).foregroundStyle(.red).textSelection(.enabled)
-                    .font(.caption).accessibilityIdentifier("nas-task-error")
-            }
-            Text("任务状态每 5 秒自动更新。关闭窗口不影响后台任务执行。")
-                .font(.caption).foregroundStyle(.secondary)
-            if let taskStatus {
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("自动更新").font(.headline)
-                            Spacer()
-                            Text(Self.statusLabel(taskStatus.automatic.status)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            if hasWork || !errors.isEmpty {
+                HStack(spacing: 10) {
+                    Button { expanded.toggle() } label: {
+                        Label(errors.isEmpty ? "后台任务" : "后台任务出错",
+                              systemImage: expanded ? "chevron.down" : "chevron.right")
+                    }.buttonStyle(.plain)
+                    if let status = taskStatus {
+                        if Self.isVisible(status.automatic.status) || status.automatic.failedPhotos > 0 {
+                            Text("自动更新 · \(Self.statusLabel(status.automatic.status)) · 待更新 \(status.automatic.remainingPhotos) 张")
+                            if status.automatic.failedPhotos > 0 {
+                                Text("失败 \(status.automatic.failedPhotos) 张").foregroundStyle(.red)
+                            }
                         }
-                        if taskStatus.automatic.status == "running" || taskStatus.automatic.status == "pending" {
-                            ProgressView(taskStatus.automatic.status == "pending" ? "等待更新照片…" : "正在更新照片…")
-                                .progressViewStyle(.linear)
+                        if Self.isVisible(status.longTask.status) {
+                            Text("\(status.longTask.kind.map(Self.kindLabel) ?? "后台长任务") · \(Self.statusLabel(status.longTask.status))")
                         }
-                        if let photo = taskStatus.automatic.currentPhoto {
-                            Text("当前照片：\(photo)").lineLimit(2).truncationMode(.middle)
-                                .textSelection(.enabled).help(photo)
+                        if status.automatic.status == "running" || status.automatic.status == "pending"
+                            || status.longTask.status == "running" || status.longTask.status == "pending" {
+                            ProgressView().progressViewStyle(.linear).frame(width: 100)
                         }
-                        Text("已知待更新 \(taskStatus.automatic.remainingPhotos) 张照片")
-                            .monospacedDigit()
-                        if taskStatus.automatic.failedPhotos > 0 {
-                            Text("更新失败 \(taskStatus.automatic.failedPhotos) 张照片").foregroundStyle(.red)
-                        }
-                        if let error = taskStatus.automatic.error {
-                            Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                    }
+                    Spacer(minLength: 0)
+                    if !errors.isEmpty {
+                        Button("复制错误", systemImage: "doc.on.doc") {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(errors, forType: .string)
+                        }.accessibilityIdentifier("nas-task-copy-error")
+                    }
+                }.padding(.horizontal, 16).padding(.vertical, 8)
+                if expanded {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            if let photo = taskStatus?.automatic.currentPhoto {
+                                Text("当前照片：\(photo)").textSelection(.enabled)
+                            }
+                            if let task = taskStatus?.longTask, Self.isVisible(task.status) {
+                                if let path = task.path { Text("目录：\(path)").textSelection(.enabled) }
+                                if let photo = task.currentPhoto { Text("当前照片：\(photo)").textSelection(.enabled) }
+                                if let processed = task.processed { Text("已处理 \(processed) 个文件") }
+                                if let failed = task.failed, failed > 0 { Text("失败 \(failed) 个文件").foregroundStyle(.red) }
+                            }
+                            if !errors.isEmpty {
+                                Text(errors).foregroundStyle(.red).textSelection(.enabled)
+                                    .accessibilityIdentifier("nas-task-error")
+                            }
+                        }.frame(maxWidth: .infinity, alignment: .leading).padding(16)
+                    }.frame(maxHeight: 180)
                 }
-                GroupBox {
-                    VStack(alignment: .leading, spacing: 8) {
-                        HStack {
-                            Text("后台长任务").font(.headline)
-                            Spacer()
-                            Text(Self.statusLabel(taskStatus.longTask.status)).foregroundStyle(.secondary)
-                        }
-                        if taskStatus.longTask.status == "running" || taskStatus.longTask.status == "pending" {
-                            ProgressView(taskStatus.longTask.status == "pending" ? "等待后台任务开始…" : "正在执行后台任务…")
-                                .progressViewStyle(.linear)
-                        }
-                        if let kind = taskStatus.longTask.kind {
-                            Text(Self.kindLabel(kind))
-                        }
-                        if let path = taskStatus.longTask.path {
-                            Text("目录：\(path)").lineLimit(2).truncationMode(.middle)
-                                .textSelection(.enabled).help(path)
-                        }
-                        if let photo = taskStatus.longTask.currentPhoto {
-                            Text("当前照片：\(photo)").lineLimit(2).truncationMode(.middle)
-                                .textSelection(.enabled).help(photo)
-                        }
-                        if let processed = taskStatus.longTask.processed {
-                            Text("已处理 \(processed) 个文件").monospacedDigit()
-                        }
-                        if let failed = taskStatus.longTask.failed, failed > 0 {
-                            Text("失败 \(failed) 个文件").foregroundStyle(.red)
-                        }
-                        if let error = taskStatus.longTask.error {
-                            Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-                        }
-                    }.frame(maxWidth: .infinity, alignment: .leading).padding(8)
-                }
-            } else if isBusy {
-                ProgressView("正在读取任务…").progressViewStyle(.linear)
+                Divider()
             }
-            Spacer(minLength: 0)
         }
-        .padding(20).frame(width: 680, height: 540)
-        .background(TaskWindowConfiguration())
+        .font(.caption).background(WorkspaceStyle.panel)
         .task {
             await refresh()
             while !Task.isCancelled {
@@ -209,19 +208,6 @@ struct NASSourceSettingsView: View {
         } catch is CancellationError {
         } catch {
             errorMessage = String(reflecting: error) + "\n" + error.localizedDescription
-        }
-    }
-}
-
-private struct TaskWindowConfiguration: NSViewRepresentable {
-    func makeNSView(context: Context) -> ConfigurationView { ConfigurationView() }
-    func updateNSView(_ view: ConfigurationView, context: Context) {}
-
-    final class ConfigurationView: NSView {
-        override func viewDidMoveToWindow() {
-            super.viewDidMoveToWindow()
-            window?.standardWindowButton(.miniaturizeButton)?.isHidden = true
-            window?.standardWindowButton(.zoomButton)?.isHidden = true
         }
     }
 }

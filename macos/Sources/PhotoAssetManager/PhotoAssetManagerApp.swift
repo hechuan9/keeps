@@ -60,17 +60,6 @@ struct PhotoAssetManagerApp: App {
                 }.disabled(!library.isStartupReady || library.isOperationBlocking || library.isSelectingAll)
             }
         }
-        Window("任务追踪", id: "nas-tasks") {
-            Group {
-                if let client = library.client {
-                    NASTasksView(client: client).id(ObjectIdentifier(client))
-                } else {
-                    Text("请先在设置中连接服务器。").padding(24)
-                }
-            }.disabled(library.isOperationBlocking)
-            .overlay { if library.isOperationBlocking { Text(library.isAIEditingBlocking ? "正在进行 AI 调色，请在主窗口查看进度。" : library.isAISettingsBusy ? "AI 修图设置正在运行，请在设置中查看进度。" : "正在整理照片或文件夹，请在主窗口查看进度。").padding().background(.regularMaterial) } }
-        }
-        .windowResizability(.contentSize)
         Settings {
             TabView {
                 ServerSettingsView()

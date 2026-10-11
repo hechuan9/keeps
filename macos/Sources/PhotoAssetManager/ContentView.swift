@@ -34,7 +34,6 @@ struct ContentView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var batch: AIEditingBatchStore
     @EnvironmentObject private var geometryTasks: GeometryTaskStore
-    @Environment(\.openWindow) private var openWindow
     @State private var showsAIWorkspace = false
     @State private var startsAIWorkspace = false
     @State private var showsImport = false
@@ -78,6 +77,9 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
             Divider()
+            if let client = library.client {
+                NASTasksView(client: client).id(ObjectIdentifier(client))
+            }
             HStack(spacing: 0) {
                 HSplitView {
                     if showsSidebar {
@@ -202,11 +204,7 @@ struct ContentView: View {
                 WorkspaceErrorView(title: "目录暂时不可用", details: error).padding(12)
                 Button("重试读取目录") { library.refreshNavigation() }.padding(.horizontal, 12)
             }
-            Divider()
-            Button { openWindow(id: "nas-tasks") } label: {
-                Label("任务追踪", systemImage: "list.bullet.rectangle")
-                    .font(.system(size: 12)).frame(maxWidth: .infinity, alignment: .leading).padding(16)
-            }.buttonStyle(.plain).disabled(library.client == nil)
+
         }.padding(.top, 12).background(WorkspaceStyle.panel)
     }
 
