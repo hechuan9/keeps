@@ -475,7 +475,7 @@ fn process_photo(
         for id in assets {
             store.initialize_negative(&job.library_id, &id)?;
             if job.work_class == "manual" && (job.refresh_metadata || job.scope_kind == "file") {
-                store.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
+                store.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
             }
             crate::cache_pipeline::process_asset(store, jobs, previews, &job.library_id, &id)?;
         }

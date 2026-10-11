@@ -276,12 +276,15 @@ impl MediaProcessor {
             "decoded.tiff"
         });
         let input = if video_input {
+            // thumbnail retains 60 frames; bound both axes before it buffers them.
             run(Command::new("ffmpeg")
                 .args(["-nostdin", "-v", "error", "-threads", "1", "-i"])
                 .arg(&source)
                 .args([
                     "-vf",
-                    &format!("scale={edge}:-2,thumbnail=60"),
+                    &format!(
+                        "scale='min(iw,{edge})':'min(ih,{edge})':force_original_aspect_ratio=decrease,thumbnail=60"
+                    ),
                     "-frames:v",
                     "1",
                     "-threads",
@@ -848,6 +851,46 @@ mod tests {
             );
         }
         assert_eq!(before, sha256_file(&source)?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires the Linux media runtime (FFmpeg and ImageMagick HEIC)"]
+    fn video_thumbnail_bounds_both_axes_without_upscaling() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let processor = MediaProcessor::new();
+        for (width, height, expected_width, expected_height) in [
+            (3840, 2160, 512, 288),
+            (2160, 3840, 288, 512),
+            (256, 4096, 32, 512),
+            (80, 160, 80, 160),
+        ] {
+            let source = directory.path().join(format!("{width}x{height}.mp4"));
+            run(Command::new("ffmpeg")
+                .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i"])
+                .arg(format!("color=c=red:s={width}x{height}:r=30"))
+                .args([
+                    "-frames:v",
+                    "61",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-threads",
+                    "1",
+                ])
+                .arg(&source))?;
+            let before = sha256_file(&source)?;
+            let target = directory.path().join(format!("{width}x{height}.heic"));
+            let preview = processor.generate_image(&source, &target, 512)?;
+            assert_eq!(
+                (preview.width, preview.height),
+                (expected_width, expected_height),
+                "video dimensions {width}x{height}"
+            );
+            assert_eq!(before, sha256_file(&source)?);
+            assert_eq!(preview.sha256, sha256_file(&target)?);
+        }
         Ok(())
     }
 

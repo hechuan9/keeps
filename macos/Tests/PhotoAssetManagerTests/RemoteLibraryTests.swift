@@ -24,10 +24,13 @@ import KeepsAPI
         coordinator.openTaskWindow = { openedTracking = true }
         let clicked = try #require(outline.item(atRow: 1))
         let menu = try #require(coordinator.contextMenu(for: clicked))
-        let entry = try #require(menu.items.first { $0.title == "刷新目录全部元数据" })
+        let entry = try #require(menu.items.first { $0.title == "刷新" })
+        #expect(menu.items.filter { $0.title.contains("刷新") }.count == 1)
         #expect(!openedTracking)
+        let initialChildReads = LibraryStubProtocol.treeRequests.count(for: "other")
         #expect(NSApp.sendAction(try #require(entry.action), to: entry.target, from: entry))
-        try await waitUntil { openedTracking }
+        try await waitUntil { openedTracking && !store.isLoadingNavigation && !store.loadingDirectories.contains("other") }
+        #expect(LibraryStubProtocol.treeRequests.count(for: "other") > initialChildReads)
         #expect(store.query.directory == "root")
         #expect(outline.selectedRow == -1)
         #expect(store.submittingMetadataRefreshPaths.isEmpty)

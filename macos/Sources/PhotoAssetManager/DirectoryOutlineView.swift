@@ -390,7 +390,7 @@ struct DirectoryOutlineView: NSViewRepresentable {
                 entry.target = self
                 entry.representedObject = node
             }
-            for (title, action) in [("刷新目录全部元数据", #selector(refreshMetadata(_:))), ("刷新子目录列表", #selector(refreshDirectory(_:))), ("复制服务器路径", #selector(copyDirectoryPath(_:)))] {
+            for (title, action) in [("刷新", #selector(refreshMetadata(_:))), ("复制服务器路径", #selector(copyDirectoryPath(_:)))] {
                 let entry = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
                 entry.target = self
                 entry.representedObject = node
@@ -457,11 +457,6 @@ struct DirectoryOutlineView: NSViewRepresentable {
             Task { @MainActor in
                 if await store.refreshDirectoryMetadata(path: node.path) { openTaskWindow?() }
             }
-        }
-
-        @objc private func refreshDirectory(_ sender: NSMenuItem) {
-            guard !library.isOperationBlocking, let node = sender.representedObject as? Node else { return }
-            library.loadChildren(of: node.path, refresh: true)
         }
 
         @objc private func copyDirectoryPath(_ sender: NSMenuItem) {

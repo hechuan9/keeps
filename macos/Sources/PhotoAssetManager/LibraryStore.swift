@@ -348,6 +348,9 @@ final class LibraryStore: ObservableObject {
         do {
             _ = try await client.refreshDirectoryMetadata(path: path)
             guard configuration == requestedConfiguration else { return false }
+            refreshNavigation()
+            loadChildren(of: path, refresh: true)
+            refresh(force: true)
             return true
         } catch {
             if configuration == requestedConfiguration { lastError = Self.describe(error) }
