@@ -78,7 +78,7 @@ struct ContentView: View {
             topBar
             Divider()
             if let client = library.client {
-                NASTasksView(client: client).id(ObjectIdentifier(client))
+                NASTasksView(client: client, library: library).id(ObjectIdentifier(client))
             }
             HStack(spacing: 0) {
                 HSplitView {
@@ -194,7 +194,7 @@ struct ContentView: View {
             scopeButton("精选", count: library.counts?.picked, trashed: false, picked: true)
             scopeButton("回收站", count: library.counts?.trashed, trashed: true, picked: false)
             Divider().padding(.vertical, 20).padding(.horizontal, 16)
-            if library.isLoadingNavigation {
+            if library.isLoadingNavigation && !library.isRefreshingDirectoryAfterTrash {
                 ProgressView().progressViewStyle(.linear)
                     .accessibilityLabel("正在读取目录")
                     .padding(.horizontal, 16).padding(.bottom, 8)

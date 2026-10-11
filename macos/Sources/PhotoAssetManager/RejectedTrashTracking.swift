@@ -81,6 +81,7 @@ struct PendingRejectedTrash: Codable {
                     preferences.removeObject(forKey: Self.rejectedTrashKey)
                     rejectedTrashFinished = true
                     resetNavigation(); refreshNavigation(); refresh(force: true)
+                    closeRejectedTrash()
                     return
                 }
                 if task.status == "failed" { failRejectedTrash(task.error ?? "服务器报告删除失败。"); return }

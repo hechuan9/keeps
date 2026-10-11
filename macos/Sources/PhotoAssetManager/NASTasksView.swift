@@ -3,6 +3,7 @@ import KeepsAPI
 
 struct NASTasksView: View {
     let client: KeepsClient
+    @ObservedObject var library: LibraryStore
     @State private var taskStatus: KeepsTaskStatus?
     @State private var isBusy = false
     @State private var errorMessage: String?
@@ -19,11 +20,13 @@ struct NASTasksView: View {
     }
 
     private var hasWork: Bool {
-        guard let taskStatus else { return false }
-        return Self.isVisible(taskStatus.automatic.status)
-            || Self.isVisible(taskStatus.longTask.status)
-            || taskStatus.automatic.failedPhotos > 0
-            || (taskStatus.longTask.failed ?? 0) > 0
+        let hasServerWork = taskStatus.map { status in
+            Self.isVisible(status.automatic.status)
+            || Self.isVisible(status.longTask.status)
+            || status.automatic.failedPhotos > 0
+            || (status.longTask.failed ?? 0) > 0
+        } ?? false
+        return library.isRefreshingDirectoryAfterTrash || hasServerWork
     }
 
     var body: some View {
@@ -34,6 +37,10 @@ struct NASTasksView: View {
                         Label(errors.isEmpty ? "后台任务" : "后台任务出错",
                               systemImage: expanded ? "chevron.down" : "chevron.right")
                     }.buttonStyle(.plain)
+                    if library.isRefreshingDirectoryAfterTrash {
+                        Text("正在更新目录")
+                        ProgressView().progressViewStyle(.linear).frame(width: 100)
+                    }
                     if let status = taskStatus {
                         if Self.isVisible(status.automatic.status) || status.automatic.failedPhotos > 0 {
                             Text("自动更新 · \(Self.statusLabel(status.automatic.status)) · 待更新 \(status.automatic.remainingPhotos) 张")

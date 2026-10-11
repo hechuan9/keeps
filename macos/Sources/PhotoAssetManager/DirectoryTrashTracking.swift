@@ -119,8 +119,9 @@ struct PendingDirectoryTrash: Codable {
             query = KeepsAssetQuery()
         }
         resetNavigation()
-        refreshNavigation()
+        refreshNavigationAfterDirectoryTrash()
         refresh(force: true)
+        directoryToTrash = nil
     }
 
     func acknowledgeDirectoryTrashFailure() {

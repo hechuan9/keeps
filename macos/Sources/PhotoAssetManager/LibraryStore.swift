@@ -126,6 +126,7 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var directoryChildren: [String: [KeepsNavigationDirectory]] = [:]
     @Published private(set) var directoryErrors: [String: String] = [:]
     @Published private(set) var loadingDirectories: Set<String> = []
+    @Published private(set) var isRefreshingDirectoryAfterTrash = false
     @Published private(set) var navigationError: String?
     @Published private(set) var isLoadingNavigation = false
     @Published private(set) var navigationGeneration = 0
@@ -383,6 +384,27 @@ final class LibraryStore: ObservableObject {
                 }
             } catch {
                 if generation == navigationGeneration && requestGeneration == rootRequestGeneration { navigationError = Self.describe(error) }
+            }
+        }
+    }
+
+    func refreshNavigationAfterDirectoryTrash() {
+        guard !isOperationBlocking, let client else { return }
+        isRefreshingDirectoryAfterTrash = true
+        Task {
+            defer { isRefreshingDirectoryAfterTrash = false }
+            do {
+                let navigation = try await client.navigation()
+                let hidden = try await client.hiddenDirectories()
+                removeMissingDirectories(old: directories, new: navigation.directories)
+                hiddenDirectoryPaths = Set(hidden.paths)
+                directories = navigation.directories
+                reconcileSavedNavigation(with: navigation.directories, parent: nil)
+                for directory in navigation.directories where shouldLoadChildren(directory.path) {
+                    loadChildren(of: directory.path, refresh: true)
+                }
+            } catch {
+                navigationError = Self.describe(error)
             }
         }
     }
