@@ -81,7 +81,7 @@ struct PendingRejectedTrash: Codable {
                     preferences.removeObject(forKey: Self.rejectedTrashKey)
                     rejectedTrashFinished = true
                     resetNavigation(); refreshNavigation(); refresh(force: true)
-                    closeRejectedTrash()
+                    showsRejectedTrash = false
                     return
                 }
                 if task.status == "failed" { failRejectedTrash(task.error ?? "服务器报告删除失败。"); return }
@@ -115,5 +115,14 @@ struct PendingRejectedTrash: Codable {
         rejectedTrashFinished = false
         showsRejectedTrash = false
         refreshNavigation(); refresh(force: true)
+    }
+
+    func openRejectedTrash() {
+        if rejectedTrash == nil && rejectedTrashFinished {
+            rejectedTrashPreview = nil
+            rejectedTrashMessage = nil
+            rejectedTrashFinished = false
+        }
+        showsRejectedTrash = true
     }
 }

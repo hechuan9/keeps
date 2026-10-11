@@ -41,7 +41,7 @@ struct PhotoAssetManagerApp: App {
             CommandMenu("照片") {
                 Button("打开 AI 调色工作台") { aiWorkspace?.open() }
                     .disabled(!library.isStartupReady || aiWorkspace == nil || library.isOperationBlocking)
-                Button("删除所有弃用照片…") { library.showsRejectedTrash = true }
+                Button("删除所有弃用照片…") { library.openRejectedTrash() }
                     .disabled(!library.isStartupReady || library.client == nil || library.isOperationBlocking || library.isMutating || library.isCheckingConnection || library.isImportingPhotos || batch.isRunning || batch.editor.isBusy)
                 Divider()
                 Group {
