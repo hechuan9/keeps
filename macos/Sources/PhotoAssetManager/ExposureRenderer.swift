@@ -50,8 +50,11 @@ struct ExposureRenderer: Sendable {
             throw ExposureRenderError.invalidImage
         }
         let baseline = pixels(original, context: context, colorSpace: linear)
-        let luminances = stride(from: 0, to: baseline.count, by: 4).map {
-            max(0, 0.2126 * baseline[$0] + 0.7152 * baseline[$0 + 1] + 0.0722 * baseline[$0 + 2])
+        let luminances: [Float] = stride(from: 0, to: baseline.count, by: 4).map { index -> Float in
+            let red: Float = 0.2126 * baseline[index]
+            let green: Float = 0.7152 * baseline[index + 1]
+            let blue: Float = 0.0722 * baseline[index + 2]
+            return max(Float(0), red + green + blue)
         }.sorted()
         let median = Double(luminances[luminances.count / 2])
         var ev = min(2, max(-2, log2(0.18 / max(median, 0.000001))))
