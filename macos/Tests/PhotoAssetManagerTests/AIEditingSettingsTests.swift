@@ -53,7 +53,8 @@ import CryptoKit
         var deliveredWhileRunning = false
         _ = try await AIEditingProcess().run(executable: URL(fileURLWithPath: "/bin/sh"),
             arguments: ["-c", "printf 'first'; sleep 0.1; printf '\\nsecond\\n'; while [ ! -f acknowledged ]; do sleep 0.05; done; touch finished"], home: root, directory: root,
-            timeout: 5, onEvent: { line in
+            // The handshake proves event ordering; allow concurrent CI work to delay scheduling.
+            timeout: 30, onEvent: { line in
                 lines.append(line)
                 deliveredWhileRunning = deliveredWhileRunning || !FileManager.default.fileExists(atPath: root.appendingPathComponent("finished").path)
                 if line == "second" {
