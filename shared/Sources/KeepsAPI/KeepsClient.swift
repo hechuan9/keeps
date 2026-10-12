@@ -215,8 +215,13 @@ public final class KeepsClient: Sendable {
         try await request("POST", library + ["jobs", id, "retry"])
     }
     public func prepareImport(_ manifest: KeepsImportManifest) async throws -> KeepsImportBatch {
-        var request = try makeRequest("POST", library + ["imports"], body: JSONEncoder().encode(manifest))
-        if manifest.deduplicate { request.timeoutInterval = 3600 }
+        let request = try makeRequest("POST", library + ["imports"], body: JSONEncoder().encode(manifest))
+        let (data, response) = try await session.data(for: request)
+        return try JSONDecoder().decode(KeepsImportBatch.self, from: checkedData(data, response))
+    }
+    public func matchImportFiles(batchID: UUID, fileID: UUID, files: [KeepsImportFile]) async throws -> KeepsImportBatch {
+        struct MatchRequest: Encodable { let files: [KeepsImportFile] }
+        let request = try makeRequest("POST", library + ["imports", batchID.uuidString, "files", fileID.uuidString, "match"], body: JSONEncoder().encode(MatchRequest(files: files)))
         let (data, response) = try await session.data(for: request)
         return try JSONDecoder().decode(KeepsImportBatch.self, from: checkedData(data, response))
     }

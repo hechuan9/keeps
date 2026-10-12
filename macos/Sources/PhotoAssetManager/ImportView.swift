@@ -45,7 +45,7 @@ struct ImportView: View {
             Toggle("跳过目标文件夹中内容完全相同的文件", isOn: $store.deduplicate)
                 .disabled(store.isBusy || store.manifest != nil)
             Text(store.deduplicate
-                 ? "开启后会在对应目标目录比较文件内容；缺失的 RAW、JPEG、HEIF 或 XMP 会按配对补齐。"
+                 ? "开启后按照片逐组读取并匹配，仅比较导入来源与实际目标目录，不扫描全图库；缺失的 RAW、JPEG、HEIF 或 XMP 会按配对补齐。"
                  : "默认不去重、不预读整批照片；RAW、JPEG、HEIF 和 XMP 保持配对，同名冲突整组改名。")
                 .font(.caption).foregroundStyle(.secondary)
             Divider()

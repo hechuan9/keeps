@@ -209,6 +209,7 @@ final class GeometryTaskStore: ObservableObject {
             var outputs: [KeepsEditOutput] = []
             for target in session.objects {
                 let url = files[target.role]!
+                try await AIEditingImages.identify(url, rootID: state.rootID ?? job.assetID.uuidString, versionID: job.id)
                 let info = try await AIEditingImages.inspect(url, image: true)
                 try Task.checkCancellation()
                 try await client.uploadEditImage(target: target, file: url)

@@ -11,6 +11,44 @@ struct AIEditingImageInfo: Sendable {
 }
 
 enum AIEditingImages {
+    /// Stamp only generated outputs, before hashing and uploading immutable objects.
+    static func identify(_ url: URL, rootID: String, versionID: UUID) async throws {
+        let task = Task.detached(priority: .utility) {
+            guard let root = UUID(uuidString: rootID),
+                  let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let type = CGImageSourceGetType(source) else {
+                throw AIEditingFailure("无法读取导出照片身份。")
+            }
+            let values = ["xmpMM:OriginalDocumentID": "xmp.did:" + root.uuidString.lowercased(),
+                          "xmpMM:DocumentID": "xmp.did:" + versionID.uuidString.lowercased()]
+            if let existing = CGImageSourceCopyMetadataAtIndex(source, 0, nil),
+               values.allSatisfy({ CGImageMetadataCopyStringValueWithPath(existing, nil, $0.key as CFString) as String? == $0.value }) {
+                return
+            }
+            let metadata = CGImageMetadataCreateMutable()
+            guard CGImageMetadataRegisterNamespaceForPrefix(metadata, "http://ns.adobe.com/xap/1.0/mm/" as CFString, "xmpMM" as CFString, nil),
+                  values.allSatisfy({ CGImageMetadataSetValueWithPath(metadata, nil, $0.key as CFString, $0.value as CFString) }) else {
+                throw AIEditingFailure("无法设置导出照片身份。")
+            }
+            let pending = url.deletingLastPathComponent().appendingPathComponent(UUID().uuidString + ".heic")
+            defer { try? FileManager.default.removeItem(at: pending) }
+            guard let destination = CGImageDestinationCreateWithURL(pending as CFURL, type, CGImageSourceGetCount(source), nil) else {
+                throw AIEditingFailure("无法创建带身份的导出文件。")
+            }
+            var error: Unmanaged<CFError>?
+            guard CGImageDestinationCopyImageSource(destination, source, [
+                kCGImageDestinationMetadata: metadata,
+                kCGImageDestinationMergeMetadata: true
+            ] as CFDictionary, &error) else {
+                if let error { throw error.takeRetainedValue() as Error }
+                throw AIEditingFailure("无法保存导出照片身份。")
+            }
+            try Task.checkCancellation()
+            try Data(contentsOf: pending, options: .mappedIfSafe).write(to: url, options: .atomic)
+        }
+        try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+    }
+
     static func comparisonPreview(_ url: URL) throws -> CGImage {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [

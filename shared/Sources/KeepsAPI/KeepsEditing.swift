@@ -13,6 +13,8 @@ public struct KeepsEditRecipe: Codable, Equatable, Sendable {
 }
 
 public struct KeepsEditState: Codable, Equatable, Sendable {
+    public var rootID: String?
+    public var currentVersionID: String?
     public var decisionMetadata: String?
     public var negativeContentHash: String?
     public var revision: Int64
@@ -27,7 +29,9 @@ public struct KeepsEditState: Codable, Equatable, Sendable {
 
     public init(negativeContentHash: String?, revision: Int64, hasEdit: Bool, exposureEV: Double? = nil,
                 sourceFilename: String? = nil, sourceAvailable: Bool, lastRequestID: String? = nil,
-                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil, recipe: KeepsEditRecipe? = nil, decisionMetadata: String? = nil) {
+                sourceFileHash: String? = nil, sourceSizeBytes: Int64? = nil, recipe: KeepsEditRecipe? = nil, decisionMetadata: String? = nil, rootID: String? = nil, currentVersionID: String? = nil) {
+        self.rootID = rootID
+        self.currentVersionID = currentVersionID
         self.decisionMetadata = decisionMetadata
         self.negativeContentHash = negativeContentHash
         self.revision = revision

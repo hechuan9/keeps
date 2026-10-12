@@ -42,7 +42,7 @@ pub fn recover(jobs: &Jobs) -> Result<()> {
     let current: Option<String> = {
         let db = jobs.db.lock().unwrap();
         db.query_row(
-            "SELECT current_photo FROM worker_activity WHERE id=1",
+            "SELECT current_photo FROM worker_activity WHERE id=1 AND active=1 AND work_class='manual'",
             [],
             |r| r.get::<_, Option<String>>(0),
         )
@@ -56,12 +56,12 @@ pub fn recover(jobs: &Jobs) -> Result<()> {
             .filter(|f| f.active && std::path::Path::new(&path).starts_with(&f.path))
             .max_by_key(|f| f.path.len())
     {
-        jobs.enqueue_file_change(&folder.id, std::path::Path::new(&path), 0)?;
+        jobs.enqueue_operation_file(&folder.id, std::path::Path::new(&path), 0)?;
     }
     let mut db = jobs.db.lock().unwrap();
     let tx = db.transaction()?;
     tx.execute(
-        "DELETE FROM files WHERE path IN (SELECT path FROM worker_photo_files) OR path=(SELECT current_photo FROM worker_activity WHERE id=1 AND active=1)",
+        "DELETE FROM files WHERE EXISTS(SELECT 1 FROM worker_activity WHERE id=1 AND active=1 AND work_class='manual') AND (path IN (SELECT path FROM worker_photo_files) OR path=(SELECT current_photo FROM worker_activity WHERE id=1))",
         [],
     )?;
     tx.execute("DELETE FROM worker_photo_files", [])?;
@@ -366,6 +366,41 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_automatic_photo_is_not_requeued_or_invalidated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("originals");
+        std::fs::create_dir(&originals)?;
+        let path = originals.join("photo.jpg");
+        std::fs::write(&path, b"original")?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), &originals)?;
+        let folder = jobs.add_folder("lib", ".")?;
+        jobs.record_file(
+            &folder.id,
+            path.to_str().unwrap(),
+            8,
+            1,
+            "asset",
+            "hash",
+            None,
+        )?;
+        begin_photo(
+            &jobs,
+            "lib",
+            "automatic",
+            &path,
+            std::slice::from_ref(&path),
+        )?;
+        recover(&jobs)?;
+        assert!(jobs.claim_class("manual")?.is_none());
+        assert!(jobs.claim_class("automatic")?.is_none());
+        assert!(
+            jobs.file_state(&folder.id, path.to_str().unwrap())?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn interrupted_photo_restarts_all_members_but_preserves_completed_photos() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let originals = dir.path().join("originals");
@@ -392,7 +427,7 @@ mod tests {
                 None,
             )?;
         }
-        begin_photo(&jobs, "lib", "reconcile", &paths[0], &paths)?;
+        begin_photo(&jobs, "lib", "manual", &paths[0], &paths)?;
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
         recover(&jobs)?;
@@ -408,7 +443,7 @@ mod tests {
                 .is_some()
         );
         assert_eq!(
-            jobs.claim_class("automatic")?.unwrap().path,
+            jobs.claim_class("manual")?.unwrap().path,
             paths[0].to_str().unwrap()
         );
         begin_photo(&jobs, "lib", "automatic", &paths[0], &paths)?;

@@ -943,6 +943,52 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn directory_scan_keeps_ready_photo_remote_lease_until_that_photo_changes() -> Result<()> {
+        let (root, store) = pending_setup()?;
+        let originals = root.path().join("photos");
+        fs::create_dir_all(&originals)?;
+        let jobs = crate::jobs::Jobs::open(&root.path().join("jobs.sqlite"), &originals)?;
+        let folder = jobs.add_folder("lib", ".")?;
+        let source = jobs.root().join("photo.3fr");
+        fs::write(&source, b"original")?;
+        fs::write(jobs.root().join("other.3fr"), b"waiting for index")?;
+        let info = fs::metadata(&source)?;
+        jobs.record_file(
+            &folder.id,
+            source.to_str().unwrap(),
+            info.len() as i64,
+            info.modified()?
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos() as i64,
+            "asset",
+            "hash",
+            None,
+        )?;
+        jobs.enqueue_directory_change(&folder.id, jobs.root(), 0)?;
+        store.lock()?.execute("DELETE FROM catalog_paths", [])?;
+        store.lock()?.execute(
+            "INSERT INTO catalog_paths VALUES('lib',?,'asset','hash','raw_original')",
+            [source.to_str().unwrap()],
+        )?;
+        let (_, asset, _) = claim_pending(&store, "lib", "worker")?.unwrap();
+        assert!(!store.defer_cache_for_scan(&jobs, "lib", &asset)?);
+        let remaining: i64 = store.lock()?.query_row(
+            "SELECT count(*) FROM remote_cache_tasks WHERE completed=0",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(remaining, 1);
+        fs::write(source.with_extension("xmp"), b"new metadata")?;
+        assert!(store.defer_cache_for_scan(&jobs, "lib", &asset)?);
+        let remaining: i64 = store.lock()?.query_row(
+            "SELECT count(*) FROM remote_cache_tasks WHERE completed=0",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+    #[test]
     fn sibling_scan_revokes_remote_lease_before_encoding_existing_source() -> Result<()> {
         let (root, store) = pending_setup()?;
         let originals = root.path().join("photos");

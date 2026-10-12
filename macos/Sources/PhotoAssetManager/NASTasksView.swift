@@ -150,12 +150,12 @@ struct NASSourceSettingsView: View {
             }
             Text("服务器原片根目录：\(rootPath.isEmpty ? "等待连接" : rootPath)")
                 .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
-            Text("此处管理服务器目录，无需在本机挂载 NAS。输入相对于服务器原片根目录的路径；“.” 表示整个根目录。停止追踪只修改索引配置，保留所有原片。")
+            Text("此处管理服务器目录，无需在本机挂载 NAS。输入相对于服务器原片根目录的路径；“.” 表示整个根目录。添加来源不会自动扫描；新增或修改文件后，请点击“扫描”。移除来源只修改索引配置，保留所有原片。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 TextField("例如：2026/旅行，或 .", text: $newPath).textFieldStyle(.roundedBorder)
                     .accessibilityIdentifier("nas-folder-path")
-                Button("添加追踪") {
+                Button("添加来源") {
                     perform {
                         _ = try await client.addFolder(path: newPath.trimmingCharacters(in: .whitespacesAndNewlines))
                         try await refresh()
@@ -174,13 +174,13 @@ struct NASSourceSettingsView: View {
                         HStack {
                             Text(folder.path).textSelection(.enabled)
                             Spacer()
-                            Text(folder.active ? "追踪中" : "已停止").foregroundStyle(.secondary)
+                            Text(folder.active ? "已添加" : "已停用").foregroundStyle(.secondary)
                             if folder.active {
-                                Button("核对") { perform {
+                                Button("扫描") { perform {
                                     _ = try await client.scanFolder(id: folder.id)
                                     try await refresh()
                                 } }
-                                Button("停止追踪") { perform {
+                                Button("移除来源") { perform {
                                     try await client.removeFolder(id: folder.id)
                                     try await refresh()
                                 } }

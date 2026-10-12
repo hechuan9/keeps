@@ -252,6 +252,7 @@ final class ExposureTaskStore: ObservableObject {
             var outputs: [KeepsEditOutput] = []
             for target in session.objects {
                 let url = files[target.role]!
+                try await AIEditingImages.identify(url, rootID: state.rootID ?? job.assetID.uuidString, versionID: job.id)
                 let info = try await Self.inspectFile(url, image: true)
                 try Task.checkCancellation()
                 try await client.uploadEditImage(target: target, file: url)

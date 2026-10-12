@@ -11,7 +11,6 @@ pub mod previews;
 pub mod revisions;
 pub mod store;
 pub mod versions;
-pub mod watcher;
 pub mod worker;
 
 pub mod remote_worker;

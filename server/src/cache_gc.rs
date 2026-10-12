@@ -173,6 +173,7 @@ impl Store {
             };
             let referenced: bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM derivative_objects WHERE object_bucket=?1 AND object_key=?2) OR EXISTS(SELECT 1 FROM media_cache WHERE json_extract(thumbnail,'$.objectRef.bucket')=?1 AND json_extract(thumbnail,'$.objectRef.key')=?2) OR EXISTS(SELECT 1 FROM media_cache WHERE json_extract(browse_thumbnail,'$.objectRef.bucket')=?1 AND json_extract(browse_thumbnail,'$.objectRef.key')=?2)",params![bucket,key],|r|r.get(0))?;
             let referenced = referenced || tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_edits WHERE json_extract(standard,'$.objectRef.key')=?1 OR json_extract(thumbnail,'$.objectRef.key')=?1 OR json_extract(browse,'$.objectRef.key')=?1)", [&key], |r|r.get::<_,bool>(0))?;
+            let referenced = referenced || tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_edit_requests r,json_each(r.payload,'$.body.outputs') o WHERE json_extract(r.payload,'$.action')='commit' AND json_extract(o.value,'$.objectRef.bucket')=?1 AND json_extract(o.value,'$.objectRef.key')=?2)", params![bucket,key], |r|r.get::<_,bool>(0))?;
             if referenced {
                 tx.execute(
                     "UPDATE media_cache_gc SET not_before=? WHERE bucket=? AND object_key=?",

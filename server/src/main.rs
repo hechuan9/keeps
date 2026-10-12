@@ -55,11 +55,11 @@ async fn main() -> Result<()> {
     };
     let store = Arc::new(Store::open(&database, auto_create)?);
     let jobs = Arc::new(Jobs::open(&root.join("db/jobs.sqlite"), &original)?);
-    let cancelled = jobs.cancel_automatic_full_scans()?;
+    let cancelled = jobs.cancel_automatic_scans()?;
     if cancelled > 0 {
         tracing::info!(
             cancelled,
-            "cancelled automatic full-library scans; manual scan is required"
+            "cancelled automatic scans; scans require an explicit request"
         );
     }
     keeps_server::directory_move::recover(&jobs, &store)?;
@@ -81,17 +81,6 @@ async fn main() -> Result<()> {
     let address = env::var("KEEPS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2283".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
     let stop = Arc::new(AtomicBool::new(false));
-    let (watcher_ready, ready) = tokio::sync::oneshot::channel();
-    let mut watcher = tokio::task::spawn_blocking({
-        let (jobs, store, stop) = (jobs.clone(), store.clone(), stop.clone());
-        move || keeps_server::watcher::run(jobs, store, stop, Some(watcher_ready))
-    });
-    if ready.await.is_err() {
-        watcher
-            .await
-            .context("NAS watcher task failed during startup")??;
-        bail!("NAS watcher stopped before initialization");
-    }
     let mut worker = keeps_server::background::spawn("worker", {
         let (store, jobs, previews, stop) =
             (store.clone(), jobs.clone(), previews.clone(), stop.clone());
@@ -129,12 +118,11 @@ async fn main() -> Result<()> {
         }
     });
     tokio::select! {
-        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;watcher.await??;directory_trash.await??;directory_move.await??;imports.await??;}
-        result=&mut watcher=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS watcher exited unexpectedly");}}
-        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;watcher.await??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
-        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_move.await??;imports.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
-        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_trash.await??;imports.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
-        result=&mut imports=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;watcher.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("Import worker exited unexpectedly");}}
+        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;}
+        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
+        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_move.await??;imports.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
+        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;imports.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
+        result=&mut imports=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("Import worker exited unexpectedly");}}
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-"""Linux event/versions integration against disposable, read-only mounted originals.
+"""Manual scan/versions integration against disposable, read-only mounted originals.
 
 KEEPS_TEST_IMAGE=keeps-server:mechanisms-test python3 server/tests/mechanisms_smoke.py
 """
@@ -76,15 +76,24 @@ def main():
 
             wait(lambda: request("/healthz"), "server ready")
             assets = lambda: request("/libraries/test/assets")["items"]
+            folders = request("/libraries/test/folders")["folders"]
+            folder_id = next(f["id"] for f in folders if f["path"] == "/originals")
+            def scan():
+                return request(f"/libraries/test/folders/{folder_id}/scan", {}, "POST")
             write_photo("a.jpg")
-            first = wait(lambda: next((a for a in assets() if a.get("preview")), None), "event adds first photo and preview without periodic scan")
+            time.sleep(2)
+            assert assets() == [], "external file must wait for manual scan"
+            scan()
+            first = wait(lambda: next((a for a in assets() if a.get("preview")), None), "manual scan adds first photo and preview")
             asset_id = first["id"]
             versions_url = f"/libraries/test/assets/{asset_id}/versions"
             write_photo("b.jpg")
+            scan()
             versions = wait(lambda: (v if len(v := request(versions_url)["items"]) == 2 else None), "metadata-only JPEG variant groups despite renamed file")
             assert len(assets()) == 1
             assert next(v for v in versions if v["isDefault"])["priority"] == 3
             write_photo("c.jpg")
+            scan()
             wait(lambda: len(assets()) == 2, "same capture metadata with different image stays separate")
             candidates = request(f"/libraries/test/assets/{asset_id}/version-candidates")["items"]
             assert len(candidates) == 1, candidates
@@ -94,10 +103,13 @@ def main():
             wait(lambda: request(f"/libraries/test/assets/{asset_id}").get("preview"), "selected version preview generated")
             docker("exec", writer, "mkdir", "/originals/nested")
             docker("exec", writer, "mv", "/originals/b.jpg", "/originals/renamed-b.jpg")
+            scan()
             wait(lambda: any(p["path"] == "/originals/renamed-b.jpg" and p["available"] for v in request(versions_url)["items"] for p in v["paths"]), "same-directory rename keeps version association")
             docker("exec", writer, "cp", "/originals/renamed-b.jpg", "/originals/nested/b.jpg")
+            scan()
             wait(lambda: len(assets()) == 3, "same image in child directory stays a separate asset")
             docker("exec", writer, "rm", "/originals/a.jpg")
+            scan()
             wait(lambda: any(v["isDefault"] and v["contentHash"] != original_hash for v in request(versions_url)["items"]), "external disappearance selects available version")
             wait(lambda: request(f"/libraries/test/assets/{asset_id}").get("preview"), "fallback preview is rebuilt")
             docker("stop", name)
@@ -109,7 +121,10 @@ def main():
                 with sqlite3.connect(keeps / "db/jobs.sqlite") as db:
                     row = db.execute("SELECT metadata_stamp FROM files WHERE path='/originals/c.jpg'").fetchone()
                     return row and bool(row[0])
-            wait(sidecar_recorded, "startup reconciliation detects sidecar-only change while offline")
+            time.sleep(2)
+            assert not sidecar_recorded(), "restart must not scan offline changes"
+            scan()
+            wait(sidecar_recorded, "manual scan detects sidecar-only change while offline")
             assert len(assets()) == 3
             for fixture, path in [("b.jpg", "/originals/renamed-b.jpg"), ("b.jpg", "/originals/nested/b.jpg"), ("c.jpg", "/originals/c.jpg")]:
                 assert docker("exec", writer, "sha256sum", path).split()[0] == hashlib.sha256(blobs[fixture]).hexdigest()

@@ -53,6 +53,12 @@ struct File {
     received_sha256: Option<String>,
     #[serde(default)]
     skipped: bool,
+    #[serde(default)]
+    matched: bool,
+    #[serde(default)]
+    publication_pending: bool,
+    #[serde(default)]
+    digest_stamp: Option<DigestStamp>,
     uploaded: bool,
     published: bool,
 }
@@ -75,6 +81,70 @@ struct Batch {
     #[serde(default)]
     group_jobs: BTreeMap<String, String>,
 }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+struct DigestStamp {
+    size: u64,
+    device: u64,
+    inode: u64,
+    mtime: i64,
+    mtime_ns: i64,
+    ctime: i64,
+    ctime_ns: i64,
+}
+impl DigestStamp {
+    fn read(path: &FsPath) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path)?;
+        ensure!(metadata.is_file(), "digest source is not a regular file");
+        Ok(Self {
+            size: metadata.len(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mtime: metadata.mtime(),
+            mtime_ns: metadata.mtime_nsec(),
+            ctime: metadata.ctime(),
+            ctime_ns: metadata.ctime_nsec(),
+        })
+    }
+}
+fn save_digest(
+    db: &rusqlite::Connection,
+    library: &str,
+    path: &FsPath,
+    hash: &str,
+    stamp: &DigestStamp,
+) -> Result<()> {
+    db.execute("INSERT INTO import_file_digests(library_id,path,sha256,stamp) VALUES(?,?,?,?) ON CONFLICT(library_id,path) DO UPDATE SET sha256=excluded.sha256,stamp=excluded.stamp",
+        params![library,path.to_string_lossy(),hash,serde_json::to_string(stamp)?])?;
+    Ok(())
+}
+// Ctime and inode also invalidate edits that preserve file size and modification time.
+pub(crate) fn file_digest(jobs: &Jobs, library: &str, path: &FsPath) -> Result<String> {
+    let before = DigestStamp::read(path)?;
+    let cached: Option<(String, String)> = jobs
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT sha256,stamp FROM import_file_digests WHERE library_id=? AND path=?",
+            params![library, path.to_string_lossy()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((hash, stamp)) = cached
+        && serde_json::from_str::<DigestStamp>(&stamp)? == before
+    {
+        return Ok(hash);
+    }
+    let hash = crate::media::sha256_file(path)?;
+    ensure!(
+        DigestStamp::read(path)? == before,
+        "file changed while computing content digest"
+    );
+    save_digest(&jobs.db.lock().unwrap(), library, path, &hash, &before)?;
+    Ok(hash)
+}
+
 fn invalid(message: impl Into<String>) -> anyhow::Error {
     StoreError {
         status: 422,
@@ -245,10 +315,6 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
                 }),
             invalid("invalid size or SHA256")
         );
-        ensure!(
-            !input.deduplicate || file.sha256.is_some(),
-            invalid("deduplication requires SHA256 for every file")
-        );
         let (key, stem, suffix) = group(file)?;
         groups
             .entry(key)
@@ -273,26 +339,22 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
             .or_default()
             .insert(key, entries);
     }
-    let mut planned_directories = Vec::new();
-    for (parent, groups) in directories {
-        let existing =
-            hash_existing_groups(&destination.join(&parent), &groups, input.deduplicate)?;
-        planned_directories.push((parent, groups, existing));
-    }
     let db = jobs.db.lock().unwrap();
     if let Some(batch) = existing_batch(&db, library, &input, &destination)? {
         return Ok(batch);
     }
+    let reservations = reserved_batches(&db)?;
+    drop(db);
     let mut files = Vec::new();
-    for (parent, groups, (existing_groups, existing_hashes)) in planned_directories {
+    for (parent, groups) in directories {
         let directory = destination.join(&parent);
         for mut file in plan_files(
-            &db,
+            &reservations,
             &directory,
             &groups,
-            input.deduplicate,
-            &existing_groups,
-            &existing_hashes,
+            false,
+            &BTreeMap::new(),
+            None,
         )? {
             file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
             files.push(file);
@@ -310,46 +372,23 @@ fn prepare(jobs: &Jobs, library: &str, mut input: Prepare) -> Result<Batch> {
         job_id: None,
         group_jobs: BTreeMap::new(),
     };
-    save(&db, library, &batch)?;
+    save(&jobs.db.lock().unwrap(), library, &batch)?;
     Ok(batch)
 }
 type SourceGroups = BTreeMap<String, Vec<(InputFile, String, String)>>;
-fn hash_existing_groups(
-    destination: &FsPath,
-    groups: &SourceGroups,
-    deduplicate: bool,
-) -> Result<(ExistingGroups, BTreeMap<String, String>)> {
-    let existing_groups = if deduplicate && destination.exists() {
-        existing_groups(destination)?
-    } else {
-        BTreeMap::new()
-    };
-    let mut existing_hashes = BTreeMap::new();
-    if deduplicate {
-        let candidates: HashSet<_> = groups
-            .values()
-            .flatten()
-            .map(|(file, _, suffix)| (suffix.to_lowercase(), file.size))
-            .collect();
-        for existing in existing_groups.values() {
-            for (suffix, (name, _)) in existing {
-                let path = destination.join(name);
-                let metadata = std::fs::symlink_metadata(&path)?;
-                if metadata.is_file() && candidates.contains(&(suffix.clone(), metadata.len())) {
-                    existing_hashes.insert(name.clone(), crate::media::sha256_file(&path)?);
-                }
-            }
-        }
-    }
-    Ok((existing_groups, existing_hashes))
+fn reserved_batches(db: &rusqlite::Connection) -> Result<Vec<Batch>> {
+    let mut stmt = db.prepare("SELECT manifest FROM imports")?;
+    stmt.query_map([], |row| row.get::<_, String>(0))?
+        .map(|raw| Ok(serde_json::from_str(&raw?)?))
+        .collect()
 }
 fn plan_files(
-    db: &rusqlite::Connection,
+    batches: &[Batch],
     destination: &FsPath,
     groups: &SourceGroups,
     deduplicate: bool,
     existing_groups: &ExistingGroups,
-    existing_hashes: &BTreeMap<String, String>,
+    matching_batch: Option<&str>,
 ) -> Result<Vec<File>> {
     let mut reserved: HashSet<String> = if destination.exists() {
         std::fs::read_dir(destination)?
@@ -358,11 +397,19 @@ fn plan_files(
     } else {
         HashSet::new()
     };
+    let source_ids: HashSet<_> = groups
+        .values()
+        .flatten()
+        .map(|(file, _, _)| file.id.as_str())
+        .collect();
     let mut pending_names = HashSet::new();
-    let mut stmt = db.prepare("SELECT manifest FROM imports")?;
-    for raw in stmt.query_map([], |r| r.get::<_, String>(0))? {
-        let batch: Batch = serde_json::from_str(&raw?)?;
-        for file in batch.files {
+    for batch in batches {
+        for file in &batch.files {
+            if matching_batch == Some(batch.id.as_str())
+                && source_ids.contains(file.input.id.as_str())
+            {
+                continue;
+            }
             let path = FsPath::new(&batch.target_path).join(&file.file_name);
             if path.parent() == Some(destination) {
                 let name = path
@@ -370,7 +417,7 @@ fn plan_files(
                     .context("reserved filename")?
                     .to_string_lossy()
                     .to_lowercase();
-                if !batch.finished {
+                if !file.published {
                     pending_names.insert(name.clone());
                 }
                 reserved.insert(name);
@@ -424,7 +471,6 @@ fn plan_files(
                 &pending_names,
                 &reserved,
                 existing_groups,
-                existing_hashes,
             )? {
                 for ((input, _, _), (name, skipped)) in entries.iter().zip(matches) {
                     reserved.insert(name.to_lowercase());
@@ -435,6 +481,9 @@ fn plan_files(
                         file_name: name,
                         received_sha256: if skipped { input.sha256.clone() } else { None },
                         skipped,
+                        matched: true,
+                        publication_pending: !skipped,
+                        digest_stamp: None,
                         uploaded: skipped,
                         published: skipped,
                     });
@@ -478,6 +527,9 @@ fn plan_files(
                     file_name: name,
                     received_sha256: None,
                     skipped: false,
+                    matched: false,
+                    publication_pending: true,
+                    digest_stamp: None,
                     uploaded: false,
                     published: false,
                 });
@@ -569,7 +621,6 @@ fn matching_existing_group(
     pending_names: &HashSet<String>,
     occupied: &HashSet<String>,
     groups: &ExistingGroups,
-    hashes: &BTreeMap<String, String>,
 ) -> Result<Option<Vec<(String, bool)>>> {
     for existing in groups.values() {
         let mut anchor = None;
@@ -583,7 +634,7 @@ fn matching_existing_group(
                     matches = false;
                     break;
                 }
-                if hashes.get(name) != input.sha256.as_ref() {
+                if Some(crate::media::sha256_file(&path)?) != input.sha256 {
                     matches = false;
                     break;
                 }
@@ -632,6 +683,10 @@ pub fn router() -> Router<Arc<AppState>> {
             post(prepare_handler).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
         .route(
+            "/libraries/{library}/imports/{batch}/files/{file}/match",
+            post(match_handler),
+        )
+        .route(
             "/libraries/{library}/imports/{batch}/files/{file}",
             put(upload).layer(DefaultBodyLimit::disable()),
         )
@@ -665,6 +720,177 @@ async fn prepare_handler(
         serde_json::to_value(batch).map_err(anyhow::Error::from)?,
     ))
 }
+#[derive(Deserialize)]
+struct MatchGroup {
+    files: Vec<InputFile>,
+}
+
+// Match one complete photo, keeping its original and sidecars together.
+fn match_group(
+    jobs: &Jobs,
+    library: &str,
+    id: &str,
+    file_id: &str,
+    mut inputs: Vec<InputFile>,
+) -> Result<Batch> {
+    let _directory_guard = jobs.directory_mutation.read().unwrap();
+    crate::directory_move::ensure_reconciled(jobs)?;
+    let mut batch = load(&jobs.db.lock().unwrap(), library, id)?;
+    ensure!(
+        batch.deduplicate,
+        invalid("deduplication is not enabled for this batch")
+    );
+    let file_id = uuid(file_id)?;
+    let selected = batch
+        .files
+        .iter()
+        .find(|file| file.input.id == file_id)
+        .ok_or_else(|| invalid("file not found"))?;
+    let key = group(&selected.input)?.0;
+    let indices = batch
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            (group(&file.input)
+                .map(|value| value.0 == key)
+                .unwrap_or(false))
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    for input in &mut inputs {
+        input.id = uuid(&input.id)?;
+    }
+    ensure!(
+        inputs.len() == indices.len(),
+        invalid("match requires the complete photo group")
+    );
+    let mut ids = HashSet::new();
+    for input in &inputs {
+        let original = indices
+            .iter()
+            .map(|index| &batch.files[*index])
+            .find(|file| file.input.id == input.id)
+            .ok_or_else(|| invalid("file belongs to another photo group"))?;
+        ensure!(
+            ids.insert(&input.id)
+                && input.relative_path == original.input.relative_path
+                && input.size == original.input.size,
+            conflict("match manifest differs from prepared source")
+        );
+        ensure!(
+            input
+                .sha256
+                .as_ref()
+                .is_some_and(|digest| digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())),
+            invalid("match requires SHA256 for every file")
+        );
+        ensure!(
+            original
+                .input
+                .sha256
+                .as_ref()
+                .is_none_or(|digest| Some(digest) == input.sha256.as_ref()),
+            conflict("source digest changed")
+        );
+        if original.matched {
+            ensure!(
+                original.received_sha256 == input.sha256,
+                conflict("source digest changed after matching")
+            );
+        }
+    }
+    if indices
+        .iter()
+        .all(|index| batch.files[*index].matched || batch.files[*index].uploaded)
+    {
+        batch.files = indices
+            .iter()
+            .map(|index| batch.files[*index].clone())
+            .collect();
+        return Ok(batch);
+    }
+    ensure!(
+        indices.iter().all(|index| !batch.files[*index].uploaded),
+        conflict("cannot rematch a partially uploaded photo")
+    );
+    let destination = target(jobs, library, &batch.target_path)?;
+    let parent = if batch.preserve_structure {
+        FsPath::new(&inputs[0].relative_path)
+            .parent()
+            .unwrap_or(FsPath::new(""))
+    } else {
+        FsPath::new("")
+    };
+    let directory = import_directory(&destination, parent, false)?;
+    let mut entries = Vec::new();
+    for input in &inputs {
+        let (_, stem, suffix) = group(input)?;
+        entries.push((input.clone(), stem, suffix));
+    }
+    let groups = BTreeMap::from([(key, entries)]);
+    let existing = if directory.exists() {
+        existing_groups(&directory)?
+    } else {
+        BTreeMap::new()
+    };
+    let reservations = reserved_batches(&jobs.db.lock().unwrap())?;
+    let planned = plan_files(
+        &reservations,
+        &directory,
+        &groups,
+        true,
+        &existing,
+        Some(&batch.id),
+    )?;
+    let db = jobs.db.lock().unwrap();
+    // Uploads of other groups may have advanced while destination files were read.
+    batch = load(&db, library, id)?;
+    let mut result = Vec::new();
+    for mut file in planned {
+        let index = batch
+            .files
+            .iter()
+            .position(|entry| entry.input.id == file.input.id)
+            .context("import file disappeared")?;
+        file.received_sha256 = file.input.sha256.clone();
+        file.input = batch.files[index].input.clone();
+        file.file_name = parent.join(&file.file_name).to_string_lossy().into_owned();
+        file.matched = true;
+        batch.files[index] = file.clone();
+        result.push(file);
+    }
+    save(&db, library, &batch)?;
+    batch.files = result;
+    Ok(batch)
+}
+
+async fn match_handler(
+    State(state): State<Arc<AppState>>,
+    Path((library, id, file)): Path<(String, String, String)>,
+    Json(body): Json<MatchGroup>,
+) -> Result<Json<Value>, ApiError> {
+    let batch = tokio::task::spawn_blocking(move || -> Result<Batch> {
+        let _guard = state.jobs.import_mutation.lock().unwrap();
+        let batch = match_group(&state.jobs, &library, &id, &file, body.files)?;
+        let worker: Option<String> = state.store.lock()?.query_row(
+            "SELECT worker_id FROM import_compute_leases WHERE library_id=? AND batch_id=? LIMIT 1",
+            params![library, batch.id], |row| row.get(0)).optional()?;
+        if let Some(worker) = worker {
+            reserve_compute(&state, &library, &batch, &worker)?;
+        }
+        Ok(batch)
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(Json(
+        serde_json::to_value(batch).map_err(anyhow::Error::from)?,
+    ))
+}
+
 fn resume_pipeline(state: &AppState, library: &str, id: &str) -> Result<()> {
     let batch = load(&state.jobs.db.lock().unwrap(), library, id)?;
     let mut replacements = BTreeMap::new();
@@ -690,7 +916,7 @@ fn resume_pipeline(state: &AppState, library: &str, id: &str) -> Result<()> {
                 .into_owned()
         })
         .collect();
-    state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1) AND (status='failed' OR browse_attempts>=4)",params![library,serde_json::to_string(&paths)?])?;
+    state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM json_each(?2) wanted CROSS JOIN catalog_paths p ON p.library_id=?1 AND p.path=wanted.value) AND (status='failed' OR browse_attempts>=4)",params![library,serde_json::to_string(&paths)?])?;
     let db = state.jobs.db.lock().unwrap();
     let mut current = load(&db, library, id)?;
     if let Some((group, _)) = batch
@@ -766,6 +992,10 @@ async fn upload(
             .find(|f| f.input.id == fid)
             .cloned()
             .ok_or_else(|| invalid("file not found"))?;
+        ensure!(
+            !batch.deduplicate || file.matched || file.uploaded || file.input.sha256.is_some(),
+            conflict("match the photo group before uploading")
+        );
         let destination = target(&jobs, &lib, &batch.target_path)?;
         Ok((batch, file, destination))
     })
@@ -796,9 +1026,9 @@ async fn upload(
     let received_sha256 = format!("{:x}", hash.finalize());
     if size != file.input.size
         || file
-            .input
-            .sha256
+            .received_sha256
             .as_ref()
+            .or(file.input.sha256.as_ref())
             .is_some_and(|expected| expected != &received_sha256)
     {
         return Err(invalid("uploaded size or SHA256 does not match manifest").into());
@@ -839,6 +1069,8 @@ async fn upload(
             Err(e) => return Err(e).context("publish imported original without overwriting"),
         }
         std::fs::File::open(&destination)?.sync_all()?;
+        drop(temporary);
+        item.digest_stamp = Some(DigestStamp::read(&output)?);
         item.received_sha256 = Some(received_sha256);
         item.uploaded = true;
         save(&db, &library, &current)?;
@@ -913,7 +1145,7 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
     let mut ready_assets = HashSet::new();
     let mut media_error: Option<String> = None;
     let paths_json = serde_json::to_string(&paths)?;
-    let indexed_assets = db.prepare("SELECT p.path,p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1")?.query_map(params![library,paths_json],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
+    let indexed_assets = db.prepare("SELECT p.path,p.asset_id FROM json_each(?2) wanted CROSS JOIN catalog_paths p ON p.library_id=?1 AND p.path=wanted.value")?.query_map(params![library,paths_json],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<BTreeMap<_,_>>>()?;
     let indexed = indexed_assets.len();
     let assets: HashSet<_> = indexed_assets.values().collect();
     for asset in &assets {
@@ -1014,7 +1246,7 @@ async fn finish(
         batch.group_jobs.clear();
         save(&retry_state.jobs.db.lock().unwrap(),&retry_library,&batch)?;
         let paths: Vec<_> = batch.files.iter().map(|f|destination.join(&f.file_name).to_string_lossy().into_owned()).collect();
-        retry_state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM catalog_paths p JOIN json_each(?2) wanted ON wanted.value=p.path WHERE p.library_id=?1)",params![retry_library,serde_json::to_string(&paths)?])?;
+        retry_state.store.lock()?.execute("UPDATE media_cache SET status=CASE WHEN status='failed' THEN 'pending' ELSE status END,attempts=CASE WHEN status='failed' THEN 0 ELSE attempts END,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=?1 AND asset_id IN (SELECT p.asset_id FROM json_each(?2) wanted CROSS JOIN catalog_paths p ON p.library_id=?1 AND p.path=wanted.value)",params![retry_library,serde_json::to_string(&paths)?])?;
         Ok(())
     }).await.map_err(anyhow::Error::from)??;
     let (jobs, lib, batch_id) = (state.jobs.clone(), library.clone(), id.clone());
@@ -1116,16 +1348,68 @@ fn publish_checkpoint(
             .iter()
             .any(|saved| saved.input.id == file.input.id && saved.published)
         {
+            let saved = batch
+                .files
+                .iter()
+                .find(|saved| saved.input.id == file.input.id)
+                .unwrap();
             file.published = true;
+            file.digest_stamp = saved.digest_stamp.clone();
         }
     }
     save(&db, library, &latest)?;
     drop(db);
     // Retain the staging inode until the publication checkpoint is durable, so a
     // restart can distinguish our own hard link from an unrelated late collision.
-    for (path, _) in staged.drain(..) {
-        std::fs::remove_file(path).context("remove completed import staging link")?;
+    let mut files = Vec::new();
+    for (path, _) in staged.iter() {
+        let file = latest
+            .files
+            .iter()
+            .find(|file| {
+                staging(FsPath::new(&latest.target_path), &latest.id, &file.input.id) == *path
+            })
+            .context("publication file missing")?;
+        files.push(file);
     }
+    finalize_publications(jobs, library, &latest, &files)?;
+    staged.clear();
+    Ok(())
+}
+
+fn finalize_publications(jobs: &Jobs, library: &str, batch: &Batch, files: &[&File]) -> Result<()> {
+    let mut receipts = Vec::new();
+    for file in files {
+        let destination = FsPath::new(&batch.target_path).join(&file.file_name);
+        let staged = staging(FsPath::new(&batch.target_path), &batch.id, &file.input.id);
+        let unchanged = file.publication_pending
+            && file.digest_stamp.as_ref() == Some(&DigestStamp::read(&destination)?);
+        if staged.try_exists()? {
+            std::fs::remove_file(staged).context("remove completed import staging link")?;
+        }
+        receipts.push((
+            file,
+            destination.clone(),
+            unchanged,
+            DigestStamp::read(&destination)?,
+        ));
+    }
+    let mut db = jobs.db.lock().unwrap();
+    let tx = db.transaction()?;
+    let mut latest = load(&tx, library, &batch.id)?;
+    for (file, destination, unchanged, stamp) in receipts {
+        if unchanged && let Some(hash) = &file.received_sha256 {
+            save_digest(&tx, library, &destination, hash, &stamp)?;
+        }
+        latest
+            .files
+            .iter_mut()
+            .find(|entry| entry.input.id == file.input.id)
+            .context("import file missing")?
+            .publication_pending = false;
+    }
+    save(&tx, library, &latest)?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1231,13 +1515,8 @@ fn finish_batch(
                 return Ok(json!({"status": "publishing"}));
             }
             if current.files[index].published {
-                let item = &current.files[index];
-                let staged = staging(&destination, &current.id, &item.input.id);
-                if staged.try_exists()? {
-                    // After a durable checkpoint, identity metadata may replace
-                    // the destination inode; only our staging link is removed.
-                    std::fs::remove_file(staged)
-                        .context("remove checkpointed import staging link")?;
+                if current.files[index].publication_pending {
+                    finalize_publications(jobs, library, &current, &[&current.files[index]])?;
                 }
                 continue;
             }
@@ -1251,6 +1530,10 @@ fn finish_batch(
                 true,
             )?;
             let output = destination.join(&item.file_name);
+            let verified = match &item.digest_stamp {
+                Some(stamp) => DigestStamp::read(&staged)? == *stamp,
+                None => false,
+            };
             match std::fs::hard_link(&staged, &output) {
                 Ok(()) => (),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1263,6 +1546,11 @@ fn finish_batch(
                     return Err(e).context("publish imported original without overwriting");
                 }
             }
+            current.files[index].digest_stamp = if verified {
+                Some(DigestStamp::read(&output)?)
+            } else {
+                None
+            };
             current.files[index].published = true;
             checkpoint.push((staged, parent));
             if checkpoint.len() == 32 {
@@ -1331,7 +1619,11 @@ pub(crate) fn group_pending_publication(
     for manifest in manifests {
         let batch: Batch =
             serde_json::from_str(&manifest).context("read pending import manifest")?;
-        for file in batch.files.iter().filter(|file| !file.published) {
+        for file in batch
+            .files
+            .iter()
+            .filter(|file| !file.published || file.publication_pending)
+        {
             let path = FsPath::new(&batch.target_path).join(&file.file_name);
             if groups.contains(&(
                 path.parent().context("import parent")?.to_owned(),
@@ -1392,6 +1684,67 @@ mod tests {
     }
 
     #[test]
+    fn digest_receipt_invalidates_same_size_edit_with_preserved_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
+        let path = dir.path().join("image.CR3");
+        std::fs::write(&path, b"original").unwrap();
+        let original_time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let first = file_digest(&jobs, "lib", &path).unwrap();
+        assert_eq!(file_digest(&jobs, "lib", &path).unwrap(), first);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, b"modified").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_time))
+            .unwrap();
+        let second = file_digest(&jobs, "lib", &path).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, crate::media::sha256_file(&path).unwrap());
+    }
+
+    #[test]
+    fn publication_preserves_verified_upload_digest_after_staging_unlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        let mut batch = prepare(
+            &jobs,
+            "lib",
+            structure_input(jobs.root(), &["image.CR3"], false),
+        )
+        .unwrap();
+        let staged = staging(jobs.root(), &batch.id, &batch.files[0].input.id);
+        std::fs::write(&staged, b"original").unwrap();
+        let hash = crate::media::sha256_file(&staged).unwrap();
+        batch.files[0].uploaded = true;
+        batch.files[0].received_sha256 = Some(hash.clone());
+        batch.files[0].digest_stamp = Some(DigestStamp::read(&staged).unwrap());
+        save(&jobs.db.lock().unwrap(), "lib", &batch).unwrap();
+        finish_batch(&jobs, "lib", &batch.id, None).unwrap();
+        let destination = jobs.root().join("image.CR3");
+        assert!(!staged.exists());
+        let stamp: String = jobs
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT stamp FROM import_file_digests WHERE library_id='lib' AND path=?",
+                [destination.to_str().unwrap()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<DigestStamp>(&stamp).unwrap(),
+            DigestStamp::read(&destination).unwrap()
+        );
+        assert_eq!(file_digest(&jobs, "lib", &destination).unwrap(), hash);
+        assert!(!group_pending_publication(&jobs, "lib", &[destination]).unwrap());
+    }
+
+    #[test]
     fn structure_preserves_directories_and_scopes_deduplication_and_reservations() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("photos");
@@ -1407,6 +1760,29 @@ mod tests {
             true,
         );
         let batch = prepare(&jobs, "lib", input.clone()).unwrap();
+        assert!(
+            batch
+                .files
+                .iter()
+                .all(|file| !file.skipped && !file.matched)
+        );
+        match_group(
+            &jobs,
+            "lib",
+            &batch.id,
+            &input.files[0].id,
+            input.files[..2].to_vec(),
+        )
+        .unwrap();
+        match_group(
+            &jobs,
+            "lib",
+            &batch.id,
+            &input.files[2].id,
+            input.files[2..].to_vec(),
+        )
+        .unwrap();
+        let batch = load(&jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
         assert_eq!(
             batch
                 .files
@@ -1759,8 +2135,9 @@ mod tests {
         second.uploaded = true;
         second.received_sha256 = Some("concurrent-upload".into());
         save(&jobs.db.lock().unwrap(), "lib", &latest).unwrap();
-        let staged = jobs.root().join("synthetic-checkpoint");
-        std::fs::write(&staged, b"checkpoint").unwrap();
+        let first = published.files.iter().find(|f| f.published).unwrap();
+        let staged = staging(jobs.root(), &batch.id, &first.input.id);
+        std::fs::hard_link(jobs.root().join(&first.file_name), &staged).unwrap();
         publish_checkpoint(
             &jobs,
             "lib",
@@ -2045,6 +2422,77 @@ mod tests {
         );
     }
     #[test]
+    fn matching_is_incremental_scoped_and_rejects_partial_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("elsewhere.CR3"), b"original").unwrap();
+        std::fs::write(dir.path().join("target/first.CR3"), b"original").unwrap();
+        let mut input = structure_input(
+            &jobs.root().join("target"),
+            &["first.CR3", "first.xmp", "second.CR3"],
+            true,
+        );
+        input.preserve_structure = false;
+        for file in &mut input.files {
+            file.sha256 = None;
+        }
+        let initial = prepare(&jobs, "lib", input.clone()).unwrap();
+        assert!(
+            initial
+                .files
+                .iter()
+                .all(|file| !file.matched && !file.uploaded)
+        );
+        let mut matching = input.files[..2].to_vec();
+        for file in &mut matching {
+            file.sha256 = Some(format!("{:x}", Sha256::digest(b"original")));
+        }
+        assert!(
+            match_group(
+                &jobs,
+                "lib",
+                &initial.id,
+                &matching[0].id,
+                matching[..1].to_vec()
+            )
+            .is_err()
+        );
+        let matched =
+            match_group(&jobs, "lib", &initial.id, &matching[0].id, matching.clone()).unwrap();
+        assert_eq!(matched.files.len(), 2);
+        assert!(matched.files[0].skipped);
+        assert!(!matched.files[1].skipped);
+        let resumed = prepare(&jobs, "lib", input.clone()).unwrap();
+        assert!(!resumed.files[2].matched);
+        matching[0].sha256 = Some("0".repeat(64));
+        assert!(match_group(&jobs, "lib", &initial.id, &input.files[0].id, matching).is_err());
+        // The next photo sees destination changes made after batch creation.
+        std::fs::write(dir.path().join("target/late.CR3"), b"latefile").unwrap();
+        let mut second = input.files[2].clone();
+        second.sha256 = Some(format!("{:x}", Sha256::digest(b"latefile")));
+        let result =
+            match_group(&jobs, "lib", &initial.id, &second.id, vec![second.clone()]).unwrap();
+        assert_eq!(result.files[0].file_name, "late.CR3");
+        assert!(result.files[0].skipped);
+        // Another destination must not use identical files outside that directory.
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        let mut other = structure_input(&jobs.root().join("empty"), &["new.CR3"], true);
+        other.preserve_structure = false;
+        let prepared = prepare(&jobs, "lib", other.clone()).unwrap();
+        let result = match_group(
+            &jobs,
+            "lib",
+            &prepared.id,
+            &other.files[0].id,
+            other.files.clone(),
+        )
+        .unwrap();
+        assert!(!result.files[0].skipped);
+    }
+
+    #[test]
     fn optional_deduplication_keeps_groups_together_and_preserves_sidecars() {
         use sha2::{Digest, Sha256};
         for (enabled, existing_sidecar, include_heif, expected, skipped) in [
@@ -2098,7 +2546,27 @@ mod tests {
                 preserve_structure: false,
                 files,
             };
-            let batch = prepare(&jobs, "lib", input.clone()).unwrap();
+            let mut batch = prepare(&jobs, "lib", input.clone()).unwrap();
+            assert!(batch.files.iter().all(|file| !file.skipped));
+            if enabled {
+                batch = match_group(
+                    &jobs,
+                    "lib",
+                    &batch.id,
+                    &input.files[0].id,
+                    input.files.clone(),
+                )
+                .unwrap();
+                let resumed = match_group(
+                    &jobs,
+                    "lib",
+                    &batch.id,
+                    &input.files[0].id,
+                    input.files.clone(),
+                )
+                .unwrap();
+                assert_eq!(resumed.files[0].file_name, batch.files[0].file_name);
+            }
             assert_eq!(batch.files[0].file_name, expected);
             assert_eq!(
                 batch

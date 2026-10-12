@@ -610,7 +610,6 @@ async fn add_folder(
                     .validate_path(std::path::Path::new(&body.path))
                     .map_err(|e| resource_error(422, format!("{e:#}")))?;
                 let folder = state.jobs.add_folder(&library, &body.path)?;
-                state.jobs.enqueue_scan(&folder.id)?;
                 Ok(serde_json::to_value(folder)?)
             })
             .await?,
@@ -949,7 +948,7 @@ async fn default_version(
                 .set_default_version(&library, &id, &change.content_hash)?;
             state
                 .jobs
-                .enqueue_file_change(&target.0, std::path::Path::new(target.1), 0)?;
+                .enqueue_operation_file(&target.0, std::path::Path::new(target.1), 0)?;
             Ok(result)
         })
         .await?,

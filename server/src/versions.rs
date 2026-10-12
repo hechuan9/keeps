@@ -81,6 +81,15 @@ pub(crate) fn register(
         "SELECT visual_hash,capture_key,width,height,priority,evidence FROM catalog_versions WHERE library_id=? AND asset_id=? AND content_hash=?",
         params![lib,id,hash], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)),
     ).optional()?;
+    let previous_detail = old
+        .as_ref()
+        .map(|o| serde_json::from_str::<Value>(&o.5))
+        .transpose()?;
+    let version_id = previous_detail
+        .as_ref()
+        .and_then(|v| v["versionID"].as_str())
+        .and_then(crate::identity::normalize)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let mut capture = snapshot.clone();
     if let Some(old) = &old {
         let previous: Value = serde_json::from_str(&old.5)?;
@@ -119,9 +128,15 @@ pub(crate) fn register(
     } else {
         priority.max(old.as_ref().map_or(0, |o| o.4))
     };
-    let mut detail = json!({"exactVisualHash":evidence.visual_hash,"edited":evidence.edited,"cameraSerial":evidence.camera_serial,"captureOriginal":evidence.capture_original,"capture":capture});
+    let mut detail = json!({"versionID":version_id,"exactVisualHash":evidence.visual_hash,"edited":evidence.edited,"cameraSerial":evidence.camera_serial,"captureOriginal":evidence.capture_original,"capture":capture});
     if let Some(source) = generated_from {
         detail["generatedFrom"] = source;
+    }
+    if let Some(source) = previous_detail
+        .as_ref()
+        .and_then(|v| v.get("sourceVersionID"))
+    {
+        detail["sourceVersionID"] = source.clone();
     }
     let detail = detail.to_string();
     let changed = old.as_ref()
@@ -304,7 +319,8 @@ impl Store {
             params![lib, path, id, hash, "jpeg_original"],
         )?;
         tx.execute("INSERT INTO catalog_files VALUES(?,?,?,?,?,'keeps-nas','online') ON CONFLICT DO NOTHING", params![lib,id,hash,size,"jpeg_original"])?;
-        tx.execute("INSERT OR IGNORE INTO catalog_versions(library_id,asset_id,content_hash,width,height,priority,evidence) VALUES(?,?,?,?,?,1,?)",params![lib,id,hash,dimensions.0,dimensions.1,json!({"generatedFrom":source_hash,"capture":serde_json::from_str::<Value>(&snapshot)?}).to_string()])?;
+        let source_version: Option<String> = tx.query_row("SELECT json_extract(evidence,'$.versionID') FROM catalog_versions WHERE library_id=? AND asset_id=? AND content_hash=?",params![lib,id,source_hash],|r|r.get(0)).optional()?.flatten();
+        tx.execute("INSERT OR IGNORE INTO catalog_versions(library_id,asset_id,content_hash,width,height,priority,evidence) VALUES(?,?,?,?,?,1,?)",params![lib,id,hash,dimensions.0,dimensions.1,json!({"versionID":uuid::Uuid::new_v4().to_string(),"sourceVersionID":source_version,"generatedFrom":source_hash,"capture":serde_json::from_str::<Value>(&snapshot)?}).to_string()])?;
         register(
             &tx,
             lib,
@@ -394,7 +410,8 @@ impl Store {
             if paths.is_empty() {
                 continue;
             }
-            items.push(json!({"contentHash":hash,"width":width,"height":height,"priority":priority,"evidence":serde_json::from_str::<Value>(&evidence)?,"isNegative":negative.as_deref()==Some(hash.as_str()),"isDefault":default,"userSelected":default&&user,"available":available,"paths":paths}));
+            let evidence: Value = serde_json::from_str(&evidence)?;
+            items.push(json!({"versionID":evidence["versionID"],"sourceVersionID":evidence["sourceVersionID"],"contentHash":hash,"width":width,"height":height,"priority":priority,"evidence":evidence,"isNegative":negative.as_deref()==Some(hash.as_str()),"isDefault":default,"userSelected":default&&user,"available":available,"paths":paths}));
         }
         let deprecated = crate::photo_relations::deprecated_files(&db, lib, id)?;
         Ok(json!({"items":items,"deprecatedFiles":deprecated,"negativeContentHash":negative}))
@@ -474,6 +491,18 @@ mod tests {
         let stage = dir.path().join("stage");
         std::fs::write(&stage, b"generated")?;
         store.publish_generated_standard("lib", &id, "rawhash", &stage, &target, (100, 100))?;
+        let listed = store.versions("lib", &id)?;
+        let items = listed["items"].as_array().unwrap();
+        let source = items
+            .iter()
+            .find(|v| v["contentHash"] == "rawhash")
+            .unwrap();
+        let generated = items
+            .iter()
+            .find(|v| v["contentHash"] != "rawhash")
+            .unwrap();
+        assert_eq!(generated["sourceVersionID"], source["versionID"]);
+        assert_ne!(generated["versionID"], source["versionID"]);
         assert_eq!(
             store.generated_standard_target("lib", &id, &raw, "rawhash")?,
             target
@@ -575,6 +604,10 @@ mod tests {
         let before = store.library_revision("lib")?;
         let before_asset = store.asset("lib", &id)?;
         let before_versions = store.versions("lib", &id)?;
+        assert!(
+            crate::identity::normalize(before_versions["items"][0]["versionID"].as_str().unwrap())
+                .is_some()
+        );
         let mut rescanned = snapshot();
         rescanned["createdAt"] = json!("2026-09-28T00:00:00Z");
         rescanned["updatedAt"] = rescanned["createdAt"].clone();
@@ -604,6 +637,43 @@ mod tests {
             store.versions("lib", &id)?["items"][0]["evidence"]["capture"]["lensModel"],
             "85mm"
         );
+        Ok(())
+    }
+    #[test]
+    fn changed_file_gets_new_version_with_same_photo_identity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let mut snapshot = snapshot();
+        snapshot["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+        let id = store.ingest_original_with_evidence(
+            "lib",
+            "/photos/a.jpg",
+            &file("first", false),
+            &snapshot,
+            &evidence("first"),
+        )?;
+        let first = store.versions("lib", &id)?["items"][0]["versionID"].clone();
+        assert_eq!(
+            store.ingest_original_with_evidence(
+                "lib",
+                "/photos/a.jpg",
+                &file("second", false),
+                &snapshot,
+                &evidence("second")
+            )?,
+            id
+        );
+        let second = store.versions("lib", &id)?["items"][0]["versionID"].clone();
+        assert_ne!(first, second);
+        assert!(crate::identity::normalize(second.as_str().unwrap()).is_some());
+        store.ingest_original_with_evidence(
+            "lib",
+            "/photos/a.jpg",
+            &file("second", false),
+            &snapshot,
+            &evidence("second"),
+        )?;
+        assert_eq!(store.versions("lib", &id)?["items"][0]["versionID"], second);
         Ok(())
     }
     #[test]

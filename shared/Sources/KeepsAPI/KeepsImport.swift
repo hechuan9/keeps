@@ -44,6 +44,7 @@ public struct KeepsImportBatch: Decodable, Sendable {
         public var sha256: String?
         public var uploaded: Bool
         public var skipped: Bool?
+        public var matched: Bool?
     }
 }
 

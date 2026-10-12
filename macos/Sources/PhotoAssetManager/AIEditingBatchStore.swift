@@ -857,6 +857,7 @@ struct AIEditingBatch: Codable {
                 stage(item.id, "保存到 NAS：\(names[target.role] ?? target.role)（\(index + 1)/3）", 0.90 + Double(index) * 0.025, 0.925 + Double(index) * 0.025)
                 try Task.checkCancellation()
                 let file = files[target.role]!
+                try await AIEditingImages.identify(file, rootID: state.rootID ?? item.assetID.uuidString, versionID: item.id)
                 let info = try await AIEditingImages.inspect(file, image: true)
                 try await client.uploadEditImage(target: target, file: file)
                 outputs.append(.init(role: target.role, objectRef: target.objectRef, contentHash: info.hash,

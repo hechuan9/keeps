@@ -123,7 +123,35 @@ type MediaSnapshotRow = (
     Option<String>,
 );
 
+fn current_version(db: &Connection, lib: &str, id: &str) -> Result<Option<String>> {
+    let descriptor: Option<String> = db
+        .query_row(
+            "SELECT standard FROM photo_edits WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let descriptor = descriptor
+        .map(|v| serde_json::from_str::<Value>(&v))
+        .transpose()?;
+    Ok(descriptor
+        .as_ref()
+        .and_then(|v| v["version"].as_str())
+        .and_then(|v| v.strip_prefix("edit:"))
+        .and_then(|v| v.split(':').next())
+        .and_then(crate::identity::normalize))
+}
+
 fn state(db: &Connection, lib: &str, id: &str) -> Result<Value> {
+    let root: String = db
+        .query_row(
+            "SELECT root_id FROM catalog_identity_roots WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or_else(|| id.to_owned());
+    let version = current_version(db, lib, id)?;
     let row:Option<EditStateRow>=db.query_row("SELECT a.negative_hash,a.edit_revision,a.last_edit_request,e.exposure_ev FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id WHERE a.library_id=? AND a.id=?",params![lib,id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).optional()?;
     let (hash, revision, last, ev) = row.ok_or_else(|| error(404, "照片不存在"))?;
     let recipe: Option<String> = db
@@ -154,9 +182,25 @@ fn state(db: &Connection, lib: &str, id: &str) -> Result<Value> {
         }
         Err(e) => return Err(e),
     };
-    Ok(
-        json!({"decisionMetadata":decision,"negativeContentHash":hash,"revision":revision,"lastRequestID":last,"hasEdit":ev.is_some() || recipe.is_some(),"recipe":recipe,"exposureEV":ev,"sourceAvailable":path.is_some(),"sourceFilename":path.as_ref().and_then(|p|p.file_name()).and_then(|v|v.to_str()),"sourceSizeBytes":path.as_ref().map(std::fs::metadata).transpose()?.map(|m|m.len()),"sourceFileHash":hash}),
-    )
+    let mut value = json!({"rootID":root,"currentVersionID":version,"decisionMetadata":decision,"negativeContentHash":hash,"revision":revision,"lastRequestID":last,"hasEdit":ev.is_some() || recipe.is_some(),"recipe":recipe,"exposureEV":ev,"sourceAvailable":path.is_some(),"sourceFilename":path.as_ref().and_then(|p|p.file_name()).and_then(|v|v.to_str()),"sourceSizeBytes":path.as_ref().map(std::fs::metadata).transpose()?.map(|m|m.len()),"sourceFileHash":hash});
+    if let Some(version) = version {
+        let receipt: Option<String> = db.query_row("SELECT response FROM photo_edit_requests WHERE library_id=? AND asset_id=? AND request_id=?", params![lib,id,version], |r| r.get(0)).optional()?;
+        if let Some(receipt) = receipt {
+            let receipt: Value = serde_json::from_str(&receipt)?;
+            for key in [
+                "versionID",
+                "previousVersionID",
+                "sourceContentHash",
+                "sourceVersionID",
+                "createdAt",
+            ] {
+                if let Some(field) = receipt.get(key) {
+                    value[key] = field.clone();
+                }
+            }
+        }
+    }
+    Ok(value)
 }
 impl Store {
     pub fn initialize_negative(&self, lib: &str, id: &str) -> Result<()> {
@@ -420,7 +464,11 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
             params![hash, lib, id],
         )?;
     }
-    if let Some((a, b, c)) = previous {
+    let previous_is_version: bool = match current["currentVersionID"].as_str() {
+        Some(version) => tx.query_row("SELECT EXISTS(SELECT 1 FROM photo_edit_requests WHERE library_id=? AND asset_id=? AND request_id=? AND json_extract(payload,'$.action')='commit')",params![lib,id,version],|r|r.get(0))?,
+        None => false,
+    };
+    if let Some((a, b, c)) = previous.filter(|_| !previous_is_version) {
         for old in [a, b, c] {
             let old: Value = serde_json::from_str(&old)?;
             crate::cache_gc::enqueue(
@@ -437,7 +485,15 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
         "DELETE FROM photo_edit_decisions WHERE library_id=? AND asset_id=?",
         params![lib, id],
     )?;
-    let response = state(&tx, lib, id)?;
+    let mut response = state(&tx, lib, id)?;
+    if action == "commit" {
+        response["versionID"] = json!(request);
+        response["previousVersionID"] = current["currentVersionID"].clone();
+        response["sourceContentHash"] = v["negativeContentHash"].clone();
+        let source_version: Option<String> = tx.query_row("SELECT json_extract(evidence,'$.versionID') FROM catalog_versions WHERE library_id=? AND asset_id=? AND content_hash=?",params![lib,id,v["negativeContentHash"].as_str()],|r|r.get(0)).optional()?.flatten();
+        response["sourceVersionID"] = json!(source_version);
+        response["createdAt"] = json!(chrono::Utc::now().to_rfc3339());
+    }
     tx.execute(
         "INSERT INTO photo_edit_requests VALUES(?,?,?,?,?)",
         params![lib, id, request, payload, response.to_string()],
@@ -487,6 +543,10 @@ async fn decision(
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
         .route(
+            "/libraries/{library}/assets/{asset}/edit/versions",
+            get(get_versions),
+        )
+        .route(
             "/libraries/{library}/assets/{asset}/edit/decisions",
             post(decision).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
@@ -527,6 +587,50 @@ async fn get_edit(
         .to_string();
     run(move || s.store.edit_state(&lib, &id)).await
 }
+fn edit_versions(s: &AppState, lib: &str, id: &str) -> Result<Value> {
+    let rows = {
+        let db = s.store.read()?;
+        state(&db, lib, id)?;
+        db.prepare("SELECT request_id,payload,response FROM photo_edit_requests WHERE library_id=? AND asset_id=? AND json_extract(payload,'$.action')='commit' ORDER BY json_extract(response,'$.revision') DESC")?.query_map(params![lib,id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut items = Vec::new();
+    for (version, payload, response) in rows {
+        let payload: Value = serde_json::from_str(&payload)?;
+        let response: Value = serde_json::from_str(&response)?;
+        let body = &payload["body"];
+        let mut item = json!({"versionID":version,"previousVersionID":response["previousVersionID"],"sourceContentHash":body["negativeContentHash"],"sourceVersionID":response["sourceVersionID"],"createdAt":response["createdAt"],"recipe":body["recipe"],"exposureEV":body["exposureEV"],"available":true});
+        for role in ["standard", "thumbnail", "browse"] {
+            let output = body["outputs"]
+                .as_array()
+                .and_then(|outputs| outputs.iter().find(|v| v["role"] == role));
+            let available = match output {
+                Some(out) => s.previews.contains(&out["objectRef"])?,
+                None => false,
+            };
+            if !available {
+                item["available"] = json!(false);
+            }
+            item[role] = match output {
+                Some(out) => {
+                    json!({"available":available,"downloadURL":if available {Some(s.previews.download_url(&out["objectRef"])?)} else {None},"width":out["width"],"height":out["height"],"version":format!("edit:{version}:{}",out["contentHash"].as_str().unwrap_or(""))})
+                }
+                None => Value::Null,
+            };
+        }
+        items.push(item);
+    }
+    Ok(json!({"items":items}))
+}
+async fn get_versions(
+    State(s): State<Arc<AppState>>,
+    Path((lib, id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let id = uuid::Uuid::parse_str(&id)
+        .map_err(|_| error(422, "invalid asset UUID"))?
+        .to_string();
+    run(move || edit_versions(&s, &lib, &id)).await
+}
+
 async fn negative(
     State(s): State<Arc<AppState>>,
     Path((lib, id)): Path<(String, String)>,
@@ -680,40 +784,6 @@ ALTER TABLE catalog_assets DROP COLUMN negative_hash;
 ALTER TABLE catalog_assets DROP COLUMN edit_revision;
 ALTER TABLE catalog_assets DROP COLUMN negative_selected;
 ALTER TABLE catalog_assets DROP COLUMN last_edit_request;",
-    )?;
-    Ok(())
-}
-
-pub(crate) fn merge(db: &Connection, lib: &str, old: &str, target: &str) -> Result<()> {
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='photo_edits')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        return Ok(());
-    }
-    let edited = |id: &str| -> Result<bool> {
-        Ok(db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM photo_edits WHERE library_id=? AND asset_id=?)",
-            params![lib, id],
-            |r| r.get(0),
-        )?)
-    };
-    if edited(old)? {
-        if edited(target)? {
-            return Err(error(409, "两张照片均有独立调整，不能自动合并"));
-        }
-        db.execute(
-            "UPDATE photo_edits SET asset_id=? WHERE library_id=? AND asset_id=?",
-            params![target, lib, old],
-        )?;
-        db.execute("UPDATE catalog_assets SET (negative_hash,edit_revision,negative_selected,last_edit_request)=(SELECT negative_hash,edit_revision+1,negative_selected,last_edit_request FROM catalog_assets WHERE library_id=?1 AND id=?2) WHERE library_id=?1 AND id=?3",params![lib,old,target])?;
-    }
-    db.execute("INSERT OR IGNORE INTO photo_edit_requests SELECT library_id,?3,request_id,payload,response FROM photo_edit_requests WHERE library_id=?1 AND asset_id=?2",params![lib,old,target])?;
-    db.execute(
-        "DELETE FROM photo_edit_requests WHERE library_id=? AND asset_id=?",
-        params![lib, old],
     )?;
     Ok(())
 }
@@ -1002,6 +1072,68 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn committed_versions_survive_reset_and_gc_and_report_missing_files() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        s.store.initialize_negative("lib", &id)?;
+        let descriptors = edited(&s, &id)?;
+        let version = uuid::Uuid::new_v4().to_string();
+        let mut standard = descriptors[0].clone();
+        standard["version"] = json!(format!("edit:{version}:checksum"));
+        let outputs: Vec<Value> = ["standard","thumbnail","browse"].into_iter().zip(&descriptors).map(|(role,d)| json!({"role":role,"objectRef":d["objectRef"],"contentHash":"checksum","width":64,"height":64})).collect();
+        let payload =
+            json!({"action":"commit","body":{"negativeContentHash":"source","outputs":outputs}});
+        {
+            let db = s.store.lock()?;
+            db.execute(
+                "UPDATE photo_edits SET standard=? WHERE asset_id=?",
+                params![standard.to_string(), id],
+            )?;
+            db.execute(
+                "INSERT INTO photo_edit_requests VALUES('lib',?,?,?,?)",
+                params![
+                    id,
+                    version,
+                    payload.to_string(),
+                    json!({"revision":1,"versionID":version}).to_string()
+                ],
+            )?;
+        }
+        assert_eq!(s.store.edit_state("lib", &id)?["currentVersionID"], version);
+        let listed = edit_versions(&s, "lib", &id)?;
+        assert_eq!(listed["items"][0]["versionID"], version);
+        assert_eq!(listed["items"][0]["available"], true);
+        assert!(
+            listed["items"][0]["standard"]["downloadURL"]
+                .as_str()
+                .is_some()
+        );
+        let reset = json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":0});
+        let result = mutate(&s, "lib", &id, reset.clone(), "reset")?;
+        assert!(result["currentVersionID"].is_null());
+        assert_eq!(mutate(&s, "lib", &id, reset, "reset")?, result);
+        assert_eq!(
+            s.store
+                .collect_cache_garbage(&s.previews, chrono::Utc::now().timestamp() + 3600)?,
+            0
+        );
+        assert_eq!(
+            edit_versions(&s, "lib", &id)?["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            edit_versions(&s, "lib", &id)?["items"][0]["available"],
+            true
+        );
+        std::fs::remove_file(s.previews.object_path(&descriptors[0]["objectRef"])?)?;
+        let missing = edit_versions(&s, "lib", &id)?;
+        assert_eq!(missing["items"][0]["available"], false);
+        assert!(missing["items"][0]["standard"]["downloadURL"].is_null());
+        Ok(())
+    }
     #[tokio::test]
     async fn source_download_rejects_replaced_symlink() -> Result<()> {
         let (_dir, s, id) = setup()?;
@@ -1239,6 +1371,17 @@ mod render_integration {
             serde_json::from_slice(&saved.into_body().collect().await?.to_bytes())?;
         assert_eq!(response["revision"], 1);
         assert_eq!(response["hasEdit"], true);
+        assert_eq!(response["currentVersionID"], request);
+        assert_eq!(response["versionID"], request);
+        assert!(response["previousVersionID"].is_null());
+        assert_eq!(response["sourceContentHash"], hash);
+        assert_eq!(
+            edit_versions(&s, "lib", &id)?["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         if darktable {
             assert_eq!(response["recipe"], input["recipe"]);
         }

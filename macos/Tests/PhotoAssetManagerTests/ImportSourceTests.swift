@@ -28,9 +28,9 @@ struct ImportSourceTests {
             "two/IMG.ARW", "two/IMG.HEIC", "two/IMG.HEIC.xmp",
         ])
         #expect(files.allSatisfy { $0.size == 3 })
-        #expect(files.allSatisfy { $0.sha256 == nil })
-        let hashed = try ImportSource.scan(root, calculateHashes: true)
-        #expect(hashed.allSatisfy { $0.sha256 == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" })
+        let hashed = try ImportSource.hash(root.appendingPathComponent("one/IMG.ARW"))
+        #expect(hashed.0 == 3)
+        #expect(hashed.1 == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         for path in paths {
             #expect(try Data(contentsOf: root.appendingPathComponent(path)) == Data("abc".utf8))
         }
@@ -52,6 +52,15 @@ struct ImportSourceTests {
 
         #expect(try ImportSource.scan(root).map(\.sourcePath) == ["actual/photo.nef"])
         #expect(throws: (any Error).self) { try ImportSource.scan(root.appendingPathComponent("linked")) }
+    }
+
+    @Test func photoGroupsKeepDirectoryScopeAndAllSidecarForms() {
+        let group = ImportSource.groupKey("Trip/IMG.NEF")
+        for path in ["Trip/img.jpg", "Trip/IMG.HEIC", "Trip/img.xmp", "Trip/IMG.NEF.xmp"] {
+            #expect(ImportSource.groupKey(path) == group)
+        }
+        #expect(ImportSource.groupKey("Elsewhere/IMG.NEF") != group)
+        #expect(ImportSource.groupKey("trip/IMG.NEF") != group)
     }
 
     @Test func missingSourceFailsInsteadOfReportingEmptySuccess() {

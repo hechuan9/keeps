@@ -5,6 +5,33 @@ import Testing
 @testable import PhotoAssetManager
 
 struct AIEditingImagesTests {
+    @Test func exportedIdentityPreservesPixelsAndIsIdempotent() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("export.heic")
+        let image = CIImage(color: CIColor(red: 0.2, green: 0.5, blue: 0.7))
+            .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 32))
+        try CIContext().writeHEIFRepresentation(of: image, to: url, format: .RGBA8,
+                                              colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
+        func pixels() throws -> Data {
+            let source = try #require(CGImageSourceCreateWithURL(url as CFURL, nil))
+            let decoded = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+            return try #require(decoded.dataProvider?.data) as Data
+        }
+        let before = try pixels()
+        let photoID = UUID(), versionID = UUID()
+        try await AIEditingImages.identify(url, rootID: photoID.uuidString, versionID: versionID)
+        #expect(try pixels() == before)
+        let source = try #require(CGImageSourceCreateWithURL(url as CFURL, nil))
+        let metadata = try #require(CGImageSourceCopyMetadataAtIndex(source, 0, nil))
+        #expect(CGImageMetadataCopyStringValueWithPath(metadata, nil, "xmpMM:OriginalDocumentID" as CFString) as String? == "xmp.did:" + photoID.uuidString.lowercased())
+        #expect(CGImageMetadataCopyStringValueWithPath(metadata, nil, "xmpMM:DocumentID" as CFString) as String? == "xmp.did:" + versionID.uuidString.lowercased())
+        let stamped = try Data(contentsOf: url)
+        try await AIEditingImages.identify(url, rootID: photoID.uuidString, versionID: versionID)
+        #expect(try Data(contentsOf: url) == stamped)
+    }
+
     @Test func comparisonPreviewAppliesOrientationAndBoundsDecodedPixels() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".jpg")
         defer { try? FileManager.default.removeItem(at: url) }

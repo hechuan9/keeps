@@ -6,7 +6,6 @@ struct ImportSourceFile: Codable, Sendable {
     let sourcePath: String
     let size: Int64
     let modifiedAt: Date
-    let sha256: String?
 }
 
 enum ImportSource {
@@ -16,7 +15,7 @@ enum ImportSource {
         "srf", "srw", "heif", "heic", "hif", "jpg", "jpeg",
     ]
 
-    static func scan(_ root: URL, calculateHashes: Bool = false) throws -> [ImportSourceFile] {
+    static func scan(_ root: URL) throws -> [ImportSourceFile] {
         try Task.checkCancellation()
         let root = root.standardizedFileURL
         let values = try root.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
@@ -24,11 +23,11 @@ enum ImportSource {
             throw ScanError.invalidDirectory(root.path)
         }
         var files: [ImportSourceFile] = []
-        try scanDirectory(root, relativePath: "", calculateHashes: calculateHashes, files: &files)
+        try scanDirectory(root, relativePath: "", files: &files)
         return files.sorted { $0.sourcePath < $1.sourcePath }
     }
 
-    private static func scanDirectory(_ directory: URL, relativePath: String, calculateHashes: Bool, files: inout [ImportSourceFile]) throws {
+    private static func scanDirectory(_ directory: URL, relativePath: String, files: inout [ImportSourceFile]) throws {
         try Task.checkCancellation()
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey, .isHiddenKey]
         let children = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys))
@@ -40,7 +39,7 @@ enum ImportSource {
                   !child.lastPathComponent.hasPrefix("."),
                   !["@eadir", "#recycle"].contains(child.lastPathComponent.lowercased()) else { continue }
             if values.isDirectory == true {
-                try scanDirectory(child, relativePath: relativePath + child.lastPathComponent + "/", calculateHashes: calculateHashes, files: &files)
+                try scanDirectory(child, relativePath: relativePath + child.lastPathComponent + "/", files: &files)
             } else if values.isRegularFile == true {
                 regularFiles.append(child)
             }
@@ -55,13 +54,23 @@ enum ImportSource {
                   let modifiedAt = attributes[.modificationDate] as? Date else {
                 throw ScanError.changedDuringRead(file.path)
             }
-            let digest = calculateHashes ? try hash(file).1 : nil
             files.append(ImportSourceFile(url: file, sourcePath: relativePath + file.lastPathComponent,
-                                          size: size.int64Value, modifiedAt: modifiedAt, sha256: digest))
+                                          size: size.int64Value, modifiedAt: modifiedAt))
         }
     }
 
-    private static func hash(_ url: URL) throws -> (Int64, String) {
+    static func groupKey(_ relativePath: String) -> String {
+        var path = URL(fileURLWithPath: relativePath)
+        if path.pathExtension.lowercased() == "xmp" {
+            path.deletePathExtension()
+            if photoExtensions.contains(path.pathExtension.lowercased()) { path.deletePathExtension() }
+        } else {
+            path.deletePathExtension()
+        }
+        return path.deletingLastPathComponent().path + "/" + path.lastPathComponent.lowercased()
+    }
+
+    static func hash(_ url: URL) throws -> (Int64, String) {
         try Task.checkCancellation()
         let before = try FileManager.default.attributesOfItem(atPath: url.path)
         let handle = try FileHandle(forReadingFrom: url)

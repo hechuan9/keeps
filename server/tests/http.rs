@@ -250,6 +250,10 @@ async fn folders_jobs_are_library_scoped_and_removal_keeps_originals() {
     .await;
     assert!(status.is_success(), "{folder}");
     assert_eq!(folder["libraryID"], "photos");
+    assert!(
+        state.jobs.jobs(100).unwrap().is_empty(),
+        "adding a folder must not scan"
+    );
     let id = folder["id"].as_str().unwrap();
     let (_, folders) = call(app.clone(), "GET", "/libraries/photos/folders", Value::Null).await;
     assert_eq!(folders["folders"][0]["id"], id);
@@ -1799,18 +1803,6 @@ async fn imports_deduplicate_skips_existing_group_and_rechecks_before_finish() {
         let mut manifest = json!({"id":batch,"targetPath":root,"deduplicate":true,"files":[{
             "id":file,"relativePath":"card/IMG.CR3","size":8
         }]});
-        assert_eq!(
-            call(
-                app.clone(),
-                "POST",
-                "/libraries/photos/imports",
-                manifest.clone()
-            )
-            .await
-            .0,
-            StatusCode::UNPROCESSABLE_ENTITY
-        );
-        manifest["files"][0]["sha256"] = json!(format!("{:x}", Sha256::digest(b"original")));
         let (status, prepared) = call(
             app.clone(),
             "POST",
@@ -1818,6 +1810,24 @@ async fn imports_deduplicate_skips_existing_group_and_rechecks_before_finish() {
             manifest.clone(),
         )
         .await;
+        assert_eq!(status, StatusCode::OK, "{prepared}");
+        assert_eq!(prepared["files"][0]["skipped"], false);
+        let match_url = format!("/libraries/photos/imports/{batch}/files/{file}/match");
+        assert_eq!(
+            call(
+                app.clone(),
+                "POST",
+                &match_url,
+                json!({"files":manifest["files"]})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let mut matching = manifest["files"].clone();
+        matching[0]["sha256"] = json!(format!("{:x}", Sha256::digest(b"original")));
+        let (status, prepared) =
+            call(app.clone(), "POST", &match_url, json!({"files":matching})).await;
         assert_eq!(status, StatusCode::OK, "{prepared}");
         assert_eq!(prepared["files"][0]["fileName"], "existing.CR3");
         assert_eq!(prepared["files"][0]["skipped"], true);

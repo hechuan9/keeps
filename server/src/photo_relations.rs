@@ -33,7 +33,6 @@ struct Original {
     asset: String,
     hash: String,
     visual: Option<String>,
-    capture: Option<String>,
 }
 
 pub(crate) fn capture_match(
@@ -69,72 +68,20 @@ pub(crate) fn capture_match(
 fn originals(db: &Connection, lib: &str, directory: &str) -> Result<Vec<Original>> {
     let prefix = format!("{}/", directory.trim_end_matches('/'));
     let end = format!("{}0", directory.trim_end_matches('/'));
-    let mut q = db.prepare("SELECT p.path,p.asset_id,p.content_hash,v.visual_hash,v.capture_key FROM catalog_paths p LEFT JOIN catalog_versions v ON v.library_id=p.library_id AND v.asset_id=p.asset_id AND v.content_hash=p.content_hash LEFT JOIN catalog_defaults d ON d.library_id=p.library_id AND d.asset_id=p.asset_id LEFT JOIN media_cache c ON c.library_id=p.library_id AND c.asset_id=p.asset_id LEFT JOIN catalog_deprecated_files x ON x.library_id=p.library_id AND x.path=p.path WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND instr(substr(p.path,length(?2)+1),'/')=0 AND p.role IN ('raw_original','jpeg_original') ORDER BY coalesce(d.user_selected=1 AND d.content_hash=p.content_hash,0) DESC,(x.path IS NOT NULL),coalesce(v.priority,0) DESC,coalesce(c.status='ready',0) DESC,length(p.path),p.path")?;
+    let mut q = db.prepare("SELECT p.path,p.asset_id,p.content_hash,v.visual_hash FROM catalog_paths p LEFT JOIN catalog_versions v ON v.library_id=p.library_id AND v.asset_id=p.asset_id AND v.content_hash=p.content_hash LEFT JOIN catalog_defaults d ON d.library_id=p.library_id AND d.asset_id=p.asset_id LEFT JOIN media_cache c ON c.library_id=p.library_id AND c.asset_id=p.asset_id LEFT JOIN catalog_deprecated_files x ON x.library_id=p.library_id AND x.path=p.path WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND instr(substr(p.path,length(?2)+1),'/')=0 AND p.role IN ('raw_original','jpeg_original') ORDER BY coalesce(d.user_selected=1 AND d.content_hash=p.content_hash,0) DESC,(x.path IS NOT NULL),coalesce(v.priority,0) DESC,coalesce(c.status='ready',0) DESC,length(p.path),p.path")?;
     Ok(q.query_map(params![lib, prefix, end], |r| {
         Ok(Original {
             path: r.get(0)?,
             asset: r.get(1)?,
             hash: r.get(2)?,
             visual: r.get(3)?,
-            capture: r.get(4)?,
         })
     })?
     .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn canonical(mut id: String, redirects: &BTreeMap<String, String>) -> String {
-    while let Some(next) = redirects.get(&id) {
-        id = next.clone();
-    }
-    id
-}
-
-fn keys(row: &Original) -> Vec<String> {
-    let mut keys = vec![format!("hash:{}", row.hash)];
-    if let Some(visual) = &row.visual {
-        keys.push(format!("visual:{visual}"));
-    }
-    if crate::media::is_photo(Path::new(&row.path))
-        && let Some(capture) = &row.capture
-        && let Some(stem) = Path::new(&row.path).file_stem().and_then(|s| s.to_str())
-    {
-        keys.push(format!("capture:{}", json!([capture, stem])));
-    }
-    keys
-}
-
 pub(crate) fn reconcile_directory(db: &Connection, lib: &str, directory: &str) -> Result<()> {
-    let rows = originals(db, lib, directory)?;
-    let mut seen = BTreeMap::<String, String>::new();
-    let mut redirects = BTreeMap::new();
-    for row in &rows {
-        let mut id = canonical(row.asset.clone(), &redirects);
-        let keys = keys(row);
-        for key in &keys {
-            if let Some(other) = seen.get(key) {
-                let target = canonical(other.clone(), &redirects);
-                if target != id {
-                    db.execute(
-                        "UPDATE catalog_paths SET asset_id=? WHERE library_id=? AND asset_id=?",
-                        params![target, lib, id],
-                    )?;
-                    crate::catalog::merge_unlocated_identity(db, lib, &id, &target)?;
-                    redirects.insert(id, target.clone());
-                    id = target;
-                }
-            }
-        }
-        for key in keys {
-            seen.insert(key, id.clone());
-        }
-    }
-    let mut ids = mark_duplicates(db, lib, directory)?;
-    ids.extend(
-        redirects
-            .values()
-            .map(|id| canonical(id.clone(), &redirects)),
-    );
-    for id in ids {
+    for id in mark_duplicates(db, lib, directory)? {
         crate::versions::choose(db, lib, &id)?;
     }
     Ok(())
@@ -142,16 +89,19 @@ pub(crate) fn reconcile_directory(db: &Connection, lib: &str, directory: &str) -
 
 fn mark_duplicates(db: &Connection, lib: &str, directory: &str) -> Result<BTreeSet<String>> {
     let rows = originals(db, lib, directory)?;
-    let mut hashes = BTreeMap::<String, String>::new();
-    let mut visuals = BTreeMap::<String, String>::new();
+    let mut hashes = BTreeMap::<(String, String), String>::new();
+    let mut visuals = BTreeMap::<(String, String), String>::new();
     let mut desired = BTreeMap::<String, (String, String, String)>::new();
     for row in rows {
-        let duplicate = hashes.get(&row.hash).map(|p| (p, "sha256")).or_else(|| {
-            row.visual
-                .as_ref()
-                .and_then(|v| visuals.get(v))
-                .map(|p| (p, "exact_jpeg_image"))
-        });
+        let duplicate = hashes
+            .get(&(row.asset.clone(), row.hash.clone()))
+            .map(|p| (p, "sha256"))
+            .or_else(|| {
+                row.visual
+                    .as_ref()
+                    .and_then(|v| visuals.get(&(row.asset.clone(), v.clone())))
+                    .map(|p| (p, "exact_jpeg_image"))
+            });
         if let Some((retained, basis)) = duplicate {
             let description = if basis == "sha256" {
                 "文件 SHA-256 相同"
@@ -162,9 +112,9 @@ fn mark_duplicates(db: &Connection, lib: &str, directory: &str) -> Result<BTreeS
                 format!("重复照片：{description}；保留 {retained}。此文件仅标记弃用，未删除。");
             desired.insert(row.path, (retained.clone(), basis.to_owned(), reason));
         } else {
-            hashes.insert(row.hash, row.path.clone());
+            hashes.insert((row.asset.clone(), row.hash), row.path.clone());
             if let Some(visual) = row.visual {
-                visuals.insert(visual, row.path);
+                visuals.insert((row.asset, visual), row.path);
             }
         }
     }
@@ -357,6 +307,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_distinct_roots_are_not_overridden_by_capture_match() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let raw = dir.path().join("photos/a.3FR");
+        let heif = raw.with_extension("HEIC");
+        let raw_root = uuid::Uuid::new_v4().to_string();
+        let heif_root = uuid::Uuid::new_v4().to_string();
+        let mut raw_metadata = snapshot("raw");
+        let mut heif_metadata = snapshot("heif");
+        raw_metadata["originalDocumentID"] = json!(raw_root);
+        heif_metadata["originalDocumentID"] = json!(heif_root);
+        let raw_id = ingest(&store, &raw, "raw", &raw_metadata, None)?;
+        let heif_id = ingest(&store, &heif, "heif", &heif_metadata, None)?;
+        assert_ne!(raw_id, heif_id);
+        assert_eq!(store.root_id("lib", &raw_id)?, raw_root);
+        assert_eq!(store.root_id("lib", &heif_id)?, heif_root);
+        assert_eq!(store.counts("lib", false)?["all"], 2);
+        assert_eq!(
+            ingest(&store, &heif, "heif", &heif_metadata, None)?,
+            heif_id
+        );
+        Ok(())
+    }
+
+    #[test]
     fn missing_retained_file_promotes_existing_copy_without_deleting_it() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
@@ -377,8 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_nine_reconciles_existing_identities_preserving_heif_cache_and_annotations()
-    -> Result<()> {
+    fn schema_nine_preserves_existing_identities_cache_and_annotations() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let database = dir.path().join("db");
         let store = Store::open(&database, true)?;
@@ -407,9 +381,9 @@ mod tests {
         drop(store);
         assert!(Store::open(&database, false).is_err());
         let store = Store::open(&database, true)?;
-        assert_eq!(store.counts("lib", false)?["all"], 1);
-        assert_eq!(store.asset("lib", &heif_id)?["rating"], 5);
-        assert_eq!(store.asset("lib", &heif_id)?["tags"], json!(["keep"]));
+        assert_eq!(store.counts("lib", false)?["all"], 2);
+        assert_eq!(store.asset("lib", &raw_id)?["rating"], 5);
+        assert_eq!(store.asset("lib", &raw_id)?["tags"], json!(["keep"]));
         assert_eq!(
             store
                 .default_version("lib", &heif_id)?
@@ -422,14 +396,14 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            1
         );
         assert!(store.cache_descriptors("lib", &heif_id)?.is_some());
         let db = store.lock()?;
         assert_eq!(
             db.query_row("SELECT count(*) FROM media_cache", [], |r| r
                 .get::<_, i64>(0))?,
-            1
+            2
         );
         assert_eq!(
             db.query_row(
@@ -437,7 +411,7 @@ mod tests {
                 [raw_metadata["originalDocumentID"].as_str().unwrap()],
                 |r| r.get::<_, String>(0)
             )?,
-            heif_id
+            raw_id
         );
         assert_eq!(std::fs::read_to_string(raw)?, "raw");
         assert_eq!(std::fs::read_to_string(heif)?, "heif");
@@ -498,7 +472,7 @@ mod tests {
                 [],
                 |r| r.get::<_, i64>(0)
             )?,
-            1
+            2
         );
         Ok(())
     }

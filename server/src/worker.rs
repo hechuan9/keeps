@@ -32,46 +32,19 @@ pub fn run(
         .context("NAS media runtime unavailable")?;
     crate::tasks::recover(&jobs)?;
     store.recover_cache()?;
-    let mut prefer_manual = false;
     let mut next_maintenance = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         let mut worked = false;
-        if prefer_manual && let Some(job) = jobs.claim_class("manual")? {
+        if let Some(job) = jobs.claim_class("manual")? {
             run_claimed(&store, &jobs, &previews, &job, &stop)?;
-            prefer_manual = false;
-            worked = true;
-        } else if let Some(job) = jobs.claim_automatic_file()? {
-            run_claimed(&store, &jobs, &previews, &job, &stop)?;
-            prefer_manual = true;
-            worked = true;
-        } else if crate::cache_pipeline::process_next(&store, &jobs, &previews, &stop)? {
-            prefer_manual = true;
-            worked = true;
-        } else if let Some(job) = jobs.claim_class("manual")? {
-            run_claimed(&store, &jobs, &previews, &job, &stop)?;
-            prefer_manual = false;
             worked = true;
         }
         if !worked && !stop.load(Ordering::Relaxed) {
             worked = crate::browse_cache::process_next(&store, &previews)?;
         }
-        if !worked
-            && !stop.load(Ordering::Relaxed)
-            && let Some(job) = jobs.claim_class("automatic")?
-        {
-            run_claimed(&store, &jobs, &previews, &job, &stop)?;
-            worked = true;
-        }
-        if !worked && !stop.load(Ordering::Relaxed) {
-            if Instant::now() >= next_maintenance {
-                crate::cache_pipeline::maintain(&store, &jobs, &previews, &stop)?;
-                next_maintenance = Instant::now() + Duration::from_secs(60);
-                continue;
-            }
-            if let Some(job) = jobs.claim_class("reconcile")? {
-                run_claimed(&store, &jobs, &previews, &job, &stop)?;
-                worked = true;
-            }
+        if !worked && !stop.load(Ordering::Relaxed) && Instant::now() >= next_maintenance {
+            crate::cache_pipeline::maintain(&store, &jobs, &previews, &stop)?;
+            next_maintenance = Instant::now() + Duration::from_secs(60);
         }
         maintain_revisions(&store, &jobs)?;
         if !worked {
@@ -332,7 +305,7 @@ fn process_entry(
             progress.failed += 1;
             progress.last_error = Some(trace);
             if job.scope_kind != "file" {
-                let queued = jobs.enqueue_file_change(&job.folder_id, path, 0)?;
+                let queued = jobs.enqueue_operation_file(&job.folder_id, path, 0)?;
                 store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
             }
         }
@@ -416,7 +389,7 @@ fn process_photo(
     // Metadata writers may replace inodes. Keep the whole photo group untouched
     // until import checkpoints make every published link independently recoverable.
     if crate::imports::group_pending_publication(jobs, &job.library_id, &paths)? {
-        let queued = jobs.enqueue_file_change(&job.folder_id, path, 2)?;
+        let queued = jobs.enqueue_operation_file(&job.folder_id, path, 2)?;
         store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
         return Ok(false);
     }
@@ -430,7 +403,7 @@ fn process_photo(
             )?
             .is_some_and(|f| (f.size, f.mtime_ns) == stamp);
         if !unchanged && recently_modified(stamp.1) {
-            let queued = jobs.enqueue_file_change(&job.folder_id, source, 2)?;
+            let queued = jobs.enqueue_operation_file(&job.folder_id, source, 2)?;
             store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
             return Ok(false);
         }
@@ -440,19 +413,7 @@ fn process_photo(
     let result = (|| {
         let mut changed = false;
         for source in &paths {
-            changed |= if job.work_class == "maintenance" {
-                process_file_with_identity(
-                    store,
-                    jobs,
-                    previews,
-                    job,
-                    source,
-                    &uninterrupted,
-                    true,
-                )?
-            } else {
-                process_file(store, jobs, previews, job, source, &uninterrupted)?
-            };
+            changed |= process_file(store, jobs, previews, job, source, &uninterrupted)?;
         }
         let assets = {
             let db = store.lock()?;
@@ -497,18 +458,6 @@ fn process_file(
     path: &Path,
     stop: &AtomicBool,
 ) -> Result<bool> {
-    process_file_with_identity(store, jobs, _previews, job, path, stop, false)
-}
-
-fn process_file_with_identity(
-    store: &Store,
-    jobs: &Jobs,
-    _previews: &PreviewStorage,
-    job: &Job,
-    path: &Path,
-    stop: &AtomicBool,
-    backfill: bool,
-) -> Result<bool> {
     jobs.validate_path(path.parent().context("original has no parent")?)?;
     let text = path.to_str().context("original path must be UTF-8")?;
     let (mut size, mut mtime) = file_stamp(path)?;
@@ -523,8 +472,7 @@ fn process_file_with_identity(
         .map(|p| p.version.clone())
         .unwrap_or_default();
     let force = job.work_class == "manual" && job.refresh_metadata;
-    if !backfill
-        && !force
+    if !force
         && job.scope_kind != "file"
         && let Some(previous) = &previous
         && previous.size == size
@@ -537,8 +485,7 @@ fn process_file_with_identity(
         }
         return Ok(false);
     }
-    if !backfill
-        && !force
+    if !force
         && let Some(previous) = &previous
         && previous.size == size
         && previous.mtime_ns == mtime
@@ -552,14 +499,14 @@ fn process_file_with_identity(
     // Debouncing is normally handled by the event queue; reconciliation can also
     // discover a file during a copy, before the close/write notification arrives.
     if recently_modified(mtime) {
-        let queued = jobs.enqueue_file_change(&job.folder_id, path, 2)?;
+        let queued = jobs.enqueue_operation_file(&job.folder_id, path, 2)?;
         store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
         return Ok(false);
     }
     let mut identity_checked = false;
     let result: Result<bool> = (|| {
         let processor = MediaProcessor::new();
-        hash = media::sha256_file(path)?;
+        hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
         let metadata = processor.extract(path)?;
         if stopped(jobs, job, stop)? {
             return Ok(false);
@@ -605,7 +552,7 @@ fn process_file_with_identity(
             &file,
             &snapshot,
             &evidence,
-            if backfill { None } else { Some(&job.id) },
+            Some(&job.id),
         )?;
         if existing_root.is_some() {
             identity_checked = true;
@@ -617,7 +564,7 @@ fn process_file_with_identity(
             let written = crate::identity::ensure(path, &root)?;
             sidecars = media::sidecar_stamp(path)?;
             if written.changed && written.path == path {
-                hash = media::sha256_file(path)?;
+                hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
                 (size, mtime) = file_stamp(path)?;
                 Ok(Some((hash.clone(), size as u64, mtime.to_string())))
             } else {
@@ -656,54 +603,6 @@ fn process_file_with_identity(
         Ok(false) => {}
     }
     result
-}
-
-pub fn process_identity_batch(
-    store: &Store,
-    jobs: &Jobs,
-    previews: &PreviewStorage,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let _directory_guard = jobs.directory_mutation.read().unwrap();
-    crate::directory_move::ensure_reconciled(jobs)?;
-    for (folder, text) in jobs.pending_identities(1)? {
-        if stop.load(Ordering::Relaxed)
-            || jobs.has_due_class("automatic")?
-            || jobs.has_due_class("manual")?
-        {
-            break;
-        }
-        let path = Path::new(&text);
-        if !path.try_exists()? {
-            jobs.identity_missing(&folder.id, &text)?;
-            continue;
-        }
-        let job = Job {
-            id: "identity-backfill".into(),
-            work_class: "maintenance".into(),
-            scope_kind: "file".into(),
-            folder_id: folder.id.clone(),
-            library_id: folder.library_id,
-            path: folder.path,
-            refresh_metadata: false,
-            path_sync: false,
-            wait_for_quiet: false,
-            status: "running".into(),
-            error: None,
-            processed: 0,
-            skipped: 0,
-            failed: 0,
-            current_path: None,
-            started_at: None,
-            finished_at: None,
-        };
-        if let Err(error) = process_photo(store, jobs, previews, &job, path) {
-            let trace = format!("{error:#}");
-            tracing::error!(path=%text,error=%trace,"photo identity backfill failed");
-            jobs.identity_result(&folder.id, &text, Some(&trace))?;
-        }
-    }
-    Ok(())
 }
 
 fn recently_modified(mtime_ns: i64) -> bool {
@@ -746,12 +645,9 @@ mod tests {
                 .is_none()
         );
         let queued = jobs.jobs(100)?;
-        assert!(
-            queued
-                .iter()
-                .any(|pending| pending.work_class == "automatic"
-                    && pending.path == path.to_str().unwrap())
-        );
+        assert!(queued.iter().any(
+            |pending| pending.work_class == "manual" && pending.path == path.to_str().unwrap()
+        ));
         assert!(!crate::imports::group_pending_publication(
             &jobs,
             "library",

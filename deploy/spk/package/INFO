@@ -1,5 +1,5 @@
 package="KeepsNativeProbe"
-version="0.1.0-0049"
+version="0.1.0-0052"
 displayname="Keeps Native Probe"
 description="Isolated native Keeps feasibility probe. Uses generated samples only."
 arch="geminilake"

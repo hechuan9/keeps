@@ -269,6 +269,8 @@ public struct KeepsAssetVersions: Decodable, Sendable {
 }
 
 public struct KeepsAssetVersion: Decodable, Identifiable, Sendable {
+    public var versionID: String? = nil
+    public var sourceVersionID: String? = nil
     public var contentHash: String
     public var width: Int
     public var height: Int
@@ -278,7 +280,7 @@ public struct KeepsAssetVersion: Decodable, Identifiable, Sendable {
     public var isNegative: Bool? = nil
     public var available: Bool
     public var paths: [Location]
-    public var id: String { contentHash }
+    public var id: String { versionID ?? contentHash }
     public var filename: String { paths.first.map { URL(fileURLWithPath: $0.path).lastPathComponent } ?? contentHash }
     public var kind: String {
         switch priority {

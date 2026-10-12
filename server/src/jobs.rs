@@ -126,6 +126,24 @@ fn job_priority(job: &Job) -> (u8, u8, bool, bool) {
     )
 }
 
+fn same_photo_stem(left: &Path, right: &Path) -> bool {
+    fn stem(path: &Path) -> Option<String> {
+        let without_xmp = path.with_extension("");
+        let path = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
+            && crate::media::is_photo(&without_xmp)
+        {
+            &without_xmp
+        } else {
+            path
+        };
+        path.file_stem()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+    }
+    left.parent() == right.parent() && stem(left) == stem(right)
+}
+
 impl Jobs {
     pub fn root(&self) -> &Path {
         &self.root
@@ -157,6 +175,7 @@ impl Jobs {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
           CREATE TABLE IF NOT EXISTS worker_activity(id INTEGER PRIMARY KEY CHECK(id=1),library_id TEXT NOT NULL,work_class TEXT NOT NULL,current_photo TEXT,last_error TEXT,active INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
+          CREATE TABLE IF NOT EXISTS import_file_digests(library_id TEXT NOT NULL,path TEXT NOT NULL,sha256 TEXT NOT NULL,stamp TEXT NOT NULL,PRIMARY KEY(library_id,path));
           CREATE TABLE IF NOT EXISTS imports(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,manifest TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,UNIQUE(library_id,path));
           CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,folder_id TEXT NOT NULL REFERENCES folders(id),status TEXT NOT NULL,error TEXT,processed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,current_path TEXT,started_at INTEGER,finished_at INTEGER,created_at INTEGER NOT NULL DEFAULT(unixepoch()),updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
@@ -293,16 +312,17 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         tx.commit()?;
         Ok(found)
     }
-    pub fn cancel_automatic_full_scans(&self) -> Result<usize> {
-        // Retire queued reconciliation from deployments that scanned on startup.
+    pub fn cancel_automatic_scans(&self) -> Result<usize> {
+        // Retire filesystem-triggered work from deployments before manual-only scanning.
         Ok(self.db.lock().unwrap().execute(
-            "UPDATE jobs SET status='cancelled',rerun=0,finished_at=unixepoch(),updated_at=unixepoch() WHERE status IN ('pending','running') AND work_class<>'manual' AND scope_kind='recursive' AND scope_path=?1",
-            [self.root.to_str().context("originals root must be UTF-8")?],
+            "UPDATE jobs SET status='cancelled',rerun=0,finished_at=unixepoch(),updated_at=unixepoch() WHERE status IN ('pending','running','failed') AND work_class<>'manual'",
+            [],
         )?)
     }
     pub fn enqueue_scan(&self, folder_id: &str) -> Result<Job> {
         self.enqueue_scan_with_quiet(folder_id, false)
     }
+    #[cfg(test)]
     pub fn enqueue_external_scan(&self, folder_id: &str) -> Result<Job> {
         self.enqueue_scan_with_quiet(folder_id, true)
     }
@@ -328,6 +348,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         )
     }
     /// A running scan receives another pass instead of swallowing a concurrent event.
+    #[cfg(test)]
     pub fn enqueue_change(
         &self,
         folder_id: &str,
@@ -357,6 +378,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "manual",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_external_reconcile_scope(&self, folder_id: &str, path: &Path) -> Result<Job> {
         let tracked: String = self.db.lock().unwrap().query_row(
             "SELECT path FROM folders WHERE id=?1",
@@ -370,6 +392,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         };
         self.enqueue_scope(folder_id, path, 0, false, true, true, "recursive", class)
     }
+    #[cfg(test)]
     pub fn enqueue_path_change(
         &self,
         folder_id: &str,
@@ -387,6 +410,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "automatic",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_file_change(&self, folder_id: &str, path: &Path, delay: i64) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
@@ -398,6 +422,9 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "file",
             "automatic",
         )
+    }
+    pub fn enqueue_operation_file(&self, folder_id: &str, path: &Path, delay: i64) -> Result<Job> {
+        self.enqueue_scope(folder_id, path, delay, false, true, true, "file", "manual")
     }
     pub fn enqueue_manual_file(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(folder_id, path, 0, true, false, true, "file", "manual")
@@ -420,8 +447,8 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let scope = path.to_str().context("scan scope must be UTF-8")?;
         let id = Uuid::new_v4().to_string();
         let inserted = tx.execute(
-            "INSERT INTO jobs(id,folder_id,scope_path,scope_kind,status,available_at,wait_for_quiet,path_sync)
-             SELECT ?1,?2,?3,'file','pending',0,1,1 WHERE NOT EXISTS(
+            "INSERT INTO jobs(id,folder_id,scope_path,scope_kind,status,available_at,wait_for_quiet,path_sync,work_class)
+             SELECT ?1,?2,?3,'file','pending',0,1,1,'manual' WHERE NOT EXISTS(
              SELECT 1 FROM jobs WHERE folder_id=?2 AND scope_path=?3 AND scope_kind='file' AND status IN ('pending','running','failed'))",
             params![id,folder_id,scope],
         )?;
@@ -457,6 +484,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "manual",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_directory_change(
         &self,
         folder_id: &str,
@@ -474,6 +502,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             "automatic",
         )
     }
+    #[cfg(test)]
     pub fn enqueue_removed_directory(
         &self,
         folder_id: &str,
@@ -677,23 +706,89 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     }
     pub fn directory_scan_pending(&self, library: &str, source: &Path) -> Result<bool> {
         let parent = source.parent().context("cache source has no parent")?;
-        let db = self.db.lock().unwrap();
-        let mut query = db.prepare("SELECT COALESCE(j.scope_path,f.path),j.scope_kind FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=? AND f.active=1 AND j.work_class='automatic' AND j.status IN ('pending','running')")?;
-        let scopes = query.query_map([library], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for scope in scopes {
-            let (path, kind) = scope?;
+        let scopes = {
+            let db = self.db.lock().unwrap();
+            let mut query = db.prepare("SELECT COALESCE(j.scope_path,f.path),j.scope_kind,j.folder_id FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.library_id=? AND f.active=1 AND j.work_class='automatic' AND j.status IN ('pending','running')")?;
+            query
+                .query_map([library], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (path, kind, folder) in scopes {
             let path = Path::new(&path);
-            if match kind.as_str() {
-                "file" => path.parent() == Some(parent),
-                "recursive" => parent.starts_with(path),
-                _ => parent == path,
-            } {
+            if kind == "file" {
+                if same_photo_stem(path, source) {
+                    return Ok(true);
+                }
+                continue;
+            }
+            let covers = if kind == "recursive" {
+                parent.starts_with(path)
+            } else {
+                parent == path
+            };
+            if covers && !self.photo_index_current(&folder, source)? {
                 return Ok(true);
             }
         }
         Ok(false)
+    }
+    fn photo_index_current(&self, folder: &str, source: &Path) -> Result<bool> {
+        let parent = source.parent().context("cache source has no parent")?;
+        let mut paths = vec![source.to_path_buf()];
+        let entries = match std::fs::read_dir(parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read photo directory {}", parent.display()));
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if crate::media::is_photo(&path) && same_photo_stem(&path, source) {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            let info = match std::fs::symlink_metadata(&path) {
+                Ok(info) => info,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => {
+                    return Err(error).with_context(|| format!("stat {}", path.display()));
+                }
+            };
+            if !info.file_type().is_file() {
+                return Ok(false);
+            }
+            let Some(state) =
+                self.file_state(folder, path.to_str().context("photo path must be UTF-8")?)?
+            else {
+                return Ok(false);
+            };
+            if state.error.is_some()
+                || state.asset_id.is_empty()
+                || u64::try_from(state.size).ok() != Some(info.len())
+                || u128::try_from(state.mtime_ns).ok()
+                    != Some(
+                        info.modified()?
+                            .duration_since(std::time::UNIX_EPOCH)?
+                            .as_nanos(),
+                    )
+                || state.metadata_stamp != crate::media::sidecar_stamp(&path)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
     pub fn path_sync_pending(&self, library: &str, path: &Path) -> Result<bool> {
         let text = path.to_str().context("asset path must be UTF-8")?;
@@ -718,6 +813,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     pub fn claim_next(&self) -> Result<Option<Job>> {
         self.claim(None, false)
     }
+    #[cfg(test)]
     pub fn claim_automatic_file(&self) -> Result<Option<Job>> {
         self.claim(Some("automatic"), true)
     }
@@ -842,7 +938,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
 mod tests {
     use super::*;
     #[test]
-    fn manual_only_full_scans_cancel_legacy_work_and_preserve_incremental_jobs() {
+    fn manual_only_scans_cancel_all_legacy_work_and_preserve_explicit_operations() {
         let (dir, jobs, folder) = setup();
         std::fs::create_dir(jobs.root().join("child")).unwrap();
         let legacy = jobs.enqueue_external_scan(&folder.id).unwrap();
@@ -853,15 +949,26 @@ mod tests {
         let file = jobs
             .enqueue_file_change(&folder.id, &jobs.root().join("new.jpg"), 0)
             .unwrap();
-        assert_eq!(jobs.cancel_automatic_full_scans().unwrap(), 1);
+        let operation = jobs
+            .enqueue_operation_file(&folder.id, &jobs.root().join("import.jpg"), 0)
+            .unwrap();
+        jobs.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET status='failed' WHERE id=?", [&file.id])
+            .unwrap();
+        assert_eq!(jobs.cancel_automatic_scans().unwrap(), 3);
         assert_eq!(jobs.job(&legacy.id).unwrap().unwrap().status, "cancelled");
-        for id in [&manual.id, &child.id, &file.id] {
+        for id in [&child.id, &file.id] {
+            assert_eq!(jobs.job(id).unwrap().unwrap().status, "cancelled");
+        }
+        for id in [&manual.id, &operation.id] {
             assert_eq!(jobs.job(id).unwrap().unwrap().status, "pending");
         }
         let root = jobs.root().to_path_buf();
         drop(jobs);
         let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
-        assert_eq!(jobs.cancel_automatic_full_scans().unwrap(), 0);
+        assert_eq!(jobs.cancel_automatic_scans().unwrap(), 0);
         assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "pending");
     }
 
@@ -1164,7 +1271,7 @@ mod tests {
         );
     }
     #[test]
-    fn cache_scan_gate_covers_siblings_and_recursive_ancestors_only() {
+    fn cache_scan_gate_covers_same_photo_but_not_other_photos() {
         let (_dir, jobs, folder) = setup();
         let child = jobs.root().join("child");
         std::fs::create_dir(&child).unwrap();
@@ -1186,7 +1293,8 @@ mod tests {
         );
         jobs.claim_next().unwrap().unwrap();
         assert!(
-            jobs.directory_scan_pending("library", &jobs.root().join("b.heic"))
+            !jobs
+                .directory_scan_pending("library", &jobs.root().join("b.heic"))
                 .unwrap()
         );
         jobs.enqueue_scan(&folder.id).unwrap();
@@ -1195,6 +1303,53 @@ mod tests {
                 .directory_scan_pending("library", &child.join("a.heic"))
                 .unwrap()
         );
+    }
+    #[test]
+    fn directory_scan_allows_indexed_photo_while_other_photos_wait() -> Result<()> {
+        let (_dir, jobs, folder) = setup();
+        let photo = jobs.root().join("a.3fr");
+        std::fs::write(&photo, b"raw")?;
+        std::fs::write(jobs.root().join("b.3fr"), b"pending other photo")?;
+        let record = |path: &Path| -> Result<()> {
+            let info = std::fs::metadata(path)?;
+            let text = path.to_str().unwrap();
+            jobs.record_file(
+                &folder.id,
+                text,
+                info.len() as i64,
+                info.modified()?
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos() as i64,
+                "asset",
+                "hash",
+                None,
+            )?;
+            jobs.record_metadata_stamp(&folder.id, text, &crate::media::sidecar_stamp(path)?)
+        };
+        record(&photo)?;
+        jobs.enqueue_directory_change(&folder.id, jobs.root(), 0)?;
+        assert!(!jobs.directory_scan_pending("library", &photo)?);
+        assert!(jobs.directory_scan_pending("library", &jobs.root().join("b.3fr"))?);
+        let sibling = jobs.root().join("A.heic");
+        std::fs::write(&sibling, b"new version")?;
+        assert!(jobs.directory_scan_pending("library", &photo)?);
+        record(&sibling)?;
+        assert!(!jobs.directory_scan_pending("library", &photo)?);
+        std::fs::write(photo.with_extension("xmp"), b"updated rating")?;
+        assert!(jobs.directory_scan_pending("library", &photo)?);
+        record(&photo)?;
+        record(&sibling)?;
+        assert!(!jobs.directory_scan_pending("library", &photo)?);
+        std::fs::write(&photo, b"changed raw bytes")?;
+        assert!(jobs.directory_scan_pending("library", &photo)?);
+        Ok(())
+    }
+    #[test]
+    fn scan_gate_matches_both_sidecar_names_without_blocking_other_photos() {
+        let source = Path::new("/photos/a.b.3fr");
+        assert!(same_photo_stem(Path::new("/photos/a.b.xmp"), source));
+        assert!(same_photo_stem(Path::new("/photos/a.b.3fr.XMP"), source));
+        assert!(!same_photo_stem(Path::new("/photos/b.xmp"), source));
     }
     #[test]
     fn shallow_scope_never_absorbs_recursive_child_and_file_does_not_block_descendants() {

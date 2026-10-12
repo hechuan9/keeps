@@ -35,9 +35,36 @@ import Testing
         #expect(fixture.store.skippedFiles == 1)
         #expect(fixture.store.completedFiles == 2)
         let snapshot = fixture.state.snapshot()
-        #expect(snapshot.events == ["prepare", "upload:nested/b.heic", "finish"])
+        #expect(snapshot.events == ["prepare", "match:a.nef", "match:nested/b.heic", "upload:nested/b.heic", "finish"])
         #expect(snapshot.manifests.first?.deduplicate == true)
-        #expect(snapshot.manifests.first?.files.allSatisfy { $0.sha256 == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" } == true)
+        #expect(snapshot.manifests.first?.files.allSatisfy { $0.sha256 == nil } == true)
+    }
+
+    @Test func matchesCompletePhotoGroupBeforeUploadThenMovesToNextPhoto() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        for name in ["a.jpg", "a.nef.xmp", "a.xmp"] {
+            try Data("abc".utf8).write(to: fixture.root.appendingPathComponent(name))
+        }
+        fixture.store.deduplicate = true
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.state.snapshot().events == ["prepare", "match:a.jpg,a.nef,a.nef.xmp,a.xmp", "upload:a.jpg", "upload:a.nef", "upload:a.nef.xmp", "upload:a.xmp", "match:nested/b.heic", "upload:nested/b.heic", "finish"])
+        #expect(fixture.store.sentBytes == 15)
+    }
+
+    @Test func matchedGroupsResumeWithoutMatchingAgain() async throws {
+        let fixture = try makeFixture(failUpload: true)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.deduplicate = true
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage != nil)
+        fixture.store.start(targetPath: "incoming")
+        try await waitForCompletion(fixture.store)
+        #expect(fixture.store.errorMessage == nil)
+        #expect(fixture.state.snapshot().events.filter { $0.hasPrefix("match:") } == ["match:a.nef", "match:nested/b.heic"])
     }
 
     @Test func uploadFailureResumesSameManifestAndSkipsCompletedFile() async throws {
@@ -215,6 +242,56 @@ import Testing
         #expect(!fixture.state.snapshot().events.contains("finish"))
     }
 
+    @Test func twoMediaTasksRunTogetherWhileProgressPollsAndBothRestore() async throws {
+        let persistence = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: persistence) }
+        let fixture = try makeFixture(gatedPipeline: true, parallelMedia: true, persistenceDirectory: persistence)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForEvent("source:media-1:1", state: fixture.state)
+        try await waitForEvent("source:media-2:1", state: fixture.state)
+        try await waitForEvent("progress:2", state: fixture.state)
+        let deadline = ContinuousClock.now + .seconds(5)
+        while fixture.store.indexedFiles < 2, ContinuousClock.now < deadline { await Task.yield() }
+        #expect(fixture.store.indexedFiles >= 2)
+        #expect(!fixture.state.snapshot().events.contains("claim:media-3"))
+        fixture.store.pause()
+        try await waitForCompletion(fixture.store)
+        let checkpoint = try #require(FileManager.default.contentsOfDirectory(at: persistence, includingPropertiesForKeys: nil).first)
+        let saved = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint)) as? [String: Any])
+        #expect((saved["mediaTasks"] as? [[String: Any]])?.count == 2)
+        let restored = ImportStore(client: fixture.store.client, persistenceDirectory: persistence)
+        restored.start(targetPath: "incoming")
+        try await waitForEvent("source:media-1:2", state: fixture.state)
+        try await waitForEvent("source:media-2:2", state: fixture.state)
+        restored.pause()
+        try await waitForCompletion(restored)
+        #expect(fixture.state.snapshot().events.filter { $0.hasPrefix("claim:media-") }.count == 2)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:source:media-1" }.count == 2)
+        #expect(fixture.state.snapshot().events.filter { $0 == "cancel:source:media-2" }.count == 2)
+    }
+
+    @Test func legacySingleMediaCheckpointResumesWithoutReclaimingTask() async throws {
+        let persistence = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: persistence) }
+        let fixture = try makeFixture(gatedPipeline: true, persistenceDirectory: persistence)
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        fixture.store.start(targetPath: "incoming")
+        try await waitForEvent("source:1", state: fixture.state)
+        fixture.store.pause()
+        try await waitForCompletion(fixture.store)
+        let checkpoint = try #require(FileManager.default.contentsOfDirectory(at: persistence, includingPropertiesForKeys: nil).first)
+        var saved = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: checkpoint)) as? [String: Any])
+        saved["mediaTask"] = (saved.removeValue(forKey: "mediaTasks") as? [[String: Any]])?.first
+        try JSONSerialization.data(withJSONObject: saved).write(to: checkpoint)
+        let restored = ImportStore(client: fixture.store.client, persistenceDirectory: persistence)
+        restored.start(targetPath: "incoming")
+        try await waitForEvent("source:2", state: fixture.state)
+        restored.pause()
+        try await waitForCompletion(restored)
+        #expect(fixture.state.snapshot().events.filter { $0 == "claim:first" }.count == 1)
+    }
+
     private func waitForEvent(_ event: String, state: ImportScenario) async throws {
         let deadline = ContinuousClock.now + .seconds(5)
         while ContinuousClock.now < deadline {
@@ -224,18 +301,18 @@ import Testing
         throw NSError(domain: "ImportStoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "未收到 HTTP 闸门事件：" + event])
     }
 
-    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false, gatedPipeline: Bool = false) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
+    private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false, gatedPipeline: Bool = false, parallelMedia: Bool = false, persistenceDirectory: URL? = nil) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root.appendingPathComponent("nested"), withIntermediateDirectories: true)
         try Data("abc".utf8).write(to: root.appendingPathComponent("a.nef"))
         try Data("abc".utf8).write(to: root.appendingPathComponent("nested/b.heic"))
         let host = UUID().uuidString.lowercased() + ".invalid"
-        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst, publishing: publishing, failPrepare: failPrepare, failPublication: failPublication, acceptFailedUpload: acceptFailedUpload, gatedPipeline: gatedPipeline)
+        let state = ImportScenario(failUpload: failUpload, failFinish: failFinish, skipFirst: skipFirst, publishing: publishing, failPrepare: failPrepare, failPublication: failPublication, acceptFailedUpload: acceptFailedUpload, gatedPipeline: gatedPipeline, parallelMedia: parallelMedia)
         ImportProtocol.scenarios.register(state, host: host)
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ImportProtocol.self]
         let client = KeepsClient(configuration: KeepsConfiguration(baseURL: URL(string: "https://\(host)")!, libraryID: "test"), session: URLSession(configuration: configuration))
-        let store = ImportStore(client: client)
+        let store = ImportStore(client: client, persistenceDirectory: persistenceDirectory)
         store.selectSource(root)
         return (root, store, state)
     }
@@ -259,14 +336,19 @@ private final class ImportScenario: @unchecked Sendable {
     private let skipFirst: Bool
     private let publishing: Bool
     private let gatedPipeline: Bool
+    private let parallelMedia: Bool
+    private var claimedMedia = 0
+    private var progressPolls = 0
     private var pending: [String: ImportProtocol] = [:]
     private var sourceRequests = 0
     private var claimed = false
     private var manifests: [KeepsImportManifest] = []
     private var uploaded: Set<UUID> = []
+    private var matched: Set<UUID> = []
     private var events: [String] = []
 
-    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool, publishing: Bool, failPrepare: Bool, failPublication: Bool, acceptFailedUpload: Bool, gatedPipeline: Bool) {
+    init(failUpload: Bool, failFinish: Bool, skipFirst: Bool, publishing: Bool, failPrepare: Bool, failPublication: Bool, acceptFailedUpload: Bool, gatedPipeline: Bool, parallelMedia: Bool) {
+        self.parallelMedia = parallelMedia
         self.gatedPipeline = gatedPipeline
         self.acceptFailedUpload = acceptFailedUpload
         self.failPrepare = failPrepare
@@ -292,6 +374,14 @@ private final class ImportScenario: @unchecked Sendable {
             events.append(event)
             events.append("held:upload:\(events.filter { $0 == event }.count)")
             pending["upload"] = protocolInstance
+            return true
+        }
+        if parallelMedia, path.hasSuffix("/source") {
+            let id = request.url!.deletingLastPathComponent().lastPathComponent
+            let event = "source:" + id
+            events.append(event)
+            events.append(event + ":\(events.filter { $0 == event }.count)")
+            pending[event] = protocolInstance
             return true
         }
         if path.hasSuffix("/tasks/first/source") {
@@ -335,12 +425,28 @@ private final class ImportScenario: @unchecked Sendable {
                 "files": manifest.files.map { file in
                     ["id": file.id.uuidString, "relativePath": file.relativePath,
                      "fileName": URL(fileURLWithPath: file.relativePath).lastPathComponent,
-                     "size": file.size, "uploaded": uploaded.contains(file.id) || (skipFirst && file.relativePath == "a.nef"),
-                     "skipped": skipFirst && file.relativePath == "a.nef"] as [String: Any]
+                     "size": file.size, "uploaded": uploaded.contains(file.id) || (matched.contains(file.id) && skipFirst && file.relativePath == "a.nef"),
+                     "skipped": matched.contains(file.id) && skipFirst && file.relativePath == "a.nef", "matched": matched.contains(file.id)] as [String: Any]
                 },
             ])
         }
         guard let manifest = manifests.last else { throw URLError(.badServerResponse) }
+        if path.hasSuffix("/match"), request.httpMethod == "POST" {
+            struct MatchRequest: Decodable { let files: [KeepsImportFile] }
+            let files = try JSONDecoder().decode(MatchRequest.self, from: requestBody(request)).files
+            #expect(files.allSatisfy { $0.sha256 == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" })
+            events.append("match:" + files.map(\.relativePath).joined(separator: ","))
+            matched.formUnion(files.map(\.id))
+            return try JSONSerialization.data(withJSONObject: [
+                "id": manifest.id.uuidString, "targetPath": manifest.targetPath, "finished": false,
+                "files": files.map { file in
+                    ["id": file.id.uuidString, "relativePath": file.relativePath,
+                     "fileName": URL(fileURLWithPath: file.relativePath).lastPathComponent,
+                     "size": file.size, "uploaded": uploaded.contains(file.id) || (skipFirst && file.relativePath == "a.nef"),
+                     "skipped": skipFirst && file.relativePath == "a.nef", "matched": true] as [String: Any]
+                },
+            ])
+        }
         if request.httpMethod == "PUT", let file = manifest.files.first(where: { path.hasSuffix($0.id.uuidString) }) {
             events.append("upload:" + file.relativePath)
             if failUpload && file.relativePath == "nested/b.heic" {
@@ -352,7 +458,13 @@ private final class ImportScenario: @unchecked Sendable {
             return Data("{}".utf8)
         }
         if path.hasSuffix("/worker/claim") {
-            if gatedPipeline, !uploaded.isEmpty, !claimed {
+            if parallelMedia, !uploaded.isEmpty, claimedMedia < 3 {
+                claimedMedia += 1
+                let id = "media-\(claimedMedia)"
+                events.append("claim:" + id)
+                return Data("{\"task\":{\"taskID\":\"\(id)\",\"inputHash\":\"unused\",\"filename\":\"a.nef\",\"generateStandard\":false,\"thumbnailEdge\":512,\"thumbnailQuality\":85}}".utf8)
+            }
+            if gatedPipeline, !parallelMedia, !uploaded.isEmpty, !claimed {
                 claimed = true
                 events.append("claim:first")
                 return Data("{\"task\":{\"taskID\":\"first\",\"inputHash\":\"unused\",\"filename\":\"a.nef\",\"generateStandard\":false,\"generateBrowse\":true,\"thumbnailEdge\":512,\"thumbnailQuality\":85}}".utf8)
@@ -360,7 +472,11 @@ private final class ImportScenario: @unchecked Sendable {
             return Data("{\"task\":null}".utf8)
         }
         if path.hasSuffix("/finish"), request.httpMethod == "GET", !events.contains("finish") {
-            return Data("{\"id\":\"\(manifest.id)\",\"status\":\"uploading\",\"completedFiles\":\(uploaded.count),\"totalFiles\":2,\"indexedFiles\":\(uploaded.count),\"indexTotal\":2,\"thumbnailTotal\":2,\"thumbnailCompleted\":0}".utf8)
+            if parallelMedia {
+                progressPolls += 1
+                events.append("progress:\(progressPolls)")
+            }
+            return Data("{\"id\":\"\(manifest.id)\",\"status\":\"uploading\",\"completedFiles\":\(uploaded.count),\"totalFiles\":2,\"indexedFiles\":\(parallelMedia ? progressPolls : uploaded.count),\"indexTotal\":2,\"thumbnailTotal\":2,\"thumbnailCompleted\":0}".utf8)
         }
         if path.hasSuffix("/finish") {
             events.append(request.httpMethod == "GET" ? "status" : "finish")
