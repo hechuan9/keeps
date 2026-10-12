@@ -65,7 +65,7 @@ pub(crate) fn capture_match(
     Ok(None)
 }
 
-/// A collision suffix may separate a newly imported RAW from its camera HEIF.
+/// RAW and camera HEIF may live in different directories or have collision suffixes.
 /// Require the camera's original timestamp because displayed capture times can
 /// differ after timezone interpretation, and a filename alone is not identity.
 pub(crate) fn raw_heif_match(
@@ -84,18 +84,13 @@ pub(crate) fn raw_heif_match(
     if !raw && !heif || evidence.capture_original.is_empty() {
         return Ok(None);
     }
-    let Some(directory) = path.parent().and_then(Path::to_str) else {
-        return Ok(None);
-    };
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return Ok(None);
     };
     let stem = collision_stem(stem);
-    let prefix = format!("{}/", directory.trim_end_matches('/'));
-    let end = format!("{}0", directory.trim_end_matches('/'));
     let mut matches = BTreeSet::new();
-    let mut q = db.prepare("SELECT p.path,p.asset_id,v.evidence FROM catalog_paths p JOIN catalog_versions v ON v.library_id=p.library_id AND v.asset_id=p.asset_id AND v.content_hash=p.content_hash WHERE p.library_id=? AND p.path>=? AND p.path<? AND p.role IN ('raw_original','jpeg_original')")?;
-    for row in q.query_map(params![lib, prefix, end], |r| {
+    let mut q = db.prepare("SELECT p.path,p.asset_id,v.evidence FROM catalog_versions v INDEXED BY version_capture_original JOIN catalog_paths p ON p.library_id=v.library_id AND p.asset_id=v.asset_id AND p.content_hash=v.content_hash WHERE v.library_id=? AND json_extract(v.evidence,'$.captureOriginal')=? AND p.role IN ('raw_original','jpeg_original')")?;
+    for row in q.query_map(params![lib, evidence.capture_original], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -112,7 +107,7 @@ pub(crate) fn raw_heif_match(
         } else {
             other_ext.eq_ignore_ascii_case("3fr")
         };
-        if !opposite || other.parent() != path.parent() {
+        if !opposite {
             continue;
         }
         let other_stem = other.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -362,6 +357,64 @@ mod tests {
     }
 
     #[test]
+    fn raw_heif_pair_across_directories_shares_identity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let raw = dir.path().join("Mexico/B0003498.3FR");
+        let heif = dir.path().join("Vail/B0003498.HEIC");
+        let evidence = VersionEvidence {
+            capture_original: "2025:11:28 12:03:27-06:00".into(),
+            width: 100,
+            height: 100,
+            ..Default::default()
+        };
+        let mut ids = Vec::new();
+        for (path, hash) in [(&heif, "heif"), (&raw, "raw")] {
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            std::fs::write(path, hash)?;
+            let mut metadata = snapshot(hash);
+            metadata["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+            ids.push(store.ingest_original_with_evidence(
+                "lib", path.to_str().unwrap(),
+                &json!({"contentHash":hash,"sizeBytes":hash.len(),"role":if crate::media::is_raw(path) {"raw_original"} else {"jpeg_original"}}),
+                &metadata, &evidence,
+            )?);
+        }
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(
+            store.versions("lib", &ids[0])?["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        for directory in ["Mexico", "Vail"] {
+            let query = crate::catalog::AssetQuery {
+                directory: Some(dir.path().join(directory).to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            assert_eq!(store.query_assets("lib", &query)?["total"], 1);
+        }
+        let unrelated = dir.path().join("Other/B0003498.HEIC");
+        std::fs::create_dir_all(unrelated.parent().unwrap())?;
+        std::fs::write(&unrelated, "different")?;
+        let mut metadata = snapshot("different");
+        metadata["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+        let unrelated_id = store.ingest_original_with_evidence(
+            "lib",
+            unrelated.to_str().unwrap(),
+            &json!({"contentHash":"different","sizeBytes":9,"role":"jpeg_original"}),
+            &metadata,
+            &VersionEvidence {
+                capture_original: "2025:11:29 12:03:27-06:00".into(),
+                ..evidence
+            },
+        )?;
+        assert_ne!(unrelated_id, ids[0]);
+        Ok(())
+    }
+
+    #[test]
     fn exact_duplicates_are_deprecated_with_reason_not_extra_versions() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
@@ -414,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn pairing_requires_same_directory_stem_and_complete_metadata() -> Result<()> {
+    fn pairing_requires_stem_and_complete_metadata() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let raw = dir.path().join("photos/a.3FR");

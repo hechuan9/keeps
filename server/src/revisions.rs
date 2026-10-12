@@ -737,7 +737,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                14
+                15
             );
             assert_eq!(
                 db.query_row(

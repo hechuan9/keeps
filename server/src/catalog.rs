@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 14;
+const VERSION: i64 = 15;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -154,6 +154,9 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         crate::remote_worker::migrate(&tx)?;
         crate::edits::migrate_recipe(&tx)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS ai_editing_state(library_id TEXT NOT NULL,kind TEXT NOT NULL,revision INTEGER NOT NULL,content TEXT,PRIMARY KEY(library_id,kind)); CREATE TABLE IF NOT EXISTS photo_edit_decisions(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,metadata TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));")?;
+    }
+    if version < 15 {
+        tx.execute_batch("CREATE INDEX IF NOT EXISTS version_capture_original ON catalog_versions(library_id,json_extract(evidence,'$.captureOriginal'));")?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;

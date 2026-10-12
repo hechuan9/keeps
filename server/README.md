@@ -67,7 +67,7 @@ SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行
 
 批次及完成上传的暂存文件跨服务重启保留，首版没有自动过期或取消清理；未完成导入需要通过原批次继续。服务端必须运行在支持硬链接的本地 NAS 文件系统，部署及真实照片整理效果仍需 NAS 验收。
 
-导入计算租约与既有编辑状态统一使用 catalog schema 14。升级 schema 12 或 13 前停止服务、备份 SQLite，再执行现有 `keeps-server migrate`；迁移兼容既有 schema 13 的编辑状态或导入租约版本，保留配方、决定和展示对象，不改照片文件。
+导入计算租约与既有编辑状态统一使用 catalog schema 15；该版本为跨目录 HEIF/3FR 匹配添加原始拍摄时间索引。升级旧 schema 前停止服务、备份 SQLite，再执行现有 `keeps-server migrate`；迁移保留既有编辑状态、配方、决定和展示对象，不改照片文件。
 
 
 已发布调色历史通过 `GET /libraries/{library}/assets/{asset}/edit/versions` 查询；每项包含独立 `versionID`、`previousVersionID`、`sourceContentHash`、`available` 和带签名 URL 的可用媒体。`GET .../edit` 返回稳定 `rootID` 与 `currentVersionID`。照片 UUID 与文件摘要分离，替换或重置当前调色保留已发布历史，旧版本已丢失的媒体不会标为可用。
