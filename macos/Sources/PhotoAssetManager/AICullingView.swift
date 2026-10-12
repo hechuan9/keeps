@@ -11,6 +11,7 @@ struct AICullingView: View {
     @State private var preferenceError: String?
     @State private var editsPreferences = false
     @State private var enlarged: KeepsAsset?
+    @State private var exposureSettings: [UUID: CullingExposureSettings] = [:]
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -82,6 +83,7 @@ struct AICullingView: View {
             preferences = store.preferences
             library.isCullingActive = true
         }
+        .onChange(of: store.session?.completed) { _, _ in exposureSettings.removeAll() }
         .onChange(of: store.readyForAnalysis) { _, ready in if ready { analyze() } }
         .sheet(isPresented: $editsPreferences) {
             VStack(alignment: .leading, spacing: 16) {
@@ -101,12 +103,17 @@ struct AICullingView: View {
         }
         .onDisappear { store.cancel(); library.isCullingActive = false; library.refresh(force: true) }
         .sheet(item: $enlarged) { asset in
-            VStack {
-                KeepsPreviewImage(asset: asset, configuration: library.configuration, loadStandard: true)
-                    .frame(minWidth: 800, minHeight: 560)
-                Text(asset.originalFilename)
-                Button("关闭") { enlarged = nil }
-            }.padding()
+            CullingExposureView(asset: asset, client: library.client,
+                settings: Binding(get: { exposureSettings[asset.id] ?? CullingExposureSettings() },
+                                  set: { exposureSettings[asset.id] = $0 }),
+                kept: Binding(get: {
+                    guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return false }
+                    return store.session?.kept.contains(index) == true
+                }, set: { value in
+                    guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }),
+                          store.session?.kept.contains(index) != value else { return }
+                    store.toggle(index)
+                }), canChoose: !store.busy && !store.hasPending && !store.loadFailed)
         }
     }
 
@@ -152,7 +159,7 @@ struct AICullingView: View {
             HStack {
                 Text(asset.originalFilename).lineLimit(1)
                 Spacer()
-                Button("放大") { enlarged = asset }
+                Button("放大 / 曝光检查") { enlarged = asset }
             }
             if photo.recommended { Text("AI 推荐保留").font(.caption.bold()).foregroundStyle(.green) }
             Text(photo.reason).font(.callout).foregroundStyle(.secondary)
