@@ -37,6 +37,7 @@ struct ContentView: View {
     @State private var showsAIWorkspace = false
     @State private var startsAIWorkspace = false
     @State private var showsImport = false
+    @State private var showsCulling = false
     @EnvironmentObject private var importTasks: ImportTaskOwner
     private var importStore: ImportStore? { importTasks.store }
     @State private var importWindowID = UUID()
@@ -54,6 +55,7 @@ struct ContentView: View {
         Group {
             if showsAIWorkspace {
                 AIEditingWorkspaceView(autoStart: startsAIWorkspace, returnToLibrary: { showsAIWorkspace = false })
+                    .disabled(library.isCullingActive)
             } else {
                 libraryScreen
             }
@@ -61,6 +63,7 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             AIEditingBackgroundStatus(store: batch) { showsAIWorkspace = true }
         }
+        .sheet(isPresented: $showsCulling) { AICullingView() }
         .sheet(item: $assetToCrop) { asset in
             PhotoCropSheet(asset: asset)
         }
@@ -161,6 +164,12 @@ struct ContentView: View {
             } label: { Label("导入", systemImage: "square.and.arrow.down") }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
                 .disabled(library.client == nil)
+            Button {
+                guard library.query.directory != nil else { return }
+                showsCulling = true
+            } label: { Label("AI 筛片", systemImage: "photo.on.rectangle.angled") }
+                .disabled(library.query.directory == nil || library.client == nil || library.isMutating || batch.isRunning || batch.editor.isBusy)
+                .help(library.query.directory == nil ? "请先选择一个目录" : "让 AI 引导筛选当前目录，或继续上次筛片")
             Spacer(minLength: 12)
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)

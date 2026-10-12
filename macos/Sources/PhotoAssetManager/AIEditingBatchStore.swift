@@ -266,7 +266,7 @@ struct AIEditingBatch: Codable {
     }
 
     func start() {
-        guard storageError == nil, worker == nil, !editor.isBusy, library?.isDirectoryOperationBlocking != true, batch != nil,
+        guard storageError == nil, worker == nil, !editor.isBusy, library?.isCullingActive != true, library?.isDirectoryOperationBlocking != true, batch != nil,
               batch!.items.contains(where: { !$0.terminal }) else { return }
         isRunning = true
         worker = Task {

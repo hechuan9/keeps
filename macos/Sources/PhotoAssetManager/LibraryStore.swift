@@ -93,10 +93,11 @@ final class LibraryStore: ObservableObject {
     @Published var openImportWindows: Set<UUID> = []
     @Published var isImportWorkerActive = false
     var isImportingPhotos: Bool { !openImportWindows.isEmpty || isImportWorkerActive }
+    @Published var isCullingActive = false
     @Published var isAIEditingBlocking = false
     @Published var isAISettingsBusy = false
     var isDirectoryOperationBlocking: Bool { isDirectoryTrashBlocking || isMovingDirectory || photoMove != nil || rejectedTrash != nil || isPreparingRejectedTrash }
-    var isOperationBlocking: Bool { isDirectoryOperationBlocking || isAIEditingBlocking || isAISettingsBusy }
+    var isOperationBlocking: Bool { isCullingActive || isDirectoryOperationBlocking || isAIEditingBlocking || isAISettingsBusy }
     @Published private(set) var hiddenDirectoryPaths: Set<String> = []
     @Published private(set) var isUpdatingHiddenDirectory = false
     @Published var hiddenDirectoryFilterEnabled = true {

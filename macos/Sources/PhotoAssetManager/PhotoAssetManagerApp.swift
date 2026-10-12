@@ -81,7 +81,7 @@ struct PhotoAssetManagerApp: App {
             }
             .environmentObject(library)
             .onReceive(batch.editor.$isBusy, perform: synchronizeEditorActivity)
-            .disabled(library.isDirectoryOperationBlocking || batch.isRunning)
+            .disabled(library.isCullingActive || library.isDirectoryOperationBlocking || batch.isRunning)
             .overlay {
                 if library.isDirectoryOperationBlocking || batch.isRunning {
                     Text(batch.isRunning ? "正在进行 AI 调色，请在调色工作台查看进度。" : "正在整理照片或文件夹，请在主窗口查看进度。")
