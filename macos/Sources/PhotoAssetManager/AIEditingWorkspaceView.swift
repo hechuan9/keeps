@@ -9,11 +9,10 @@ struct AIEditingWorkspaceView: View {
     var autoStart = false
     var returnToLibrary: () -> Void
     private enum Editor: Identifiable {
-        case preferences, instruction, candidates, suggestion(AIEditingPreferenceSuggestion)
+        case preferences, candidates, suggestion(AIEditingPreferenceSuggestion)
         var id: String {
             switch self {
             case .preferences: "preferences"
-            case .instruction: "instruction"
             case .candidates: "candidates"
             case .suggestion(let value): value.id.uuidString
             }
@@ -78,13 +77,6 @@ struct AIEditingWorkspaceView: View {
             .contentShape(Rectangle())
             .onTapGesture(count: 2) { openEditor(.preferences, text: store.preferencesText) }
             .accessibilityAction(named: Text("编辑审美偏好")) { openEditor(.preferences, text: store.preferencesText) }
-            HStack {
-                Text(store.batchInstruction.isEmpty ? "新增照片要求：未设置" : "新增照片要求：" + store.batchInstruction)
-                    .font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                Spacer()
-                Button("调整要求") { openEditor(.instruction, text: store.batchInstruction) }
-                    .disabled(store.batch == nil)
-            }
             Text("选择采用版本后，该照片立即移出工作台并在后台发布；进度显示在底部状态栏。")
                 .font(.caption).foregroundStyle(.secondary)
         }
@@ -133,9 +125,6 @@ struct AIEditingWorkspaceView: View {
         case .preferences:
             title = "编辑审美偏好"
             help = "确认后保存在这台 Mac；已开始的照片保留原偏好。"
-        case .instruction:
-            title = "调整新增照片要求"
-            help = "确认后仅用于尚未开始的照片，不会直接改写长期偏好。"
         case .suggestion:
             title = "确认偏好候选"
             help = "可以先修改表述；确认后加入长期审美偏好。"
@@ -168,8 +157,6 @@ struct AIEditingWorkspaceView: View {
         switch target {
         case .preferences:
             Task { if await store.savePreferences(text: editorDraft) { editor = nil } }
-        case .instruction:
-            if store.saveBatchInstruction(text: editorDraft) { editor = nil }
         case .suggestion(let suggestion):
             if store.acceptPreferenceSuggestion(id: suggestion.id, text: editorDraft) { editor = nil }
         case .candidates: break

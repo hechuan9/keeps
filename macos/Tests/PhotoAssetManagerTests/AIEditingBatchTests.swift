@@ -355,7 +355,11 @@ import Testing
         #expect(store.batch?.items.last?.preferences == "低饱和")
         #expect(store.batch?.items.last?.batchInstruction == "提亮阴影")
         let restored = AIEditingBatchStore(root: root)
-        #expect(restored.preferencesText == "低饱和")
+        #expect(restored.preferencesText == "低饱和\n提亮阴影")
+        #expect(restored.batchInstruction.isEmpty)
+        #expect(restored.batch?.instruction == "")
+        #expect(AIEditingBatchStore(root: root).preferencesText == restored.preferencesText)
+        #expect(restored.batch?.items.first?.batchInstruction == "保留暖光")
         #expect(restored.batch?.items.first?.preferences == "自然肤色")
     }
 

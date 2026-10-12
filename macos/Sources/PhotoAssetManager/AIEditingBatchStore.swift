@@ -122,6 +122,15 @@ struct AIEditingBatch: Codable {
                 try importLegacyState()
             }
             restoreLegacyResults()
+            let instruction = (batch?.instruction ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if !instruction.isEmpty {
+                let preferences = preferencesText.trimmingCharacters(in: .whitespacesAndNewlines)
+                if preferences != instruction {
+                    preferencesText = preferences.isEmpty ? instruction : preferences + "\n" + instruction
+                }
+                preferencesRevision += 1
+                batch?.instruction = ""
+            }
             batchInstruction = batch?.instruction ?? ""
             try database.save(batch: batch, preferences: savedPreferences)
             preferenceSuggestions = try database.preferenceSuggestions()
@@ -332,14 +341,6 @@ struct AIEditingBatch: Codable {
             errorMessage = nil; errorDetails = nil
             return true
         } catch { recordFailure(error); return false }
-    }
-
-    @discardableResult func saveBatchInstruction(text: String) -> Bool {
-        guard batch != nil, storageError == nil else { return false }
-        batchInstruction = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard storageError == nil else { return false }
-        errorMessage = nil; errorDetails = nil
-        return true
     }
 
     func selectCandidate(itemID: UUID, candidateID: UUID?) {
