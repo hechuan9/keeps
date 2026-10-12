@@ -189,6 +189,22 @@ public final class KeepsClient: Sendable {
         try await request("GET", library + ["rejected-trash", id.uuidString.lowercased()])
     }
 
+    public func previewTrash() async throws -> KeepsRejectedTrashTask {
+        try await request("POST", library + ["trash", "preview"])
+    }
+    public func submitTrash(id: UUID, confirmationCount: Int) async throws -> KeepsRejectedTrashTask {
+        try await request("POST", library + ["trash", id.uuidString.lowercased()], body: JSONEncoder().encode(["confirmationCount": confirmationCount]))
+    }
+    public func trashTask(id: UUID) async throws -> KeepsRejectedTrashTask {
+        try await request("GET", library + ["trash", id.uuidString.lowercased()])
+    }
+    public func trashSettings() async throws -> KeepsTrashSettings {
+        try await request("GET", library + ["trash", "settings"])
+    }
+    public func updateTrashSettings(_ settings: KeepsTrashSettings) async throws -> KeepsTrashSettings {
+        try await request("PUT", library + ["trash", "settings"], body: JSONEncoder().encode(settings))
+    }
+
     public func trashDirectory(path: String, confirmationName: String, requestID: UUID) async throws -> KeepsDirectoryTrashTask {
         try await request("POST", library + ["directories", "trash"], body: JSONEncoder().encode(["path": path, "confirmationName": confirmationName, "requestID": requestID.uuidString.lowercased()]))
     }

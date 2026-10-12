@@ -43,6 +43,8 @@ struct PhotoAssetManagerApp: App {
                     .disabled(!library.isStartupReady || aiWorkspace == nil || library.isOperationBlocking)
                 Button("删除所有弃用照片…") { library.openRejectedTrash() }
                     .disabled(!library.isStartupReady || library.client == nil || library.isOperationBlocking || library.isMutating || library.isCheckingConnection || library.isImportingPhotos || batch.isRunning || batch.editor.isBusy)
+                Button("清空 Keeps 回收站…") { library.openRejectedTrash(emptyingTrash: true) }
+                    .disabled(!library.isStartupReady || library.client == nil || library.isOperationBlocking || library.isMutating || library.isCheckingConnection || library.isImportingPhotos || batch.isRunning || batch.editor.isBusy)
                 Divider()
                 Group {
                 Button("上一张") { library.selectAdjacent(-1) }
@@ -75,6 +77,15 @@ struct PhotoAssetManagerApp: App {
                 }
                 .disabled(library.isOperationBlocking)
                 .tabItem { Label("来源", systemImage: "folder") }
+                Group {
+                    if library.isStartupReady, let client = library.client {
+                        TrashSettingsView(client: client).id(ObjectIdentifier(client))
+                    } else {
+                        Text("请先验证并保存服务器连接。").padding(24)
+                    }
+                }
+                .disabled(library.isOperationBlocking)
+                .tabItem { Label("回收站", systemImage: "trash") }
                 AIEditingSettingsView(store: batch.editor)
                     .disabled(library.isImportingPhotos || library.isMutating || library.isCheckingConnection || library.isUpdatingHiddenDirectory || library.directoryToRename != nil || library.directoryToTrash != nil)
                     .tabItem { Label("AI 修图", systemImage: "wand.and.stars") }

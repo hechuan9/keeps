@@ -45,11 +45,13 @@ SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行
 
 ## 显式回收所有弃用照片
 
-`POST /libraries/{library}/rejected-trash/preview` 保存待确认清单，返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。按全库 `flag=rejected AND trashed=0` 且有原片路径的照片去重计数，包括隐藏目录；清单包含全部有效原片路径、关联版本及 XMP。未弃用照片共用的文件或 sidecar、跨图库和非追踪文件均拒绝。
+`POST /libraries/{library}/rejected-trash/preview` 保存全库待删除的弃用照片清单，包括隐藏目录；`POST /libraries/{library}/rejected-trash/{id}` 接收 `{confirmationCount}`，数量须与非零预览相同。NAS 持久任务只将照片移入 Keeps 回收站，原片及关联文件保持原位。单张 `assets/{id}/trash` 与恢复使用相同的入站计时。
 
-`POST /libraries/{library}/rejected-trash/{id}` 接收 `{confirmationCount}`，必须与非零预览数量一致，并再次核对精确照片 ID、路径与文件身份；同一 ID 重复提交返回原任务，不重试失败任务。返回 202，由目录回收 worker 执行，`GET` 同路径查询。任务和逐文件进度存于 `jobs.sqlite`；实际执行前再核对清单与 DSM 回收配置，使用 `/usr/syno/bin/synorecycle --unlink share=<共享名> rpath=<相对文件>`，不存在永久删除降级路径。该参数已通过 DSM 7.3.2 的 `synorecycle --help` 只读核实。
+`POST /libraries/{library}/trash/preview` 预览 Keeps 回收站全量清单，`POST /libraries/{library}/trash/{id}` 以相同数量确认协议提交清空；`GET` 同路径查询。实际清空通过 DSM 原生 `/usr/syno/bin/synorecycle --unlink` 将所有有效原片版本和关联 XMP 移入 NAS 回收站，不永久删除、不使用文件操作兜底。提交和执行均复核照片状态、文件身份、追踪范围及共享文件归属；未进入 Keeps 回收站的照片共用文件会阻止回收。
 
-执行与扫描、目录移动、照片标记修改及曝光提交互斥。中断的原生调用若原文件仍存在则停止并提示核实，不盲目重放；原文件消失则继续剩余清单。原生部分失败也会对账消失路径、更新图库修订与缓存；对账中断可重启继续。失败任务不自动重试，需检查 NAS 回收站后重新预览。照片历史保留，不转入 Keeps 软件回收站；恢复通过 File Station，随后扫描重新索引。客户端显示的照片数与实际文件数分别计量。
+`GET` / `PUT /libraries/{library}/trash/settings` 读取或保存 `{enabled,retentionDays}`。默认启用，保留 30 天，可设为 1–3650 天或关闭；从进入 Keeps 回收站起计时，恢复即取消计时，再入站重新计时。schema 16 迁移时已有回收站照片从迁移当天起计时。NAS 后台每小时检查到期清单，客户端关闭不影响执行；任务开始前再次检查当前保留期限和启用状态。
+
+任务与逐文件断点保存在 `jobs.sqlite`，API 返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。回收与扫描、目录移动、照片状态修改及曝光提交互斥。中断原生调用不盲目重放；原文件消失则继续剩余清单。失败对账消失路径，未回收文件和照片资料保留；失败任务不重试，需核实 NAS 回收站后重新预览。全部文件确认回收后，清除照片图库资料及编辑记录，专属生成缓存进入现有安全 GC 队列；NAS 回收站恢复后需重新扫描索引。
 
 ## Mac 显式导入
 

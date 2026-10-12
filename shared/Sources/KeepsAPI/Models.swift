@@ -327,3 +327,12 @@ public struct KeepsRejectedTrashTask: Codable, Equatable, Identifiable, Sendable
     public var updatedAt: Double
     public var finishedAt: Double?
 }
+
+public struct KeepsTrashSettings: Codable, Equatable, Sendable {
+    public var enabled: Bool
+    public var retentionDays: Int
+    public init(enabled: Bool = true, retentionDays: Int = 30) {
+        self.enabled = enabled
+        self.retentionDays = retentionDays
+    }
+}

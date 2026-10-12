@@ -17,6 +17,15 @@ final class IOSLibraryStore: ObservableObject {
     private(set) var syncError: String?
     @Published private(set) var configuration: KeepsConfiguration?
     @Published var lastError: String?
+    @Published var showingTrashCleanup = false
+    @Published private(set) var trashCleanup: KeepsRejectedTrashTask?
+    @Published private(set) var trashCleanupBusy = false
+    @Published private(set) var trashCleanupError: String?
+    private var trashCleanupTracking: Task<Void, Never>?
+    var hasPendingTrashCleanup: Bool { pendingTrashID != nil }
+    private var pendingTrashID: UUID?
+    private var pendingTrashCount: Int?
+    private var trashCleanupConfiguration: KeepsConfiguration?
     @Published var search = ""
     @Published var showingTrash = false
     @Published var showingPicked = false
@@ -50,6 +59,14 @@ final class IOSLibraryStore: ObservableObject {
 
     func configure(_ configuration: KeepsConfiguration?) {
         guard self.configuration != configuration else { return }
+        trashCleanupTracking?.cancel()
+        trashCleanupTracking = nil
+        pendingTrashID = nil
+        pendingTrashCount = nil
+        trashCleanup = nil
+        trashCleanupBusy = false
+        trashCleanupError = nil
+        showingTrashCleanup = false
         generation += 1
         readSequence += 1
         paging = false
@@ -74,6 +91,7 @@ final class IOSLibraryStore: ObservableObject {
         lastError = nil
         self.configuration = configuration
         guard let configuration else { return }
+        restoreTrashCleanup(configuration)
         do {
             database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseDirectory)
             isLoadingLocal = true
@@ -86,6 +104,112 @@ final class IOSLibraryStore: ObservableObject {
                 initialReadTask = nil
             }
         } catch { lastError = String(reflecting: error) }
+    }
+
+    private func trashCleanupKey(_ configuration: KeepsConfiguration) -> String {
+        "keeps.ios.pendingTrash." + configuration.baseURL.absoluteString + "|" + configuration.libraryID
+    }
+
+    private func restoreTrashCleanup(_ configuration: KeepsConfiguration) {
+        guard let saved = UserDefaults.standard.dictionary(forKey: trashCleanupKey(configuration)),
+              let value = saved["id"] as? String, let id = UUID(uuidString: value),
+              let count = saved["count"] as? Int else { return }
+        pendingTrashID = id
+        pendingTrashCount = count
+        trashCleanupConfiguration = configuration
+        showingTrashCleanup = true
+        trashCleanupBusy = true
+        trashCleanupTracking = Task { await trackTrashCleanup(configuration, submit: false) }
+    }
+
+    func previewTrashCleanup() async {
+        guard pendingTrashID == nil, !trashCleanupBusy, let configuration else { return }
+        trashCleanupConfiguration = configuration
+        trashCleanup = nil
+        trashCleanupError = nil
+        trashCleanupBusy = true
+        defer { if self.configuration == configuration { trashCleanupBusy = false } }
+        do {
+            let preview = try await KeepsClient(configuration: configuration, session: session).previewTrash()
+            guard self.configuration == configuration else { return }
+            trashCleanup = preview
+        } catch {
+            guard self.configuration == configuration else { return }
+            trashCleanupError = error.localizedDescription + "\n" + String(reflecting: error)
+        }
+    }
+
+    func canConfirmTrashCleanup(_ confirmation: String) -> Bool {
+        guard let task = trashCleanup else { return false }
+        return !trashCleanupBusy && pendingTrashID == nil && configuration == trashCleanupConfiguration
+            && task.status == "draft" && task.count > 0 && confirmation == String(task.count)
+    }
+
+    func submitTrashCleanup(_ confirmation: String) {
+        guard canConfirmTrashCleanup(confirmation), let task = trashCleanup, let configuration else { return }
+        pendingTrashID = task.id
+        pendingTrashCount = task.count
+        UserDefaults.standard.set(["id": task.id.uuidString, "count": task.count], forKey: trashCleanupKey(configuration))
+        trashCleanupBusy = true
+        trashCleanupTracking = Task { await trackTrashCleanup(configuration, submit: true) }
+    }
+
+    private func trackTrashCleanup(_ configuration: KeepsConfiguration, submit: Bool) async {
+        let client = KeepsClient(configuration: configuration, session: session)
+        var shouldSubmit = submit
+        while self.configuration == configuration, let id = pendingTrashID, let count = pendingTrashCount, !Task.isCancelled {
+            do {
+                let task: KeepsRejectedTrashTask
+                if shouldSubmit {
+                    shouldSubmit = false
+                    task = try await client.submitTrash(id: id, confirmationCount: count)
+                } else { task = try await client.trashTask(id: id) }
+                guard self.configuration == configuration, !Task.isCancelled else { return }
+                guard task.id == id, task.count == count else {
+                    trashCleanupError = "服务器返回的任务与已确认清单不一致，请在 NAS 核实。"
+                    trashCleanupBusy = false
+                    return
+                }
+                trashCleanup = task
+                trashCleanupError = nil
+                if task.status == "completed" || task.status == "failed" {
+                    pendingTrashID = nil
+                    pendingTrashCount = nil
+                    UserDefaults.standard.removeObject(forKey: trashCleanupKey(configuration))
+                    trashCleanupBusy = false
+                    if task.status == "failed" { trashCleanupError = task.error ?? "NAS 回收任务失败。" }
+                    await refresh()
+                    return
+                }
+                if task.status == "draft" { shouldSubmit = true }
+            } catch {
+                guard self.configuration == configuration, !Task.isCancelled else { return }
+                trashCleanupError = "暂时无法确认进度；NAS 后台任务独立执行，正在查询同一任务。\n" + error.localizedDescription + "\n" + String(reflecting: error)
+                if case KeepsAPIError.http(let status, _) = error, (400..<500).contains(status) {
+                    if status == 409 {
+                        pendingTrashID = nil
+                        pendingTrashCount = nil
+                        trashCleanup = nil
+                        UserDefaults.standard.removeObject(forKey: trashCleanupKey(configuration))
+                        trashCleanupError = "回收站清单已变化，请重新预览并确认照片总数。\n" + String(reflecting: error)
+                    }
+                    trashCleanupBusy = false
+                    return
+                }
+            }
+            do { try await Task.sleep(for: .seconds(2)) } catch { return }
+        }
+    }
+
+    func resumeTrashCleanup() {
+        guard pendingTrashID != nil, !trashCleanupBusy, let configuration else { return }
+        trashCleanupBusy = true
+        trashCleanupTracking = Task { await trackTrashCleanup(configuration, submit: false) }
+    }
+
+    func closeTrashCleanup() {
+        showingTrashCleanup = false
+        if pendingTrashID == nil { trashCleanup = nil; trashCleanupError = nil }
     }
 
     func reloadConfiguration() {

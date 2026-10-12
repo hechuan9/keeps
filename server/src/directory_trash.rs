@@ -407,7 +407,18 @@ pub fn run(
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use rusqlite::OptionalExtension;
+    let mut next_cleanup = std::time::Instant::now();
     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        if std::time::Instant::now() >= next_cleanup {
+            next_cleanup = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            if let Err(e) = crate::rejected_trash::schedule_expired(
+                &jobs,
+                &store,
+                chrono::Utc::now().timestamp(),
+            ) {
+                tracing::error!(error=%format!("{e:#}"),"Automatic trash cleanup check failed");
+            }
+        }
         let next = {
             let db = jobs.trash_db.lock().unwrap();
             db.query_row("SELECT id,path,status,phase,error,created_at,updated_at,finished_at,library_id,confirmation FROM directory_trash_tasks WHERE status IN ('pending','running') ORDER BY created_at,id LIMIT 1",[],|row|Ok((task(row)?,row.get::<_,String>(8)?,row.get::<_,String>(9)?))).optional()?

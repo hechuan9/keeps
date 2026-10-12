@@ -77,6 +77,9 @@ struct IOSRootView: View {
                 library.reloadConfiguration(); Task { await library.refresh() }
             }
         }
+        .sheet(isPresented: $library.showingTrashCleanup) {
+            IOSTrashCleanupSheet(library: library)
+        }
         .sheet(isPresented: $showingSearch) {
             IOSSearchSheet(query: library.search) { query in
                 collections = false; collectionPath = []
@@ -285,6 +288,11 @@ struct IOSRootView: View {
                             Text("原始比例网格").tag(KeepsGalleryStyle.aspectRatio)
                         }
                         Divider()
+                        if library.showingTrash {
+                            Button("清空 Keeps 回收站…", role: .destructive) {
+                                library.showingTrashCleanup = true
+                            }.disabled(changing)
+                        }
                         Button("连接设置", systemImage: "gearshape") { showingSettings = true }
                     } label: { Image(systemName: "line.3.horizontal.decrease").frame(width: 44, height: 44) }
                         .glassEffect(.regular.interactive(), in: Circle()).accessibilityLabel("图库选项")
@@ -318,7 +326,7 @@ struct IOSRootView: View {
                             Button { confirmTrash = true } label: { Image(systemName: "trash") }
                                 .accessibilityLabel("移入回收站").disabled(selectedIDs.isEmpty)
                         }
-                    }.disabled(changing).padding(20).glassEffect(.regular, in: Capsule())
+                    }.disabled(changing || library.trashCleanupBusy).padding(20).glassEffect(.regular, in: Capsule())
                 } else {
                     HStack(spacing: 4) {
                         tabButton("图库", icon: "photo.on.rectangle.fill", active: !collections) {
@@ -412,12 +420,14 @@ struct IOSSettingsView: View {
     @State private var token: String
     @State private var error: String?
     @State private var isChecking = false
+    let configuration: KeepsConfiguration?
     var didSave: () -> Void
 
     init(configuration: KeepsConfiguration?, didSave: @escaping () -> Void) {
         _baseURL = State(initialValue: configuration?.baseURL.absoluteString ?? "https://keeps.hechuannas.synology.me")
         _libraryID = State(initialValue: configuration?.libraryID ?? "local-library")
         _token = State(initialValue: configuration?.accessCredential ?? "")
+        self.configuration = configuration
         self.didSave = didSave
     }
     var body: some View {
@@ -431,6 +441,11 @@ struct IOSSettingsView: View {
                     Text("仅保存 Keeps 数据库快照和缩略图，不会加入系统照片库。同一 iCloud 账户重装后恢复图库连接和已保存的副本；访问令牌仍只保留在本机钥匙串。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
+                if let configuration {
+                    Section("Keeps 回收站") {
+                        NavigationLink("自动清理设置") { IOSTrashSettingsView(configuration: configuration) }
+                    }
+                }
                 Section("NAS 服务") {
                     TextField("服务地址", text: $baseURL).keyboardType(.URL)
                     TextField("图库 ID", text: $libraryID)
@@ -438,7 +453,7 @@ struct IOSSettingsView: View {
                 }.textInputAutocapitalization(.never).autocorrectionDisabled().disabled(isChecking)
                 Section {
                     Text("照片、评分、标签和回收站状态由 NAS 保存。此设备保存可离线浏览的图库副本与图片缓存，联网时从 NAS 同步更新。")
-                    Text("移入回收站只隐藏图库记录，原片保持不变。")
+                    Text("删除照片先进入 Keeps 回收站；手动清空或自动清理将文件移入 NAS 回收站，并清理图库资料和缓存。")
                     Text("使用 HTTPS 服务地址时，Wi-Fi 和蜂窝网络均可连接。使用局域网地址时，请允许本地网络访问并连接 NAS 所在网络。")
                 }
                 if isChecking { ProgressView("正在验证 NAS 连接…") }
@@ -556,5 +571,93 @@ private struct IOSOfflineProgressView: View {
             ProgressView(value: download.systemProgress.fractionCompleted)
         }
         .accessibilityElement(children: .combine)
+    }
+}
+
+
+struct IOSTrashCleanupSheet: View {
+    @ObservedObject var library: IOSLibraryStore
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmation = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Text("Keeps 回收站内所有照片及关联文件将移入 NAS 回收站，图库资料和缓存将清理。文件可从 NAS File Station 回收站恢复。")
+                if let task = library.trashCleanup {
+                    Text("照片：\(task.count) 张；关联文件：\(task.totalFiles) 个")
+                    if task.status == "draft" && !library.trashCleanupBusy {
+                        TextField("输入照片总数 \(task.count) 确认", text: $confirmation).keyboardType(.numberPad)
+                        Button("移入 NAS 回收站", role: .destructive) { library.submitTrashCleanup(confirmation) }
+                            .disabled(!library.canConfirmTrashCleanup(confirmation))
+                    }
+                    if library.trashCleanupBusy && task.status != "draft" {
+                        ProgressView(value: Double(task.completedFiles), total: Double(max(1, task.totalFiles)))
+                        Text("已回收文件：\(task.completedFiles) / \(task.totalFiles)")
+                    }
+                    if task.status == "completed" { Text("已完成清空 Keeps 回收站。") }
+                }
+                if library.trashCleanupBusy { ProgressView("正在查询 NAS 回收任务…") }
+                Text("任务由 NAS 后台独立执行，退出应用不影响任务；重新打开后继续查询。离线时不能创建清空任务。")
+                    .font(.caption).foregroundStyle(.secondary)
+                if let error = library.trashCleanupError {
+                    Text(error).foregroundStyle(.red).textSelection(.enabled)
+                    if library.hasPendingTrashCleanup && !library.trashCleanupBusy {
+                        Button("重新查询同一任务") { library.resumeTrashCleanup() }
+                    }
+                    if !library.hasPendingTrashCleanup && library.trashCleanup == nil && !library.trashCleanupBusy {
+                        Button("重新预览") { Task { await library.previewTrashCleanup() } }
+                    }
+                }
+            }
+            .navigationTitle("清空 Keeps 回收站")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("关闭") { library.closeTrashCleanup(); dismiss() }
+                }
+            }
+        }
+        .task { if library.trashCleanup == nil && !library.trashCleanupBusy { await library.previewTrashCleanup() } }
+    }
+}
+
+struct IOSTrashSettingsView: View {
+    let configuration: KeepsConfiguration
+    @State private var settings = KeepsTrashSettings()
+    @State private var loaded = false
+    @State private var busy = false
+    @State private var message: String?
+
+    var body: some View {
+        Form {
+            Toggle("自动清理 Keeps 回收站", isOn: $settings.enabled)
+            HStack {
+                Text("保留天数")
+                TextField("30", value: $settings.retentionDays, format: .number).keyboardType(.numberPad)
+            }.disabled(!settings.enabled)
+            Text("可设置 1–3650 天。NAS 后台清理到期照片：原片和关联文件进入 DSM 回收站，图库资料与缓存同时清理。此设置作用于整个资料库。")
+                .font(.caption).foregroundStyle(.secondary)
+            Button("保存") {
+                Task {
+                    busy = true
+                    defer { busy = false }
+                    do {
+                        settings = try await KeepsClient(configuration: configuration).updateTrashSettings(settings)
+                        message = "已保存"
+                    } catch { message = error.localizedDescription + "\n" + String(reflecting: error) }
+                }
+            }.disabled(!loaded || busy || !(1...3650).contains(settings.retentionDays))
+            if let message { Text(message).textSelection(.enabled) }
+        }
+        .disabled(!loaded || busy)
+        .navigationTitle("回收站自动清理")
+        .task {
+            busy = true
+            defer { busy = false }
+            do {
+                settings = try await KeepsClient(configuration: configuration).trashSettings()
+                loaded = true
+            } catch { message = error.localizedDescription + "\n" + String(reflecting: error) }
+        }
     }
 }

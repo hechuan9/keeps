@@ -59,6 +59,7 @@ final class LibraryStore: ObservableObject {
     }
 
     @Published var showsRejectedTrash = false
+    @Published var isEmptyingTrash = false
     @Published var rejectedTrashPreview: KeepsRejectedTrashTask?
     var rejectedTrashPreviewConfiguration: KeepsConfiguration?
     @Published var rejectedTrash: PendingRejectedTrash?

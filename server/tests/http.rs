@@ -2634,3 +2634,83 @@ async fn directory_metadata_refresh_is_recursive_manual_durable_and_scoped() {
     assert!(saved.refresh_metadata);
     assert_eq!(saved.path, path.to_str().unwrap());
 }
+
+#[tokio::test]
+async fn keeps_trash_settings_and_emptying_use_authenticated_count_confirmation() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state(dir.path());
+    state
+        .jobs
+        .add_folder("photos", state.jobs.root().to_str().unwrap())
+        .unwrap();
+    let id = seed(&state, &dir.path().canonicalize().unwrap(), "trash.jpg");
+    state.store.set_trashed("photos", &id, true).unwrap();
+    let app = router(state.clone());
+    let settings = "/libraries/photos/trash/settings";
+    assert_eq!(
+        call(app.clone(), "GET", settings, Value::Null).await,
+        (StatusCode::OK, json!({"enabled":true,"retentionDays":30}))
+    );
+    for days in [0, 3651] {
+        assert_eq!(
+            call(
+                app.clone(),
+                "PUT",
+                settings,
+                json!({"enabled":true,"retentionDays":days})
+            )
+            .await
+            .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let policy = json!({"enabled":false,"retentionDays":45});
+    assert_eq!(
+        call(app.clone(), "PUT", settings, policy.clone()).await,
+        (StatusCode::OK, policy.clone())
+    );
+    assert_eq!(
+        call(app.clone(), "GET", settings, Value::Null).await.1,
+        policy
+    );
+    let preview = "/libraries/photos/trash/preview";
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(preview)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let (status, task) = call(app.clone(), "POST", preview, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(task["count"], 1);
+    let path = format!("/libraries/photos/trash/{}", task["id"].as_str().unwrap());
+    assert_eq!(
+        call(app.clone(), "POST", &path, json!({"confirmationCount":2}))
+            .await
+            .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(app.clone(), "POST", &path, json!({"confirmationCount":1}))
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    assert_eq!(
+        call(app.clone(), "GET", &path, Value::Null).await.1["status"],
+        "pending"
+    );
+    assert_eq!(
+        call(app, "GET", "/libraries/photos/task-status", Value::Null)
+            .await
+            .1["longTask"]["kind"],
+        "trash"
+    );
+    assert!(dir.path().join("originals/trash.jpg").exists());
+}

@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 15;
+const VERSION: i64 = 16;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -43,6 +43,8 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         "database schema {version} is newer than this server supports ({VERSION})"
     );
     if version == VERSION {
+        db.prepare("SELECT library_id,asset_id,trashed_at FROM catalog_trash_entries LIMIT 0")?;
+        db.prepare("SELECT library_id,enabled,retention_days FROM trash_settings LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,metadata FROM photo_edit_decisions LIMIT 0")?;
         db.prepare("SELECT library_id,kind,revision,content FROM ai_editing_state LIMIT 0")?;
         db.prepare("SELECT negative_hash,edit_revision,negative_selected,last_edit_request FROM catalog_assets LIMIT 0")?;
@@ -157,6 +159,16 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
     }
     if version < 15 {
         tx.execute_batch("CREATE INDEX IF NOT EXISTS version_capture_original ON catalog_versions(library_id,json_extract(evidence,'$.captureOriginal'));")?;
+    }
+    if version < 16 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_trash_entries(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,trashed_at INTEGER NOT NULL,PRIMARY KEY(library_id,asset_id));
+CREATE INDEX IF NOT EXISTS catalog_trash_due ON catalog_trash_entries(library_id,trashed_at);
+CREATE TABLE IF NOT EXISTS trash_settings(library_id TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 1,retention_days INTEGER NOT NULL DEFAULT 30 CHECK(retention_days BETWEEN 1 AND 3650));
+INSERT OR IGNORE INTO catalog_trash_entries SELECT library_id,id,unixepoch() FROM catalog_assets WHERE trashed=1;
+CREATE TRIGGER IF NOT EXISTS catalog_trash_enter AFTER UPDATE OF trashed ON catalog_assets WHEN old.trashed=0 AND new.trashed=1 BEGIN INSERT OR REPLACE INTO catalog_trash_entries VALUES(new.library_id,new.id,unixepoch()); END;
+CREATE TRIGGER IF NOT EXISTS catalog_trash_restore AFTER UPDATE OF trashed ON catalog_assets WHEN old.trashed=1 AND new.trashed=0 BEGIN DELETE FROM catalog_trash_entries WHERE library_id=new.library_id AND asset_id=new.id; END;
+CREATE TRIGGER IF NOT EXISTS catalog_trash_insert AFTER INSERT ON catalog_assets WHEN new.trashed=1 BEGIN INSERT INTO catalog_trash_entries VALUES(new.library_id,new.id,unixepoch()); END;
+CREATE TRIGGER IF NOT EXISTS catalog_trash_remove AFTER DELETE ON catalog_assets BEGIN DELETE FROM catalog_trash_entries WHERE library_id=old.library_id AND asset_id=old.id; END;")?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -562,6 +574,82 @@ impl Store {
         crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(a)
+    }
+    pub(crate) fn enqueue_recycled_asset_caches(&self, lib: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in ids {
+            let descriptors=tx.prepare("SELECT thumbnail FROM media_cache WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT browse_thumbnail FROM media_cache WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT standard FROM photo_edits WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT thumbnail FROM photo_edits WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT browse FROM photo_edits WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT json_object('objectRef',json_object('bucket',object_bucket,'key',object_key)) FROM derivative_objects WHERE library_id=?1 AND asset_id=?2 UNION ALL SELECT o.value FROM photo_edit_requests r,json_each(r.payload,'$.body.outputs') o WHERE r.library_id=?1 AND r.asset_id=?2 AND json_extract(r.payload,'$.action')='commit'")?.query_map(params![lib,id],|r|r.get::<_,Option<String>>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            for descriptor in descriptors.into_iter().flatten() {
+                let value: Value = serde_json::from_str(&descriptor)?;
+                if !value["objectRef"].is_null() {
+                    crate::cache_gc::enqueue(
+                        &tx,
+                        lib,
+                        &value["objectRef"],
+                        &Value::Null,
+                        Utc::now().timestamp(),
+                    )?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn purge_recycled_assets(&self, lib: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in ids {
+            let live:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths WHERE library_id=?1 AND asset_id=?2) OR EXISTS(SELECT 1 FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND available=1)",params![lib,id],|r|r.get(0))?;
+            ensure!(!live, invalid("仍有可用原片路径，不能清理照片资料"));
+            for table in [
+                "catalog_files",
+                "catalog_versions",
+                "catalog_version_paths",
+                "catalog_defaults",
+                "catalog_identity_roots",
+                "catalog_identity_aliases",
+                "media_cache",
+                "derivative_objects",
+                "photo_edits",
+                "photo_edit_requests",
+                "photo_edit_decisions",
+                "remote_cache_tasks",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE library_id=?1 AND asset_id=?2"),
+                    params![lib, id],
+                )?;
+            }
+            for table in ["photos", "videos", "catalog_assets"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE library_id=?1 AND id=?2"),
+                    params![lib, id],
+                )?;
+            }
+        }
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub(crate) fn trash_rejected_ids(&self, lib: &str, ids: &[String]) -> Result<()> {
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in ids {
+            let mut asset = existing(&tx, lib, id)?.ok_or_else(not_found)?;
+            ensure!(
+                asset["flagState"] == "rejected",
+                invalid("照片已不再是弃用状态，已停止删除")
+            );
+            if asset["trashed"] != true {
+                asset["trashed"] = json!(true);
+                asset["updatedAt"] = json!(Utc::now().to_rfc3339());
+                save(&tx, lib, &asset)?;
+            }
+        }
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn set_trashed(&self, lib: &str, id: &str, trashed: bool) -> Result<Value> {
         let mut db = self.lock()?;

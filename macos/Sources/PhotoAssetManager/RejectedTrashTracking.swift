@@ -6,6 +6,7 @@ struct PendingRejectedTrash: Codable {
     let count: Int
     let baseURL: String
     let libraryID: String
+    var emptyingTrash: Bool?
     var terminalError: String?
 }
 
@@ -20,7 +21,7 @@ struct PendingRejectedTrash: Codable {
         rejectedTrashMessage = nil
         rejectedTrashFinished = false
         defer { isPreparingRejectedTrash = false }
-        do { rejectedTrashPreview = try await client.previewRejectedTrash() }
+        do { rejectedTrashPreview = try await (isEmptyingTrash ? client.previewTrash() : client.previewRejectedTrash()) }
         catch { rejectedTrashMessage = Self.describe(error) }
     }
 
@@ -33,7 +34,7 @@ struct PendingRejectedTrash: Codable {
     func submitRejectedTrash(confirmation: String) async {
         guard canConfirmRejectedTrash(confirmation), let preview = rejectedTrashPreview, let configuration else { return }
         rejectedTrash = PendingRejectedTrash(id: preview.id, count: preview.count,
-            baseURL: configuration.baseURL.absoluteString, libraryID: configuration.libraryID)
+            baseURL: configuration.baseURL.absoluteString, libraryID: configuration.libraryID, emptyingTrash: isEmptyingTrash)
         pauseLibraryForDirectoryOperation()
         do { try persistRejectedTrash() }
         catch { failRejectedTrash(Self.describe(error)); return }
@@ -48,6 +49,7 @@ struct PendingRejectedTrash: Codable {
         guard let data = preferences.data(forKey: Self.rejectedTrashKey) else { return }
         do {
             rejectedTrash = try JSONDecoder().decode(PendingRejectedTrash.self, from: data)
+            isEmptyingTrash = rejectedTrash?.emptyingTrash ?? false
             showsRejectedTrash = true
             guard let pending = rejectedTrash,
                   configuration?.baseURL.absoluteString == pending.baseURL,
@@ -68,8 +70,10 @@ struct PendingRejectedTrash: Codable {
                 let task: KeepsRejectedTrashTask
                 if shouldSubmit {
                     shouldSubmit = false
-                    task = try await client.submitRejectedTrash(id: pending.id, confirmationCount: pending.count)
-                } else { task = try await client.rejectedTrashTask(id: pending.id) }
+                    task = try await ((pending.emptyingTrash ?? false)
+                        ? client.submitTrash(id: pending.id, confirmationCount: pending.count)
+                        : client.submitRejectedTrash(id: pending.id, confirmationCount: pending.count))
+                } else { task = try await ((pending.emptyingTrash ?? false) ? client.trashTask(id: pending.id) : client.rejectedTrashTask(id: pending.id)) }
                 guard task.id == pending.id, task.count == pending.count else {
                     failRejectedTrash("服务器返回的删除任务与已确认清单不一致，请在 NAS 核实结果。")
                     return
@@ -89,7 +93,7 @@ struct PendingRejectedTrash: Codable {
             } catch {
                 if case KeepsAPIError.http(let status, _) = error, (400..<500).contains(status) {
                     failRejectedTrash(status == 409
-                        ? "弃用照片清单已变化，请关闭后重新预览并确认数量。\n" + Self.describe(error)
+                        ? "照片清单已变化，请关闭后重新预览并确认数量。\n" + Self.describe(error)
                         : "无法确认删除任务，请在 NAS 核实；不会创建替代删除请求。\n" + Self.describe(error))
                     return
                 }
@@ -117,7 +121,11 @@ struct PendingRejectedTrash: Codable {
         refreshNavigation(); refresh(force: true)
     }
 
-    func openRejectedTrash() {
+    func openRejectedTrash(emptyingTrash: Bool = false) {
+        if rejectedTrash == nil {
+            isEmptyingTrash = emptyingTrash
+            rejectedTrashPreview = nil
+        }
         if rejectedTrash == nil && rejectedTrashFinished {
             rejectedTrashPreview = nil
             rejectedTrashMessage = nil

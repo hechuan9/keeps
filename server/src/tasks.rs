@@ -335,9 +335,13 @@ pub fn status(store: &Store, jobs: &Jobs, library: &str) -> Result<Value> {
             .filter(|scope| scope.state == "running")
             .and_then(|scope| scope.current_path.clone())
     });
-    Ok(
-        json!({"automatic":{"status":automatic_status,"currentPhoto":current,"remainingPhotos":pending.len(),"failedPhotos":failed.len(),"error":error},"longTask":{"status":long_status,"kind":kind,"error":long_error,"path":current_scope.map(|scope| &scope.path),"currentPhoto":long_current,"processed":current_scope.map(|scope| scope.processed),"failed":current_scope.map(|scope| scope.failed)}}),
-    )
+    let mut result = json!({"automatic":{"status":automatic_status,"currentPhoto":current,"remainingPhotos":pending.len(),"failedPhotos":failed.len(),"error":error},"longTask":{"status":long_status,"kind":kind,"error":long_error,"path":current_scope.map(|scope| &scope.path),"currentPhoto":long_current,"processed":current_scope.map(|scope| scope.processed),"failed":current_scope.map(|scope| scope.failed)}});
+    if let Some(cleanup) = crate::rejected_trash::cleanup_status(jobs, library)?
+        && (cleanup["status"] != "failed" || long_status == "idle")
+    {
+        result["longTask"] = cleanup;
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

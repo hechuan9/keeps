@@ -111,6 +111,7 @@ struct NASTasksView: View {
         switch kind {
         case "manual": "手动一次性作业"
         case "maintenance": "自动维护"
+        case "trash": "清理回收站"
         case "reconcile": "全库补漏"
         default: kind
         }

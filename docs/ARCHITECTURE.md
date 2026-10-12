@@ -161,7 +161,9 @@ Mac 顶栏“导入”（⌘⇧I）选择本机来源文件夹和已有的 NAS �
 | `PUT .../assets/{assetID}/default-version` | 指定已有可用版本，body 为 contentHash；入队重建默认预览。 |
 | `GET /libraries/{libraryID}/revision?path=...&includeChildren=true` | 省略参数返回资料库单调修订号和 isUpdating；path 指定目录作用域，includeChildren 按需返回直接子作用域的版本与修改状态。仅查索引，不扫描照片或文件系统。 |
 | `PATCH /libraries/{libraryID}/assets/{assetID}` | 修改评分、旗标、颜色和标签。 |
-| `POST .../assets/{assetID}/trash` / `restore` | 修改共享回收站状态。 |
+| `POST .../assets/{assetID}/trash` / `restore` | 移入／恢复 Keeps 回收站，入站开始保留期限计时。 |
+| `POST .../trash/preview` / `POST .../trash/{id}` / `GET .../trash/{id}` | 数量确认后清空 Keeps 回收站，NAS 持久任务通过 DSM 原生接口回收文件并清理图库资料。 |
+| `GET` / `PUT .../trash/settings` | `{enabled,retentionDays}`：默认启用、30 天，可调整为 1–3650 天或关闭。 |
 | `POST .../directories/trash` | 提交包含 UUID requestID 与完全相同目录名的持久异步任务，202 返回任务；GET 同路径加 /{requestID} 查询 waiting/recycling/reconciling/completed/failed 阶段，重试幂等。后台调用 DSM 原生 `synorecycle --rmdir`，由 NAS 自动管理回收位置和删除记录；不使用手工移动或永久删除兜底。详见服务端 README。 |
 | `GET` / `PUT /libraries/{libraryID}/hidden-directories` | 读取和修改目录隐藏标记（path、hidden），返回 paths；仅改 NAS 数据库。 |
 | `GET /libraries/{libraryID}/counts` | 全部、精选和回收站计数。 |
@@ -183,7 +185,7 @@ Mac 顶栏“导入”（⌘⇧I）选择本机来源文件夹和已有的 NAS �
 - `KEEPS_ROOT=/keeps` 保存数据库、任务数据和可重建预览；宿主机路径 `/volume2/docker/keeps/data`。
 - Compose 只挂载系统数据和 `/volume2/photo` 两个目录，服务端 `ORIGINAL_ROOT=/volume2/photo`。
 - `/volume2/photo` 需要写权限用于创建标准照片；任何已有照片、RAW、sidecar 文件都不得删除、移动或以另一张照片覆盖；允许补写身份 metadata，但不得改变像素或 RAW 成像数据。标准图写入须防止重名覆盖。
-- 停止目录追踪和图库回收站只改变服务器记录。用户显式输入同名确认的“删除文件夹”是上述文件移动限制的唯一例外：由 DSM 原生回收程序处理整个目录，不永久删除，不自行移动到 `#recycle`。
+- 停止目录追踪和移入 Keeps 回收站只改变服务器记录。删除弃用照片先进入 Keeps 回收站；数量确认清空或可调期限（默认 30 天）到期后，NAS 持久任务通过 DSM 原生回收接口处理原片版本和 XMP，全部回收后清理图库资料与生成缓存。恢复取消入站计时，重新入站重新计时；schema 16 迁移时历史回收站照片从迁移当天计时。删除文件夹仍要求同名确认。不永久删除，不自行移动到 `#recycle`。
 - 预览写入 `KEEPS_ROOT/previews`。维护生成的预览和缓存不能触碰原片。
 - SQLite 是唯一业务真源；数据库 WAL 保留用于事务安全，它不是业务 ledger。schema 7 从已有业务表迁移，禁止通过重放旧事件恢复已移除的目录。数据库备份保存评分、标签和关联；文件备份保存照片内容。历史 Python 工具不属于生产运行时。
 

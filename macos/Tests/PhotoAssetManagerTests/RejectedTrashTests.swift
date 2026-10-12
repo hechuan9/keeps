@@ -41,6 +41,19 @@ import KeepsAPI
         #expect(RejectedProtocol.count("restart.invalidGET") == 1)
     }
 
+    @Test func emptyTrashRestartKeepsCorrectEndpoint() async throws {
+        let preferences = UserDefaults(suiteName: UUID().uuidString)!
+        let pending = PendingRejectedTrash(id: RejectedProtocol.id, count: 2,
+            baseURL: "https://emptyrestart.invalid", libraryID: "test", emptyingTrash: true)
+        preferences.set(try JSONEncoder().encode(pending), forKey: "keeps.pendingRejectedTrash")
+        let store = store("emptyrestart.invalid", preferences: preferences)
+        #expect(store.isEmptyingTrash)
+        await store.rejectedTrashTracking?.value
+        #expect(store.rejectedTrashPreview?.status == "completed")
+        #expect(RejectedProtocol.count("emptyrestart.invalidGET") == 1)
+        #expect(RejectedProtocol.count("emptyrestart.invalidPOST") == 1)
+    }
+
     @Test func zeroCountCannotSubmit() async {
         let store = store("zero.invalid", preferences: UserDefaults(suiteName: UUID().uuidString)!)
         await store.previewRejectedTrash()
@@ -99,8 +112,11 @@ private final class RejectedProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
     override func startLoading() {
         let url = request.url!
-        guard url.path.contains("rejected-trash") else {
+        guard url.path.contains("rejected-trash") || url.path.contains("/trash/") else {
             client?.urlProtocol(self, didFailWithError: URLError(.cancelled)); return
+        }
+        if url.host == "emptyrestart.invalid" {
+            #expect(url.path.contains("/trash/"))
         }
         let preview = url.path.hasSuffix("preview")
         let method = request.httpMethod!
@@ -112,7 +128,7 @@ private final class RejectedProtocol: URLProtocol, @unchecked Sendable {
         if host == "lost.invalid" && method == "POST" && !preview {
             client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return
         }
-        let draft = preview || (host == "restart.invalid" && method == "GET")
+        let draft = preview || (["restart.invalid", "emptyrestart.invalid"].contains(host) && method == "GET")
         let status = host == "changed.invalid" && !preview ? 409 : 200
         let body = """
         {"id":"\(Self.id)","count":\(host == "zero.invalid" ? 0 : 2),"status":"\(draft ? "draft" : "completed")","phase":"\(draft ? "confirmation" : "completed")","completedFiles":0,"totalFiles":3,"createdAt":1,"updatedAt":1}

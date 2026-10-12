@@ -202,6 +202,10 @@ struct ContentView: View {
             scopeButton("全部照片", count: library.counts?.all, trashed: false, picked: false)
             scopeButton("精选", count: library.counts?.picked, trashed: false, picked: true)
             scopeButton("回收站", count: library.counts?.trashed, trashed: true, picked: false)
+                .contextMenu {
+                    Button("清空 Keeps 回收站…", role: .destructive) { library.openRejectedTrash(emptyingTrash: true) }
+                        .disabled(library.isOperationBlocking || library.isMutating || !library.isStartupReady)
+                }
             Divider().padding(.vertical, 20).padding(.horizontal, 16)
             if library.isLoadingNavigation && !library.isRefreshingDirectoryAfterTrash {
                 ProgressView().progressViewStyle(.linear)
