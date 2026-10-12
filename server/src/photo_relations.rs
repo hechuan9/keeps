@@ -65,6 +65,95 @@ pub(crate) fn capture_match(
     Ok(None)
 }
 
+/// A collision suffix may separate a newly imported RAW from its camera HEIF.
+/// Require the camera's original timestamp because displayed capture times can
+/// differ after timezone interpretation, and a filename alone is not identity.
+pub(crate) fn raw_heif_match(
+    db: &Connection,
+    lib: &str,
+    path: &str,
+    snapshot: &Value,
+    evidence: &crate::versions::VersionEvidence,
+) -> Result<Option<String>> {
+    let path = Path::new(path);
+    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+    let raw = extension.eq_ignore_ascii_case("3fr");
+    let heif = ["heif", "heic", "hif"]
+        .iter()
+        .any(|s| extension.eq_ignore_ascii_case(s));
+    if !raw && !heif || evidence.capture_original.is_empty() {
+        return Ok(None);
+    }
+    let Some(directory) = path.parent().and_then(Path::to_str) else {
+        return Ok(None);
+    };
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return Ok(None);
+    };
+    let stem = collision_stem(stem);
+    let prefix = format!("{}/", directory.trim_end_matches('/'));
+    let end = format!("{}0", directory.trim_end_matches('/'));
+    let mut matches = BTreeSet::new();
+    let mut q = db.prepare("SELECT p.path,p.asset_id,v.evidence FROM catalog_paths p JOIN catalog_versions v ON v.library_id=p.library_id AND v.asset_id=p.asset_id AND v.content_hash=p.content_hash WHERE p.library_id=? AND p.path>=? AND p.path<? AND p.role IN ('raw_original','jpeg_original')")?;
+    for row in q.query_map(params![lib, prefix, end], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (other_path, id, detail) = row?;
+        let other = Path::new(&other_path);
+        let other_ext = other.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let opposite = if raw {
+            ["heif", "heic", "hif"]
+                .iter()
+                .any(|s| other_ext.eq_ignore_ascii_case(s))
+        } else {
+            other_ext.eq_ignore_ascii_case("3fr")
+        };
+        if !opposite || other.parent() != path.parent() {
+            continue;
+        }
+        let other_stem = other.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let other_base = collision_stem(other_stem);
+        if !stem.eq_ignore_ascii_case(other_base) {
+            continue;
+        }
+        let detail: Value = serde_json::from_str(&detail)?;
+        let capture = &detail["capture"];
+        let same_camera = ["cameraMake", "cameraModel", "lensModel"]
+            .iter()
+            .all(|key| {
+                snapshot[key]
+                    .as_str()
+                    .is_some_and(|v| !v.is_empty() && capture[key].as_str() == Some(v))
+            });
+        if same_camera
+            && detail["captureOriginal"].as_str() == Some(evidence.capture_original.as_str())
+            && (evidence.camera_serial.is_empty()
+                || detail["cameraSerial"].as_str().unwrap_or("").is_empty()
+                || detail["cameraSerial"].as_str() == Some(evidence.camera_serial.as_str()))
+        {
+            matches.insert(id);
+        }
+    }
+    Ok((matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten())
+}
+
+fn collision_stem(stem: &str) -> &str {
+    let Some(numbered) = stem.strip_suffix(')') else {
+        return stem;
+    };
+    let prefix = numbered.trim_end_matches(|c: char| c.is_ascii_digit());
+    if prefix.len() == numbered.len() {
+        return stem;
+    }
+    prefix.strip_suffix(" (").unwrap_or(stem)
+}
+
 fn originals(db: &Connection, lib: &str, directory: &str) -> Result<Vec<Original>> {
     let prefix = format!("{}/", directory.trim_end_matches('/'));
     let end = format!("{}0", directory.trim_end_matches('/'));
@@ -224,6 +313,50 @@ mod tests {
             );
             assert_eq!(std::fs::read_to_string(raw)?, "raw");
             assert_eq!(std::fs::read_to_string(heif)?, "heif");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn numbered_raw_pairs_with_camera_heif_despite_display_timezone() -> Result<()> {
+        for raw_first in [true, false] {
+            let dir = tempfile::tempdir()?;
+            let store = Store::open(&dir.path().join("db"), true)?;
+            let raw = dir.path().join("photos/B0000764 (1).3FR");
+            let heif = dir.path().join("photos/B0000764.HEIC");
+            let files = if raw_first {
+                [
+                    (&raw, "raw", "2025-11-28T18:03:27Z"),
+                    (&heif, "heif", "2025-11-28T17:03:27Z"),
+                ]
+            } else {
+                [
+                    (&heif, "heif", "2025-11-28T17:03:27Z"),
+                    (&raw, "raw", "2025-11-28T18:03:27Z"),
+                ]
+            };
+            let mut ids = Vec::new();
+            for (path, hash, time) in files {
+                std::fs::create_dir_all(path.parent().unwrap())?;
+                std::fs::write(path, hash)?;
+                let mut metadata = snapshot(hash);
+                metadata["captureTime"] = json!(time);
+                metadata["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+                ids.push(store.ingest_original_with_evidence(
+                    "lib", path.to_str().unwrap(),
+                    &json!({"contentHash":hash,"sizeBytes":hash.len(),"role":if crate::media::is_raw(path) {"raw_original"} else {"jpeg_original"}}),
+                    &metadata,
+                    &VersionEvidence { capture_original:"2025:11:28 12:03:27-06:00".into(),width:100,height:100,..Default::default() },
+                )?);
+            }
+            assert_eq!(ids[0], ids[1], "raw_first={raw_first}");
+            assert_eq!(
+                store.versions("lib", &ids[0])?["items"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
         }
         Ok(())
     }

@@ -799,8 +799,15 @@ impl Store {
         } else {
             None
         };
+        let raw_heif_match = if identity_match.is_none() && previous_path_asset.is_none() {
+            crate::photo_relations::raw_heif_match(&tx, lib, path, snapshot, evidence)?
+        } else {
+            None
+        };
         let matched = if identity_match.is_some() {
             identity_match
+        } else if raw_heif_match.is_some() {
+            raw_heif_match
         } else if previous_path_asset.is_none() && capture_match.is_some() {
             capture_match
         } else if by_path.is_some() {
