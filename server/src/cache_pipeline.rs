@@ -235,6 +235,34 @@ impl Store {
         tx.commit()?;
         Ok(row)
     }
+    fn claim_import_cache(&self) -> Result<Option<(String, String, String)>> {
+        let _source = self
+            .source_mutation
+            .read()
+            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
+        let mut db = self.lock()?;
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        crate::remote_worker::expire(&tx)?;
+        if !local_encoding_enabled()? {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let row = tx.query_row(
+            "SELECT c.library_id,c.asset_id,c.source_hash FROM media_cache c
+             WHERE c.status='pending' AND c.available_at<=unixepoch() AND c.attempts<?1
+             AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=c.library_id AND a.id=c.asset_id AND a.trashed=0)
+             AND EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at<=unixepoch())
+             AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch())
+             AND NOT EXISTS(SELECT 1 FROM remote_cache_tasks r WHERE r.library_id=c.library_id AND r.asset_id=c.asset_id AND r.completed=0 AND r.expires_at>unixepoch())
+             ORDER BY c.updated_at,c.asset_id LIMIT 1",
+            [MAX_ATTEMPTS], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)),
+        ).optional()?;
+        if let Some((lib, id, _)) = &row {
+            tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
+        }
+        tx.commit()?;
+        Ok(row)
+    }
     pub(crate) fn defer_cache_for_scan(&self, jobs: &Jobs, lib: &str, id: &str) -> Result<bool> {
         let _source = self
             .source_mutation
@@ -455,6 +483,34 @@ pub fn process_asset(
     result
 }
 
+/// Resume media from an explicitly initiated import after its client lease expires.
+pub fn process_import_media(store: &Store, jobs: &Jobs, previews: &PreviewStorage) -> Result<bool> {
+    let _directory_guard = jobs
+        .directory_mutation
+        .read()
+        .map_err(|_| anyhow::anyhow!("directory mutation lock poisoned"))?;
+    crate::directory_move::ensure_reconciled(jobs)?;
+    let Some((lib, id, hash)) = store.claim_import_cache()? else {
+        return Ok(false);
+    };
+    let result: Result<()> = (|| {
+        crate::tasks::begin(jobs, &lib, "import-media", Some(&id))?;
+        ensure!(
+            previews.free_bytes()? >= 2 * 1024 * 1024 * 1024,
+            "cache disk has less than 2 GiB free"
+        );
+        generate(store, jobs, previews, &lib, &id, &hash)
+    })();
+    let error = result.err().map(|e| format!("{e:#}"));
+    if let Some(error) = &error {
+        tracing::error!(library_id=%lib,asset_id=%id,error=%error,"NAS import media failed");
+        store.cache_failed(&lib, &id, &hash, error)?;
+    }
+    crate::tasks::finish(jobs, error.as_deref())?;
+    store.lock()?.execute("UPDATE cache_runtime SET last_batch_count=1,last_batch_at=unixepoch(),next_batch_at=0,last_error=? WHERE id=1",[error])?;
+    Ok(true)
+}
+
 pub fn maintain(
     store: &Store,
     jobs: &Jobs,
@@ -518,7 +574,7 @@ fn generate(
         "source symlink forbidden"
     );
     ensure!(
-        media::sha256_file(source)? == hash,
+        crate::imports::file_digest(jobs, lib, source)? == hash,
         "source content differs from indexed version"
     );
     let standard_source = select_standard_source(store, lib, id, &selected)?;
@@ -535,7 +591,7 @@ fn generate(
         "standard source symlink forbidden"
     );
     ensure!(
-        media::sha256_file(standard_input)? == standard_source.content_hash,
+        crate::imports::file_digest(jobs, lib, standard_input)? == standard_source.content_hash,
         "standard source content differs from indexed version"
     );
     let metadata = MediaProcessor::new().extract(standard_input)?;
@@ -581,7 +637,8 @@ fn generate(
             )?;
             MediaProcessor::new().preserve_standard_metadata(standard_input, &staged)?;
             ensure!(
-                media::sha256_file(standard_input)? == standard_source.content_hash,
+                crate::imports::file_digest(jobs, lib, standard_input)?
+                    == standard_source.content_hash,
                 "standard input changed during generation"
             );
             crate::identity::generated(&staged, &store.root_id(lib, id)?)?;
@@ -618,11 +675,11 @@ fn generate(
         thumbnail_quality()?,
     )?;
     ensure!(
-        media::sha256_file(source)? == hash,
+        crate::imports::file_digest(jobs, lib, source)? == hash,
         "source changed during generation"
     );
     ensure!(
-        media::sha256_file(standard_input)? == standard_source.content_hash,
+        crate::imports::file_digest(jobs, lib, standard_input)? == standard_source.content_hash,
         "standard input changed during generation"
     );
     let object = previews.put_generated_role(lib, id, &generated.sha256, &target, "thumbnail")?;
@@ -794,6 +851,114 @@ mod tests {
         assert!(store.claim_cache()?.is_some());
         Ok(())
     }
+    #[test]
+    fn import_takeover_is_scoped_exclusive_and_respects_retry_state() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        seed(&store, 5)?;
+        store.reconcile_cache()?;
+        for index in 0..5 {
+            let id = format!("00000000-0000-0000-0000-{index:012}");
+            let path = format!("/photos/{index}.jpg");
+            store.lock()?.execute(
+                "INSERT INTO catalog_paths VALUES('lib',?,?,?,'jpeg_original')",
+                params![path, id, format!("hash{index}")],
+            )?;
+            if index > 0 {
+                store.lock()?.execute(
+                    "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()-1)",
+                    [path],
+                )?;
+            }
+        }
+        store.lock()?.execute(
+            "UPDATE media_cache SET available_at=unixepoch()+100 WHERE source_hash='hash1'",
+            [],
+        )?;
+        store.lock()?.execute(
+            "UPDATE media_cache SET attempts=? WHERE source_hash='hash2'",
+            [MAX_ATTEMPTS],
+        )?;
+        store.lock()?.execute("INSERT INTO remote_cache_tasks VALUES('remote','lib','00000000-0000-0000-0000-000000000003','hash3','hash3','/photos/3.jpg','mac',unixepoch()+100,0)",[])?;
+        let (_, id, _) = store.claim_import_cache()?.unwrap();
+        assert!(id.ends_with('4'));
+        assert!(store.claim_import_cache()?.is_none());
+        store.lock()?.execute("UPDATE import_compute_leases SET expires_at=unixepoch()+100 WHERE path='/photos/1.jpg'",[])?;
+        store.lock()?.execute(
+            "UPDATE media_cache SET available_at=0 WHERE source_hash='hash1'",
+            [],
+        )?;
+        assert!(store.claim_import_cache()?.is_none());
+        store.lock()?.execute(
+            "UPDATE media_cache SET status='processing',attempts=1 WHERE source_hash='hash3'",
+            [],
+        )?;
+        store
+            .lock()?
+            .execute("UPDATE remote_cache_tasks SET expires_at=unixepoch()-1", [])?;
+        assert!(store.claim_import_cache()?.is_none());
+        let db = store.lock()?;
+        assert_eq!(
+            db.query_row("SELECT completed FROM remote_cache_tasks", [], |r| r
+                .get::<_, i64>(0))?,
+            -1
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT last_error FROM media_cache WHERE source_hash='hash3'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "remote worker lease expired"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_import_media_does_not_block_next_photo_or_enqueue_scan() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), dir.path())?;
+        let previews = PreviewStorage::new(
+            &dir.path().join("previews"),
+            None,
+            "http://localhost",
+            "test-key",
+        )?;
+        seed(&store, 2)?;
+        store.reconcile_cache()?;
+        for index in 0..2 {
+            let id = format!("00000000-0000-0000-0000-{index:012}");
+            let path = dir
+                .path()
+                .join(format!("missing{index}.jpg"))
+                .to_string_lossy()
+                .into_owned();
+            store.lock()?.execute(
+                "INSERT INTO catalog_paths VALUES('lib',?,?,?,'jpeg_original')",
+                params![path, id, format!("hash{index}")],
+            )?;
+            store.lock()?.execute(
+                "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()-1)",
+                [path],
+            )?;
+        }
+        assert!(process_import_media(&store, &jobs, &previews)?);
+        assert!(process_import_media(&store, &jobs, &previews)?);
+        assert!(!process_import_media(&store, &jobs, &previews)?);
+        assert_eq!(
+            store.lock()?.query_row(
+                "SELECT count(*) FROM media_cache WHERE last_error IS NOT NULL AND attempts=1",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            2
+        );
+        assert!(jobs.claim_class("manual")?.is_none());
+        assert!(jobs.claim_class("automatic")?.is_none());
+        Ok(())
+    }
+
     #[test]
     fn obsolete_failure_stays_cancelled_until_source_is_reindexed() -> Result<()> {
         let dir = tempfile::tempdir()?;

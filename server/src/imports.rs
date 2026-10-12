@@ -950,7 +950,7 @@ fn reserve_compute(state: &AppState, library: &str, batch: &Batch, worker: &str)
             owner.as_deref().is_none_or(|owner| owner == worker),
             conflict("import compute owner changed")
         );
-        tx.execute("INSERT INTO import_compute_leases VALUES(?,?,?,?,unixepoch()+3600) ON CONFLICT(library_id,batch_id,path) DO UPDATE SET expires_at=excluded.expires_at",params![library,batch.id,path,worker])?;
+        tx.execute("INSERT INTO import_compute_leases VALUES(?,?,?,?,unixepoch()+?) ON CONFLICT(library_id,batch_id,path) DO UPDATE SET expires_at=excluded.expires_at",params![library,batch.id,path,worker,crate::remote_worker::IMPORT_LEASE])?;
     }
     tx.commit()?;
     Ok(())
@@ -967,7 +967,7 @@ async fn compute_heartbeat(
                 .as_str()
                 .ok_or_else(|| invalid("workerID required"))?;
             reserve_compute(&state, &library, &batch, worker)?;
-            Ok(json!({"leaseSeconds":3600}))
+            Ok(json!({"leaseSeconds":crate::remote_worker::IMPORT_LEASE}))
         })
         .await
         .map_err(anyhow::Error::from)??,

@@ -17,6 +17,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{fs, path::PathBuf, sync::Arc};
 const LEASE: i64 = 1800;
+pub(crate) const IMPORT_LEASE: i64 = 300;
+
+fn task_lease(db: &Connection, lib: &str, id: &str) -> Result<i64> {
+    let imported: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM remote_cache_tasks r JOIN catalog_paths p ON p.library_id=r.library_id AND p.asset_id=r.asset_id JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path AND l.worker_id=r.worker_id WHERE r.library_id=? AND r.id=?)", params![lib,id], |r|r.get(0))?;
+    Ok(if imported { IMPORT_LEASE } else { LEASE })
+}
+
 static COMMIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub fn migrate(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS import_compute_leases(library_id TEXT NOT NULL,batch_id TEXT NOT NULL,path TEXT NOT NULL,worker_id TEXT NOT NULL,expires_at INTEGER NOT NULL,PRIMARY KEY(library_id,batch_id,path)); CREATE INDEX IF NOT EXISTS import_compute_path ON import_compute_leases(library_id,path,expires_at); CREATE TABLE IF NOT EXISTS remote_cache_tasks(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,asset_id TEXT NOT NULL,source_hash TEXT NOT NULL,input_hash TEXT NOT NULL,input_path TEXT NOT NULL,worker_id TEXT NOT NULL,expires_at INTEGER NOT NULL,completed INTEGER NOT NULL DEFAULT 0); CREATE INDEX IF NOT EXISTS remote_cache_expiry ON remote_cache_tasks(completed,expires_at);")?;
@@ -208,7 +215,15 @@ fn claim_pending_scoped(
     tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?", params![lib, asset])?;
     tx.execute(
         "INSERT INTO remote_cache_tasks VALUES(?,?,?,?,?,'',?,unixepoch()+?,0)",
-        params![id, lib, asset, hash, hash, worker, LEASE],
+        params![
+            id,
+            lib,
+            asset,
+            hash,
+            hash,
+            worker,
+            if batch.is_some() { IMPORT_LEASE } else { LEASE }
+        ],
     )?;
     tx.commit()?;
     Ok(Some((id, asset, hash)))
@@ -288,7 +303,7 @@ fn claim_sync(s: &AppState, lib: &str, body: Value, enabled: Option<&str>) -> Re
         Ok(None) => Ok(json!({"task":null})),
         Ok(Some(t)) => Ok(json!({
         "task":{
-        "taskID":t.id,"assetID":t.asset,"sourceHash":t.hash,"inputHash":t.input_hash,"filename":t.path.file_name().context("filename")?.to_str().context("filename utf8")?,"sizeBytes":fs::metadata(&t.path)?.len(),"mediaType":if media::is_video(&t.path) { "video" } else { "photo" },"generateStandard":needs_standard(&t),"generateBrowse":batch.is_some(),"deferred":deferred(&t),"thumbnailEdge":512,"thumbnailQuality":cache::thumbnail_quality()?,"leaseSeconds":LEASE}
+        "taskID":t.id,"assetID":t.asset,"sourceHash":t.hash,"inputHash":t.input_hash,"filename":t.path.file_name().context("filename")?.to_str().context("filename utf8")?,"sizeBytes":fs::metadata(&t.path)?.len(),"mediaType":if media::is_video(&t.path) { "video" } else { "photo" },"generateStandard":needs_standard(&t),"generateBrowse":batch.is_some(),"deferred":deferred(&t),"thumbnailEdge":512,"thumbnailQuality":cache::thumbnail_quality()?,"leaseSeconds":if batch.is_some() { IMPORT_LEASE } else { LEASE }}
         }
         )),
         Err(e) => {
@@ -382,14 +397,15 @@ async fn heartbeat(
 ) -> Result<Json<Value>, ApiError> {
     run(move || {
         let t = task(&s.store, &lib, &id)?;
+        let lease = task_lease(&*s.store.lock()?, &lib, &id)?;
         if t.completed == 0 {
             s.store.lock()?.execute(
                 "UPDATE remote_cache_tasks SET expires_at=unixepoch()+? WHERE id=?",
-                params![LEASE, id],
+                params![lease, id],
             )?;
         }
         Ok(json!({
-        "ok":true,"leaseSeconds":LEASE}
+        "ok":true,"leaseSeconds":lease}
         ))
     })
     .await
@@ -502,10 +518,14 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
         fs::remove_dir_all(root)?;
         return Ok(json!({"ok":true}));
     }
-    s.store.lock()?.execute(
-        "UPDATE remote_cache_tasks SET expires_at=unixepoch()+? WHERE id=? AND completed=0",
-        params![LEASE, id],
-    )?;
+    {
+        let db = s.store.lock()?;
+        let lease = task_lease(&db, lib, id)?;
+        db.execute(
+            "UPDATE remote_cache_tasks SET expires_at=unixepoch()+? WHERE id=? AND completed=0",
+            params![lease, id],
+        )?;
+    }
     ensure!(
         s.jobs.folders()?.iter().any(|folder| folder.active
             && folder.library_id == lib
@@ -898,6 +918,16 @@ mod tests {
                 .1,
             "asset"
         );
+        {
+            let db = store.lock()?;
+            let (id, remaining): (String, i64) = db.query_row(
+                "SELECT id,expires_at-unixepoch() FROM remote_cache_tasks",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert!((IMPORT_LEASE - 1..=IMPORT_LEASE).contains(&remaining));
+            assert_eq!(task_lease(&db, "lib", &id)?, IMPORT_LEASE);
+        }
         store
             .lock()?
             .execute("DELETE FROM remote_cache_tasks", [])?;

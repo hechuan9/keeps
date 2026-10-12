@@ -39,8 +39,16 @@ pub fn run(
             run_claimed(&store, &jobs, &previews, &job, &stop)?;
             worked = true;
         }
-        if !worked && !stop.load(Ordering::Relaxed) {
-            worked = crate::browse_cache::process_next(&store, &previews)?;
+        if !stop.load(Ordering::Relaxed) {
+            match crate::cache_pipeline::process_import_media(&store, &jobs, &previews) {
+                Ok(did_work) => worked |= did_work,
+                Err(error) => {
+                    tracing::error!(error=%format!("{error:#}"), "NAS import media queue failed")
+                }
+            }
+        }
+        if !stop.load(Ordering::Relaxed) {
+            worked |= crate::browse_cache::process_next(&store, &previews)?;
         }
         if !worked && !stop.load(Ordering::Relaxed) && Instant::now() >= next_maintenance {
             crate::cache_pipeline::maintain(&store, &jobs, &previews, &stop)?;
