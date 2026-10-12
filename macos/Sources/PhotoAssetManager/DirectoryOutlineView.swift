@@ -119,6 +119,18 @@ struct DirectoryOutlineView: NSViewRepresentable {
             guard index >= 0, let item = item(atRow: index) else { return nil }
             return contextMenuForItem?(item)
         }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let hit = super.hitTest(point) else { return nil }
+            // 右键由目录树按整行定位，避免箭头或文字控件截获上下文菜单事件。
+            if NSApp.currentEvent?.type == .rightMouseDown { return self }
+            return hit
+        }
+
+        override func rightMouseDown(with event: NSEvent) {
+            guard let menu = menu(for: event) else { return }
+            NSMenu.popUpContextMenu(menu, with: event, for: self)
+        }
     }
 
     final class DirectoryNameLabel: NSTextField {
