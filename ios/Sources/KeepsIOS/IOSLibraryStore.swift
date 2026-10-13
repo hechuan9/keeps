@@ -30,7 +30,7 @@ final class IOSLibraryStore: ObservableObject {
     @Published var showingTrash = false
     @Published var showingPicked = false
     @Published var directory: String?
-    private(set) var database: KeepsLibraryDatabase?
+    @Published private(set) var hasLocalCatalog = false
     let sort = "capture_desc"
     var chronologicalAssets: [KeepsAsset] { assets.reversed() }
     private var nextCursor: String?
@@ -75,7 +75,7 @@ final class IOSLibraryStore: ObservableObject {
         initialReadTask?.cancel()
         initialReadTask = nil
         isLoadingLocal = false
-        database = nil
+        hasLocalCatalog = false
         assets = []
         timeline = []
         visibleIDs = []
@@ -92,18 +92,15 @@ final class IOSLibraryStore: ObservableObject {
         self.configuration = configuration
         guard let configuration else { return }
         restoreTrashCleanup(configuration)
-        do {
-            database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseDirectory)
-            isLoadingLocal = true
-            let currentGeneration = generation
-            initialReadTask = Task { [weak self] in
-                guard let self, generation == currentGeneration, !Task.isCancelled else { return }
-                await readLocal()
-                guard generation == currentGeneration else { return }
-                isLoadingLocal = false
-                initialReadTask = nil
-            }
-        } catch { lastError = String(reflecting: error) }
+        isLoadingLocal = true
+        let currentGeneration = generation
+        initialReadTask = Task { [weak self] in
+            guard let self, generation == currentGeneration, !Task.isCancelled else { return }
+            await readLocal()
+            guard generation == currentGeneration else { return }
+            isLoadingLocal = false
+            initialReadTask = nil
+        }
     }
 
     private func trashCleanupKey(_ configuration: KeepsConfiguration) -> String {
@@ -242,7 +239,7 @@ final class IOSLibraryStore: ObservableObject {
         await waitForLocalLoad()
         let request = query
         if displayedQuery == request, assets.contains(where: { $0.id == asset.id }) { return true }
-        guard let configuration, database != nil else { return false }
+        guard let configuration else { return false }
         readSequence += 1
         paging = false
         let sequence = readSequence
@@ -308,7 +305,7 @@ final class IOSLibraryStore: ObservableObject {
     }
 
     private func readLocal() async {
-        guard let configuration, database != nil else { return }
+        guard let configuration else { return }
         readSequence += 1
         paging = false
         let sequence = readSequence
@@ -318,6 +315,7 @@ final class IOSLibraryStore: ObservableObject {
         var request = currentQuery
         request.limit = sameQuery ? max(200, loadedCount) : 200
         do {
+            let hasCatalog = try await reader.hasCatalog(configuration: configuration, root: databaseDirectory)
             let index = try await reader.timeline(configuration: configuration, root: databaseDirectory, query: currentQuery)
             let page = try await reader.page(configuration: configuration, root: databaseDirectory,
                 query: request, through: sameQuery && !canLoadNewer ? assets.last : nil,
@@ -327,6 +325,7 @@ final class IOSLibraryStore: ObservableObject {
                 layoutRevision += 1
                 canLoadNewer = false
             }
+            hasLocalCatalog = hasCatalog
             displayedQuery = currentQuery
             timelineRevision += 1
             timeline = index
@@ -364,7 +363,7 @@ final class IOSLibraryStore: ObservableObject {
         defer { syncObservers.removeValue(forKey: observerID) }
         await waitForLocalLoad()
         if let syncTask { await syncTask.value; return }
-        guard let configuration, database != nil else { return }
+        guard let configuration else { return }
         let currentGeneration = generation
         isSyncing = true
         syncError = nil
@@ -459,7 +458,7 @@ private actor IOSCatalogSynchronizer {
 }
 
 // A separate connection keeps SQLite work and snapshot decoding off the UI executor.
-private actor IOSCatalogReader {
+actor IOSCatalogReader {
     private var configuration: KeepsConfiguration?
     private var database: KeepsLibraryDatabase?
 
@@ -469,6 +468,11 @@ private actor IOSCatalogReader {
             self.configuration = configuration
         }
         return database!
+    }
+
+    func hasCatalog(configuration: KeepsConfiguration, root: URL? = nil) throws -> Bool {
+        let database = try open(configuration: configuration, root: root)
+        return try database.revision != nil && database.syncCheckpoint == nil
     }
 
     func timeline(configuration: KeepsConfiguration, root: URL?, query: KeepsAssetQuery) throws -> [KeepsTimelineEntry] {

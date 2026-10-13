@@ -48,7 +48,7 @@ struct IOSRootView: View {
         ZStack {
             Color.black.ignoresSafeArea()
             if library.configuration != nil && !galleryReady {
-                Color.black
+                startupScreen
             } else if collections {
                 NavigationStack(path: $collectionPath) {
                     IOSCollectionsView(configuration: library.configuration, navigation: directories)
@@ -116,7 +116,7 @@ struct IOSRootView: View {
             cloud.synchronize()
             if configuration == nil { Task { restoreCloudConnection() } }
             thumbnailDownload.configurationChanged(configuration)
-            directories.configure(configuration, database: library.database)
+            directories.configure(configuration)
             directories.synchronize = { await library.synchronize() }
             collectionPath = []
             library.directory = nil
@@ -149,6 +149,7 @@ struct IOSRootView: View {
         await library.waitForLocalLoad()
         guard !Task.isCancelled else { return }
         if let error = library.lastError { startupError = error; return }
+        if library.hasLocalCatalog { galleryReady = true; return }
         await thumbnailDownload.prepare(configuration: configuration, refreshLocal: { await library.refresh() }) { forceRebuild, progress in
             try await library.synchronizeChecked(forceRebuild: forceRebuild, includeThumbnails: false, progress: progress)
         }
@@ -177,17 +178,32 @@ struct IOSRootView: View {
             Color.black.ignoresSafeArea()
             VStack(spacing: 20) {
                 Text("正在打开图库").font(.title2.bold())
-                IOSOfflineProgressView(download: thumbnailDownload)
+                if library.isLoadingLocal {
+                    ProgressView().progressViewStyle(.linear)
+                    Text("正在读取本机照片目录…").foregroundStyle(.secondary)
+                } else {
+                    IOSOfflineProgressView(download: thumbnailDownload)
+                }
                 if let error = startupError ?? thumbnailDownload.error {
-                    Text(error).font(.caption).multilineTextAlignment(.center)
+                    Text("图库暂时无法打开，请重试或检查连接设置。")
+                        .multilineTextAlignment(.center)
+                    DisclosureGroup("错误详情") {
+                        ScrollView {
+                            Text(error).font(.caption).textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }.frame(maxHeight: 160)
+                    }.font(.caption)
                 }
                 if thumbnailDownload.isRunning {
                     Button("暂停") { thumbnailDownload.pause() }
-                } else {
+                } else if !library.isLoadingLocal {
                     Button("继续") {
                         startupError = nil
                         preparationAttempt += 1
-                        Task { await prepareLibrary() }
+                        Task {
+                            await library.refresh()
+                            await prepareLibrary()
+                        }
                     }
                 }
                 Text("照片目录准备好后即可浏览和滚动；缩略图自动在后台下载，缺图时显示占位图。")
@@ -519,8 +535,7 @@ final class ThumbnailBackgroundDelegate: NSObject, UIApplicationDelegate {
                         task.setTaskCompleted(success: true)
                         return
                     }
-                    let database = try KeepsLibraryDatabase(configuration: configuration)
-                    guard try database.revision != nil, try database.syncCheckpoint == nil else {
+                    guard try await IOSCatalogReader().hasCatalog(configuration: configuration) else {
                         task.setTaskCompleted(success: true)
                         return
                     }

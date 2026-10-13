@@ -15,6 +15,7 @@ final class IOSThumbnailDownload: ObservableObject {
     }
     @Published private(set) var error: String?
     @Published private(set) var cloudStatus = "数据库快照和缩略图会同步到 Keeps 的独立 iCloud 空间。"
+    private let catalog = IOSCatalogReader()
     private var registered = false
     private var configuration: KeepsConfiguration?
     private var work: Task<Void, Never>?
@@ -106,8 +107,7 @@ final class IOSThumbnailDownload: ObservableObject {
                      refreshLocal: @MainActor () async -> Void, synchronize: @MainActor (Bool, @escaping IOSOfflineProgress.Reporter) async throws -> Void) async {
         var completed = false
         do {
-            let database = try KeepsLibraryDatabase(configuration: configuration)
-            var hasCatalog = try database.revision != nil && database.syncCheckpoint == nil
+            var hasCatalog = try await catalog.hasCatalog(configuration: configuration)
             if !hasCatalog {
                 _ = try await KeepsCloudReplica.shared.restore(configuration: configuration, includeThumbnails: false, progress: { message in
                     await self.reportCloud(message, id: id)
@@ -116,7 +116,7 @@ final class IOSThumbnailDownload: ObservableObject {
                 })
                 try Task.checkCancellation()
                 await refreshLocal()
-                hasCatalog = try database.revision != nil && database.syncCheckpoint == nil
+                hasCatalog = try await catalog.hasCatalog(configuration: configuration)
             }
             try Task.checkCancellation()
             guard runID == id else { return }
@@ -127,7 +127,7 @@ final class IOSThumbnailDownload: ObservableObject {
                 }
             }
             try Task.checkCancellation()
-            completed = try database.revision != nil && database.syncCheckpoint == nil
+            completed = try await catalog.hasCatalog(configuration: configuration)
 
         } catch {
             if !Task.isCancelled {

@@ -2,6 +2,24 @@ import Combine
 import Foundation
 import KeepsAPI
 
+private actor IOSDirectoryReader {
+    private let configuration: KeepsConfiguration
+    private let rootDirectory: URL?
+    private var database: KeepsLibraryDatabase?
+
+    init(configuration: KeepsConfiguration, rootDirectory: URL?) {
+        self.configuration = configuration
+        self.rootDirectory = rootDirectory
+    }
+
+    func directories(at path: String?) throws -> [KeepsNavigationDirectory]? {
+        if database == nil {
+            database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: rootDirectory)
+        }
+        return try database?.navigation(path: path)?.directories
+    }
+}
+
 @MainActor
 final class IOSDirectoryStore: ObservableObject {
     struct Entry {
@@ -12,35 +30,55 @@ final class IOSDirectoryStore: ObservableObject {
 
     @Published private var entries: [String?: Entry] = [:]
     private var configuration: KeepsConfiguration?
-    private var database: KeepsLibraryDatabase?
+    private var rootDirectory: URL?
+    private var reader: IOSDirectoryReader?
+    private var requests: [String?: UUID] = [:]
     var synchronize: (() async -> Void)?
 
-    func configure(_ configuration: KeepsConfiguration?, database: KeepsLibraryDatabase?) {
-        guard self.configuration != configuration || self.database !== database else { return }
+    func configure(_ configuration: KeepsConfiguration?, rootDirectory: URL? = nil) {
+        guard self.configuration != configuration || self.rootDirectory != rootDirectory else { return }
         self.configuration = configuration
-        self.database = database
+        self.rootDirectory = rootDirectory
+        reader = configuration.map { IOSDirectoryReader(configuration: $0, rootDirectory: rootDirectory) }
+        requests = [:]
         entries = [:]
     }
 
     func state(for path: String?, configuration: KeepsConfiguration?) -> Entry {
         guard self.configuration == configuration else { return Entry() }
-        if let entry = entries[path] { return entry }
-        return read(path)
+        return entries[path] ?? Entry(loading: reader != nil)
     }
 
     func load(configuration: KeepsConfiguration?, path: String?, force: Bool = false) async {
-        guard self.configuration == configuration else { return }
+        guard self.configuration == configuration, let reader else { return }
+        let request = UUID()
+        requests[path] = request
+        var entry = entries[path] ?? Entry()
+        entry.loading = true
+        entry.error = nil
+        entries[path] = entry
         if force { await synchronize?() }
-        entries[path] = read(path)
+        guard requests[path] == request else { return }
+        do {
+            let directories = try await reader.directories(at: path)
+            guard requests[path] == request else { return }
+            entries[path] = Entry(directories: directories)
+        } catch {
+            guard requests[path] == request else { return }
+            entry.loading = false
+            entry.error = String(reflecting: error)
+            entries[path] = entry
+        }
     }
 
     func reload() {
-        for path in Array(entries.keys) { entries[path] = read(path) }
-        objectWillChange.send()
-    }
-
-    private func read(_ path: String?) -> Entry {
-        do { return Entry(directories: try database?.navigation(path: path)?.directories) }
-        catch { return Entry(error: String(reflecting: error)) }
+        let configuration = configuration
+        let reader = reader
+        for path in Array(entries.keys) {
+            Task {
+                guard self.reader === reader else { return }
+                await load(configuration: configuration, path: path)
+            }
+        }
     }
 }

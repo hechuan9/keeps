@@ -6,10 +6,36 @@ import KeepsAPI
 
 @MainActor
 struct IOSLibraryStoreTests {
+    @Test func startupReturnsBeforeDatabaseIOAndReportsFailureAsynchronously() async throws {
+        let root = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data("not a directory".utf8).write(to: root)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let configuration = KeepsConfiguration(baseURL: URL(string: "https://example.invalid")!, libraryID: "test")
+        let store = IOSLibraryStore(configuration: configuration, loadSettings: false, databaseDirectory: root)
+        #expect(store.isLoadingLocal)
+        #expect(store.lastError == nil)
+        await store.waitForLocalLoad()
+        #expect(!store.isLoadingLocal)
+        #expect(store.lastError != nil)
+        #expect(!store.hasLocalCatalog)
+    }
+
+    @Test func cachedCatalogBecomesReadyWithoutNetwork() async throws {
+        let fixture = ReplicaFixture()
+        fixture.offline = true
+        let database = try fixture.database()
+        try database.ingest([fixture.asset(1)])
+        try database.completeSync(revision: 1, isStable: true)
+        let store = await fixture.store()
+        #expect(store.hasLocalCatalog)
+        #expect(store.timeline.count == 1)
+        #expect(fixture.requests.isEmpty)
+    }
+
     @Test func fullTimelineSupportsDirectDistantPhotoLookupWithoutPagingOrNetwork() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.ingest((1...30_000).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...30_000).map { try fixture.asset($0) })
         await store.refresh()
         #expect(store.timeline.count == 30_000)
         #expect(store.assets.count == 200)
@@ -65,8 +91,7 @@ struct IOSLibraryStoreTests {
 
     @Test func initialLocalLoadIsAsynchronousAndConfigurationSwitchDiscardsIt() async throws {
         let fixture = ReplicaFixture()
-        let seeded = await fixture.store()
-        try seeded.database?.ingest((1...450).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...450).map { try fixture.asset($0) })
         let store = IOSLibraryStore(configuration: fixture.configuration, session: fixture.session, databaseDirectory: fixture.root)
         #expect(store.isLoadingLocal)
         #expect(!store.hasLoadedResults)
@@ -87,7 +112,7 @@ struct IOSLibraryStoreTests {
     @Test func coldLaunchAndLocalBrowsingNeedNoNetwork() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        let database = try #require(store.database)
+        let database = try fixture.database()
         try database.beginSync()
         try database.ingest((1...450).map { try fixture.asset($0) })
         try database.completeSync(revision: 1, isStable: true)
@@ -109,7 +134,7 @@ struct IOSLibraryStoreTests {
     @Test func refreshKeepsLoadedPhotosWhenNewPhotosArrive() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        let database = try #require(store.database)
+        let database = try fixture.database()
         try database.beginSync()
         try database.ingest((1...450).map { try fixture.asset($0) })
         await store.refresh()
@@ -141,12 +166,11 @@ struct IOSLibraryStoreTests {
 
     @Test func pagingUsesTheDisplayedBoundaryWhileBackgroundAddsNewerRows() async throws {
         let fixture = ReplicaFixture()
-        let seeded = await fixture.store()
-        try seeded.database?.ingest((1...450).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...450).map { try fixture.asset($0) })
         let browsing = await fixture.store()
         var new = try fixture.asset(999)
         new.captureTime = "2026-02-01"
-        try browsing.database?.ingest([new])
+        try fixture.database().ingest([new])
         await browsing.loadMore()
         #expect(browsing.assets.map(\.id) == (1...400).map { try! fixture.asset($0).id })
         await browsing.loadMore()
@@ -157,7 +181,7 @@ struct IOSLibraryStoreTests {
     @Test func browsingWindowStaysBoundedAndCanReturnToNewest() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.ingest((1...2400).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...2400).map { try fixture.asset($0) })
         await store.refresh()
         for _ in 0..<11 { await store.loadMore() }
         #expect(store.assets.count == 1000)
@@ -177,7 +201,7 @@ struct IOSLibraryStoreTests {
     @Test func restoresEvictedAnchorsWithCorrectBidirectionalBoundaries() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.ingest((1...2400).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...2400).map { try fixture.asset($0) })
         await store.refresh()
         #expect(await store.restoreWindow(around: try fixture.asset(1200)))
         #expect(store.assets.map(\.id) == (1000...1399).map { try! fixture.asset($0).id })
@@ -199,7 +223,7 @@ struct IOSLibraryStoreTests {
     @Test func restorationDoesNotResurrectMissingOrFilteredPhotosOrOverwriteNewScope() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.ingest((1...600).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...600).map { try fixture.asset($0) })
         await store.refresh()
         #expect(!(await store.restoreWindow(around: try fixture.asset(999))))
         store.search = "photo-600"
@@ -219,7 +243,7 @@ struct IOSLibraryStoreTests {
     @Test func overlappingPagingAndFilterChangesDoNotPublishStaleResults() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.ingest((1...600).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...600).map { try fixture.asset($0) })
         await store.refresh()
         async let first: Void = store.loadMore()
         async let duplicate: Void = store.loadMore()
@@ -240,7 +264,7 @@ struct IOSLibraryStoreTests {
         let store = await fixture.store()
         await store.synchronize()
         #expect(store.assets.count == 1)
-        #expect(try store.database?.revision == 1)
+        #expect(try fixture.database().revision == 1)
         let requests = fixture.requests.count
         let reopened = await fixture.store()
         #expect(reopened.assets.count == 1)
@@ -257,17 +281,17 @@ struct IOSLibraryStoreTests {
         let fixture = ReplicaFixture()
         fixture.updating = true
         let store = await fixture.store()
-        try store.database?.ingest([fixture.asset(99)])
+        try fixture.database().ingest([fixture.asset(99)])
         await store.synchronize()
         #expect(store.syncError == nil)
         #expect(store.assets.map(\.originalFilename) == ["photo-1"])
-        #expect(try store.database?.revision == 1)
+        #expect(try fixture.database().revision == 1)
         #expect(fixture.requests.count == 3)
         #expect(fixture.requests[0].contains("revision"))
         #expect(fixture.requests[1] == "POST /libraries/library/offline-rebuild")
         #expect(fixture.requests[2].hasSuffix("/download"))
-        #expect(try store.database?.hiddenDirectories() == ["/private"])
-        #expect(try store.database?.navigation() != nil)
+        #expect(try fixture.database().hiddenDirectories() == ["/private"])
+        #expect(try fixture.database().navigation() != nil)
         store.showingTrash = true
         await store.refresh()
         #expect(store.assets.map(\.originalFilename) == ["photo-2"])
@@ -276,7 +300,7 @@ struct IOSLibraryStoreTests {
     @Test func failedDownloadPreservesExistingCatalogAndRevision() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        let database = try #require(store.database)
+        let database = try fixture.database()
         try database.beginSync()
         try database.ingest([fixture.asset(99)])
         try database.completeSync(revision: 0, isStable: true)
@@ -294,9 +318,9 @@ struct IOSLibraryStoreTests {
     @Test func cancellationBeforeDownloadCompletesPreservesOldCatalogAndCanRetry() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        try store.database?.beginSync()
-        try store.database?.ingest([fixture.asset(99)])
-        try store.database?.completeSync(revision: 0, isStable: true)
+        try fixture.database().beginSync()
+        try fixture.database().ingest([fixture.asset(99)])
+        try fixture.database().completeSync(revision: 0, isStable: true)
         await store.refresh()
         ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
         let sync = Task { await store.synchronize() }
@@ -309,7 +333,7 @@ struct IOSLibraryStoreTests {
         await sync.value
         #expect(!store.isSyncing)
         #expect(store.syncError == nil)
-        #expect(try store.database?.revision == 0)
+        #expect(try fixture.database().revision == 0)
         #expect(store.assets.map(\.originalFilename) == ["photo-99"])
         await store.synchronize()
         #expect(store.syncError == nil)
@@ -319,10 +343,10 @@ struct IOSLibraryStoreTests {
     @Test func firstSynchronizationCanBuildTimelineWithoutBundledThumbnails() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
-        #expect(try store.database?.revision == nil)
+        #expect(try fixture.database().revision == nil)
         try await store.synchronizeChecked(includeThumbnails: false)
         #expect(fixture.thumbnailModes == [false])
-        #expect(try store.database?.revision == 1)
+        #expect(try fixture.database().revision == 1)
         #expect(store.timeline.map(\.id) == [try fixture.asset(1).id])
         #expect(store.timeline.first?.thumbnail == nil)
         #expect(store.timeline.first?.browseThumbnail == nil)
@@ -335,10 +359,10 @@ struct IOSLibraryStoreTests {
         let store = await fixture.store()
         await store.synchronize()
         #expect(fixture.thumbnailModes == [true])
-        try store.database?.completeSync(revision: 0, isStable: true)
+        try fixture.database().completeSync(revision: 0, isStable: true)
         await store.synchronize()
         #expect(fixture.thumbnailModes == [true, false])
-        try store.database?.beginSync(checkpoint: .init(revision: 1, stable: true))
+        try fixture.database().beginSync(checkpoint: .init(revision: 1, stable: true))
         await store.synchronize()
         #expect(fixture.thumbnailModes == [true, false, true])
     }
@@ -355,12 +379,11 @@ struct IOSLibraryStoreTests {
 
     @Test func completedBackgroundSyncPublishesLocalChanges() async throws {
         let fixture = ReplicaFixture()
-        let seeded = await fixture.store()
-        try seeded.database?.ingest((1...450).map { try fixture.asset($0) })
+        try fixture.database().ingest((1...450).map { try fixture.asset($0) })
         let browsing = await fixture.store()
         await browsing.synchronize()
         #expect(browsing.assets.map(\.originalFilename) == ["photo-1"])
-        #expect(try browsing.database?.assets(query: KeepsAssetQuery()).items.count == 1)
+        #expect(try fixture.database().assets(query: KeepsAssetQuery()).items.count == 1)
         await browsing.refresh()
         #expect(browsing.assets.map(\.originalFilename) == ["photo-1"])
     }
@@ -371,7 +394,7 @@ struct IOSLibraryStoreTests {
         let store = await fixture.store()
         await store.synchronize()
         #expect(store.syncError != nil)
-        #expect(try store.database?.revision == nil)
+        #expect(try fixture.database().revision == nil)
         #expect(fixture.requests.count == 2)
         #expect(!fixture.requests.contains { $0.contains("/assets") || $0.contains("navigation") })
     }
@@ -427,6 +450,9 @@ private final class ReplicaFixture: @unchecked Sendable {
         ReplicaProtocol.remove(host: configuration.baseURL.host!)
         session.invalidateAndCancel()
         try? FileManager.default.removeItem(at: root)
+    }
+    func database() throws -> KeepsLibraryDatabase {
+        try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root)
     }
     @MainActor func store() async -> IOSLibraryStore {
         let store = IOSLibraryStore(configuration: configuration, session: session, databaseDirectory: root)
