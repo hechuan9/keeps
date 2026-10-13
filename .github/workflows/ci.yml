@@ -52,6 +52,8 @@ jobs:
       - run: swift test --package-path macos
       - run: swift test --package-path macos/ColorTools
       - run: bash macos/scripts/package_app.sh
+      - name: Build macOS Xcode app
+        run: xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO build
       - name: Build iOS Simulator
         run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
       - name: Test release scripts without credentials
