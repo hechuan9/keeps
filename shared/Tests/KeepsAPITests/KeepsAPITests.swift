@@ -7,6 +7,35 @@ private let assetJSON = """
 """
 
 struct KeepsAPITests {
+    @Test func videoTrimPreservesRequestIdentityAndDecodesTask() async throws {
+        let assetID = UUID()
+        let trim = KeepsVideoTrimRequest(contentHash: "source-hash", startSeconds: 1.25, endSeconds: 8.75)
+        let fixture = Fixture { request in
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")
+            let path = "/api/libraries/library/assets/\(assetID.uuidString)/video-trims"
+            if request.httpMethod == "POST" {
+                #expect(request.url?.path == path)
+                let body = try JSONDecoder().decode(KeepsVideoTrimRequest.self, from: request.bodyData)
+                #expect(body.id == trim.id)
+                #expect(body.contentHash == trim.contentHash)
+                #expect(body.startSeconds == 1.25)
+                #expect(body.endSeconds == 8.75)
+            } else {
+                #expect(request.httpMethod == "GET")
+                #expect(request.url?.path == path + "/" + trim.id.uuidString)
+            }
+            return (202, """
+            {"id":"\(trim.id)","assetID":"\(assetID)","contentHash":"source-hash","startSeconds":1.25,"endSeconds":8.75,"status":"indexing","error":null,"newAssetID":null,"outputPath":"/photos/clip.mp4"}
+            """)
+        }
+        #expect(try await fixture.client.trimVideo(assetID: assetID, trim: trim).id == trim.id)
+        #expect(try await fixture.client.trimVideo(assetID: assetID, trim: trim).id == trim.id)
+        let task = try await fixture.client.videoTrim(assetID: assetID, id: trim.id)
+        #expect(task.status == "indexing")
+        #expect(task.assetID == assetID)
+        #expect(task.outputPath == "/photos/clip.mp4")
+    }
+
     @Test func videoPlaybackRequestsSignedURLWithAuthentication() async throws {
         let id = UUID()
         let hash = String(repeating: "a", count: 64)

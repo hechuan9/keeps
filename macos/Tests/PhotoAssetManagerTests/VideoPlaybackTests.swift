@@ -8,6 +8,28 @@ import SwiftUI
 
 @MainActor
 struct VideoPlaybackTests {
+    @Test func resumesPersistedTrimWithoutCreatingAnotherRequest() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CompletedTrimProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = KeepsClient(configuration: KeepsConfiguration(baseURL: URL(string: "https://trim.invalid")!, libraryID: "test"), session: session)
+        let asset = try JSONDecoder().decode(KeepsAsset.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","cameraMake":"","cameraModel":"","lensModel":"","originalFilename":"synthetic.mp4","contentFingerprint":"test","metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2026-01-01","updatedAt":"2026-01-01","trashed":false}"#.utf8))
+        let key = "video-trim:https://trim.invalid:test:" + asset.id.uuidString
+        let request = KeepsVideoTrimRequest(id: CompletedTrimProtocol.requestID, contentHash: "hash", startSeconds: 1, endSeconds: 2)
+        UserDefaults.standard.set(try JSONEncoder().encode(request), forKey: key)
+        defer { UserDefaults.standard.removeObject(forKey: key) }
+        let store = VideoPlaybackStore()
+        defer { store.close() }
+        store.open(asset: asset, client: client)
+        try await waitUntil { !store.trimBusy }
+        #expect(store.savedAssetID == CompletedTrimProtocol.newAssetID)
+        #expect(store.trimError == nil)
+        #expect(!store.hasPendingTrim)
+        #expect(!store.canSaveTrim)
+        #expect(UserDefaults.standard.data(forKey: key) == nil)
+    }
+
     @Test func rendersNativePlayerInHostingWindow() throws {
         _ = NSApplication.shared
         let player = AVPlayer()
@@ -68,6 +90,34 @@ struct VideoPlaybackTests {
         let reached = await player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         #expect(reached)
         try await waitUntil { player.currentTime().seconds > target + 0.1 }
+        try await waitUntil { store.duration > 0 }
+        store.trimStart = 0.25
+        store.trimEnd = min(1.0, store.duration)
+        #expect(store.validTrim)
+        store.previewTrim()
+        #expect(item.forwardPlaybackEndTime.seconds == store.trimEnd)
+        store.endTrimPreview()
+        #expect(!item.forwardPlaybackEndTime.isValid)
+        store.trimStart = store.trimEnd
+        #expect(!store.validTrim)
+        store.trimStart = -.infinity
+        #expect(!store.validTrim)
+        if ProcessInfo.processInfo.environment["KEEPS_TEST_VIDEO_TRIM"] == "1" {
+            store.trimStart = 0.25
+            store.trimEnd = 1.25
+            store.saveTrim()
+            try await waitUntil { !store.trimBusy }
+            #expect(store.trimError == nil)
+            let savedID = try #require(store.savedAssetID)
+            #expect(savedID != asset.id)
+            #expect(try await client.asset(id: asset.id).trashed)
+            let saved = try await client.asset(id: savedID)
+            #expect(!saved.trashed)
+            #expect(saved.originalFilename.hasSuffix(".mp4"))
+            store.openSavedVideo()
+            try await waitUntil { store.title == saved.originalFilename && store.duration > 0 }
+            #expect(abs(store.duration - 1.0) < 0.25)
+        }
         store.close()
         #expect(store.player == nil)
         #expect(player.currentItem == nil)
@@ -114,6 +164,42 @@ private final class DeniedPlaybackProtocol: URLProtocol, @unchecked Sendable {
             : #"{"detail":"playback denied"}"#
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: isVersions ? 200 : 403, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+private final class CompletedTrimProtocol: URLProtocol, @unchecked Sendable {
+    static let requestID = UUID(uuidString: "00000000-0000-0000-0000-000000000002")!
+    static let newAssetID = UUID(uuidString: "00000000-0000-0000-0000-000000000003")!
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let trim = request.url!.path.hasSuffix("/video-trims")
+        var body = Data()
+        if let data = request.httpBody { body = data }
+        else if let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 { break }
+                body.append(buffer, count: count)
+            }
+        }
+        if trim {
+            #expect(request.httpMethod == "POST")
+            let submitted = try? JSONDecoder().decode(KeepsVideoTrimRequest.self, from: body)
+            #expect(submitted?.id == Self.requestID)
+        }
+        let json = trim
+            ? """
+              {"id":"\(Self.requestID)","assetID":"00000000-0000-0000-0000-000000000001","contentHash":"hash","startSeconds":1,"endSeconds":2,"status":"completed","newAssetID":"\(Self.newAssetID)"}
+              """
+            : "{}"
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: trim ? 202 : 403, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(json.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}

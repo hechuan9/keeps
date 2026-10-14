@@ -36,3 +36,5 @@ pub mod rejected_trash;
 mod database;
 
 pub mod background;
+
+pub mod video_trim;

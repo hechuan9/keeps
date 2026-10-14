@@ -98,6 +98,10 @@ async fn main() -> Result<()> {
         let (jobs, stop) = (jobs.clone(), stop.clone());
         move || keeps_server::imports::run(jobs, stop)
     })?;
+    let mut video_trim = keeps_server::background::spawn("video_trim", {
+        let (jobs, store, stop) = (jobs.clone(), store.clone(), stop.clone());
+        move || keeps_server::video_trim::run(jobs, store, stop)
+    })?;
     tracing::info!(%address, "Keeps Rust server started");
     let http = axum::serve(
         listener,
@@ -118,11 +122,12 @@ async fn main() -> Result<()> {
         }
     });
     tokio::select! {
-        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;}
-        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
-        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_move.await??;imports.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
-        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;imports.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
-        result=&mut imports=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;if !stopping {bail!("Import worker exited unexpectedly");}}
+        result=http=>{stop.store(true,Ordering::Relaxed);result?;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;video_trim.await??;}
+        result=&mut worker=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;directory_trash.await??;directory_move.await??;imports.await??;video_trim.await??;if !stopping {bail!("NAS worker exited unexpectedly");}}
+        result=&mut directory_trash=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_move.await??;imports.await??;video_trim.await??;if !stopping {bail!("Directory recycling worker exited unexpectedly");}}
+        result=&mut directory_move=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;imports.await??;video_trim.await??;if !stopping {bail!("Directory move worker exited unexpectedly");}}
+        result=&mut video_trim=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;imports.await??;if !stopping {bail!("Video trim worker exited unexpectedly");}}
+        result=&mut imports=>{let stopping=stop.swap(true,Ordering::Relaxed);result??;worker.await??;directory_trash.await??;directory_move.await??;video_trim.await??;if !stopping {bail!("Import worker exited unexpectedly");}}
     }
     Ok(())
 }

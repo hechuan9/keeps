@@ -48,6 +48,12 @@ public final class KeepsClient: Sendable {
               playback.playbackURL.host != nil else { throw KeepsAPIError.invalidResponse }
         return playback
     }
+    public func trimVideo(assetID: UUID, trim: KeepsVideoTrimRequest) async throws -> KeepsVideoTrim {
+        try await request("POST", library + ["assets", assetID.uuidString, "video-trims"], body: JSONEncoder().encode(trim))
+    }
+    public func videoTrim(assetID: UUID, id: UUID) async throws -> KeepsVideoTrim {
+        try await request("GET", library + ["assets", assetID.uuidString, "video-trims", id.uuidString])
+    }
     public func downloadVersion(assetID: UUID, contentHash: String, to destination: URL) async throws {
         var request = try makeRequest("GET", library + ["assets", assetID.uuidString, "versions", contentHash, "download"])
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")

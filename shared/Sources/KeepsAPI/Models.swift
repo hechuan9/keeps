@@ -25,6 +25,32 @@ public struct KeepsVideoPlayback: Decodable, Sendable {
     public var expiresAt: TimeInterval
 }
 
+public struct KeepsVideoTrimRequest: Codable, Sendable {
+    public var id: UUID
+    public var contentHash: String
+    public var startSeconds: Double
+    public var endSeconds: Double
+
+    public init(id: UUID = UUID(), contentHash: String, startSeconds: Double, endSeconds: Double) {
+        self.id = id
+        self.contentHash = contentHash
+        self.startSeconds = startSeconds
+        self.endSeconds = endSeconds
+    }
+}
+
+public struct KeepsVideoTrim: Decodable, Sendable {
+    public var id: UUID
+    public var assetID: UUID
+    public var contentHash: String
+    public var startSeconds: Double
+    public var endSeconds: Double
+    public var status: String
+    public var error: String?
+    public var newAssetID: UUID?
+    public var outputPath: String?
+}
+
 public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var id: UUID
     public var captureTime: String?

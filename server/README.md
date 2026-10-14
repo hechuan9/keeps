@@ -75,3 +75,9 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 
 已发布调色历史通过 `GET /libraries/{library}/assets/{asset}/edit/versions` 查询；每项包含独立 `versionID`、`previousVersionID`、`sourceContentHash`、`available` 和带签名 URL 的可用媒体。`GET .../edit` 返回稳定 `rootID` 与 `currentVersionID`。照片 UUID 与文件摘要分离，替换或重置当前调色保留已发布历史，旧版本已丢失的媒体不会标为可用。
+
+## 视频时长裁剪
+
+`POST /libraries/{library}/assets/{asset}/video-trims` 接收 `{id,contentHash,startSeconds,endSeconds}`，返回 `202` 持久任务；同一 UUID 和参数幂等，参数冲突返回 409。同一原资产同时只能有一个活动裁剪。`GET .../video-trims/{id}` 查询 `{id,assetID,contentHash,startSeconds,endSeconds,status,error?,newAssetID?,outputPath?}`，状态依次为 `pending`、`processing`、`indexing`、`completed`，操作失败为 `failed`。客户端关闭不取消任务，NAS 重启后继续。
+
+NAS 先用 ffprobe 校验实际时长，再以单线程 FFmpeg 重编码 H.264/AAC MP4，保留音频、应用视频旋转及可传递的容器元数据。同目录的新文件使用独立身份和 UUID 文件名，无覆盖发布并复用索引队列。新视频确认作为独立资产入库后才把原资产标为 Keeps 回收站；原文件不移动、不删除、不覆盖。失败保留原资产；若发布后索引失败，已生成的新文件保留并在任务中返回路径。SPK 运行时必须包含 ffmpeg、ffprobe 和现有 exiftool。

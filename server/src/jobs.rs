@@ -234,6 +234,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             DROP INDEX IF EXISTS jobs_live_scope;
             CREATE UNIQUE INDEX jobs_live_scope ON jobs(folder_id,scope_path,scope_kind,work_class) WHERE status IN ('pending','running');")?;
         crate::directory_move::initialize(&db)?;
+        crate::video_trim::initialize(&db)?;
         let trash_db = Connection::open(path)?;
         trash_db.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::directory_trash::initialize(&trash_db)?;

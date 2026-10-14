@@ -71,6 +71,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let protected = Router::new()
         .merge(crate::remote_worker::router())
         .merge(crate::edits::router())
+        .merge(crate::video_trim::router())
         .merge(crate::rejected_trash::router())
         .merge(crate::imports::router())
         .merge(crate::offline_rebuild::router(state.clone()))
@@ -220,7 +221,7 @@ async fn authenticate(
     next.run(request).await
 }
 
-fn require_library(state: &AppState, library: &str) -> Result<(), ApiError> {
+pub(crate) fn require_library(state: &AppState, library: &str) -> Result<(), ApiError> {
     if library != state.library_id {
         return Err(ApiError(
             StatusCode::NOT_FOUND,
@@ -231,7 +232,7 @@ fn require_library(state: &AppState, library: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-async fn blocking<F, T>(operation: F) -> Result<T, ApiError>
+pub(crate) async fn blocking<F, T>(operation: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
@@ -276,7 +277,7 @@ fn signed_asset(state: &AppState, mut asset: Value) -> anyhow::Result<Value> {
     }
     Ok(asset)
 }
-fn asset_id(id: &str) -> Result<String, ApiError> {
+pub(crate) fn asset_id(id: &str) -> Result<String, ApiError> {
     uuid::Uuid::parse_str(id)
         .map(|id| id.to_string())
         .map_err(|_| ApiError::bad("invalid asset UUID"))

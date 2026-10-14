@@ -8,7 +8,7 @@ import tarfile
 
 COLLECT = r'''
 import glob,json,os,shutil,subprocess,sys,tarfile
-names=['keeps-server','keeps-render','keeps-inspect','exiftool','perl','heif-convert','dcraw_emu','convert','identify','ffmpeg','timeout','prlimit']
+names=['keeps-server','keeps-render','keeps-inspect','exiftool','perl','heif-convert','dcraw_emu','convert','identify','ffmpeg','ffprobe','timeout','prlimit']
 programs={n:os.path.realpath(shutil.which(n)) for n in names}
 files=set(programs.values())
 libraries={}
