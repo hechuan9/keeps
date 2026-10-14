@@ -251,8 +251,10 @@ import Testing
         try await waitForEvent("source:media-1:1", state: fixture.state)
         try await waitForEvent("source:media-2:1", state: fixture.state)
         try await waitForEvent("progress:2", state: fixture.state)
-        let deadline = ContinuousClock.now + .seconds(5)
-        while fixture.store.indexedFiles < 2, ContinuousClock.now < deadline { await Task.yield() }
+        let deadline = ContinuousClock.now + .seconds(30)
+        while fixture.store.indexedFiles < 2, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
         #expect(fixture.store.indexedFiles >= 2)
         #expect(!fixture.state.snapshot().events.contains("claim:media-3"))
         fixture.store.pause()
@@ -293,12 +295,14 @@ import Testing
     }
 
     private func waitForEvent(_ event: String, state: ImportScenario) async throws {
-        let deadline = ContinuousClock.now + .seconds(5)
-        while ContinuousClock.now < deadline {
-            if state.snapshot().events.contains(event) { return }
-            await Task.yield()
+        // These gates verify ordering, not latency; leave the main actor available to drive imports.
+        let deadline = ContinuousClock.now + .seconds(30)
+        while !state.snapshot().events.contains(event) {
+            guard ContinuousClock.now < deadline else {
+                throw NSError(domain: "ImportStoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "未收到 HTTP 闸门事件：" + event])
+            }
+            try await Task.sleep(for: .milliseconds(5))
         }
-        throw NSError(domain: "ImportStoreTests", code: 2, userInfo: [NSLocalizedDescriptionKey: "未收到 HTTP 闸门事件：" + event])
     }
 
     private func makeFixture(failUpload: Bool = false, failFinish: Bool = false, skipFirst: Bool = false, publishing: Bool = false, failPrepare: Bool = false, failPublication: Bool = false, acceptFailedUpload: Bool = false, gatedPipeline: Bool = false, parallelMedia: Bool = false, persistenceDirectory: URL? = nil) throws -> (root: URL, store: ImportStore, state: ImportScenario) {
