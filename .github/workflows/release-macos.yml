@@ -8,19 +8,39 @@ on:
 
 permissions:
   contents: read
-
-concurrency:
-  group: macos-testflight
-  cancel-in-progress: false
-  queue: max
+  actions: read
 
 jobs:
-  release:
+  eligibility:
+    name: Check macOS release scope
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_branch == 'main' &&
       github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    outputs:
+      release: ${{ steps.scope.outputs.release }}
+    steps:
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          eligible=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$CI_RUN_ID/jobs?per_page=100" --jq '[.jobs[] | select(.name == "macOS" and .conclusion == "success")] | length > 0')
+          echo "release=$eligible" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: Archive and upload
+    needs: eligibility
+    if: needs.eligibility.outputs.release == 'true'
+    # Keep one pending upload; never interrupt an upload already in progress.
+    concurrency:
+      group: macos-testflight
+      cancel-in-progress: false
+    outputs:
+      build: ${{ steps.version.outputs.build }}
+      version: ${{ steps.version.outputs.version }}
     runs-on: macos-15
     environment: macos-testflight
     timeout-minutes: 90
@@ -33,6 +53,7 @@ jobs:
           ref: ${{ github.event.workflow_run.head_sha }}
           persist-credentials: false
       - name: Validate toolchain and release version
+        id: version
         run: |
           test "$(uname -m)" = arm64
           xcodebuild -version
@@ -41,6 +62,7 @@ jobs:
           MARKETING_VERSION=$(awk '$1 == "MARKETING_VERSION" { print $3 }' macos/Version.xcconfig)
           test -n "$MARKETING_VERSION"
           printf 'BUILD_NUMBER=%s\nMARKETING_VERSION=%s\n' "$BUILD_NUMBER" "$MARKETING_VERSION" >> "$GITHUB_ENV"
+          printf 'build=%s\nversion=%s\n' "$BUILD_NUMBER" "$MARKETING_VERSION" >> "$GITHUB_OUTPUT"
       - name: Install App Store Connect client runtime
         run: brew install uv
       - name: Check for an existing upload
@@ -131,12 +153,8 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
           ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
         run: bash scripts/testflight.sh macos upload
-      - name: Wait for Apple processing
-        env:
-          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
-          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
-        run: uv run --script scripts/app_store_connect.py macos wait --build "$BUILD_NUMBER" --version "$MARKETING_VERSION"
+      - name: Report upload completion
+        run: echo "Uploaded macOS $MARKETING_VERSION ($BUILD_NUMBER). Apple availability is checked by the separate processing job." >> "$GITHUB_STEP_SUMMARY"
       - name: Clean up signing material
         if: always()
         run: |
@@ -148,3 +166,29 @@ jobs:
           if test -n "${MACOS_INSTALLED_PROFILE:-}"; then
             rm -f "$MACOS_INSTALLED_PROFILE"
           fi
+
+  processing:
+    name: Confirm TestFlight availability
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: macos-testflight
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'PyJWT[crypto]>=2.10,<3'
+      - name: Wait for this build to become installable
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.ASC_PRIVATE_KEY }}
+          BUILD_NUMBER: ${{ needs.release.outputs.build }}
+          MARKETING_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          python scripts/app_store_connect.py macos wait --build "$BUILD_NUMBER" --version "$MARKETING_VERSION"
+          echo "macOS $MARKETING_VERSION ($BUILD_NUMBER) is available for internal TestFlight testing." >> "$GITHUB_STEP_SUMMARY"

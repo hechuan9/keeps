@@ -83,7 +83,7 @@ TestFlight 构建有效期为 90 天，需要持续发布新构建。该渠道�
 
 ## GitHub CI
 
-`.github/workflows/ci.yml` 在 main push、所有 PR 和手动触发时运行：Rust 格式、Clippy 和测试；共享 Swift 与 macOS 测试、开发打包、iOS Simulator 构建；Python 控制平面与迁移测试；发布脚本测试和 Gitleaks 密钥扫描。工作流只授予仓库读取权限，不上传 TestFlight，也不需要 Apple 或 NAS 凭据。
+`.github/workflows/ci.yml` 在 main push、所有 PR 和手动触发时运行。push 按上一次成功 CI 至当前提交的变化选择 Rust、Python、共享 Swift、macOS 与 iOS 检查，避免漏掉被取消或失败的提交；PR 按分支差异选择，手动触发运行全部检查。Apple 平台与共享库并行验证，SwiftPM/Xcode Debug 和 Cargo 使用工具链隔离的构建缓存；密钥扫描及发布脚本测试每次运行。CI 仅有读取权限，不持有 Apple 或 NAS 凭据；纯服务端修改不会触发 macOS TestFlight 发布。
 
 本机 API 查询：`codex-secret run app-store-connect -- bash scripts/testflight.sh macos status`（iOS 将 `macos` 换为 `ios`）。同一入口支持 `archive` 和 `upload`，私钥由加密凭据库注入。
 

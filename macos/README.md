@@ -28,7 +28,7 @@ bash scripts/package_app.sh
 
 ## TestFlight 分发
 
-`.github/workflows/release-macos.yml` 在同仓库 main 的 push CI 全部通过后自动发布该提交，构建号采用 CI run number 加 100（不回写仓库）。发布使用独立队列，固定下载并校验 AI 运行时；上传后按目标版本和构建号等待内部测试可用，超时会明确失败，不把旧构建当作本次发布成功。
+`.github/workflows/release-macos.yml` 在同仓库 main 的 push CI 全部通过且本次 macOS 检查实际运行后发布该提交；纯服务端和纯文档修改跳过。构建号仍为 CI run number 加 100（不回写仓库）。归档与上传共用单独队列，只保留一个待执行构建，新入队任务替换旧待执行任务，不中断已经开始的上传。上传完成即释放队列并清理签名材料；随后独立 Linux 任务按目标版本和构建号等待 Apple 确认可安装，失败或超时仍明确报错，不把“上传完成”当作分发完成。
 
 启用前需配置 GitHub `macos-testflight` environment，仅允许 main，并配置 `ASC_KEY_ID`、`ASC_ISSUER_ID`、`ASC_PRIVATE_KEY`、`MACOS_SIGNING_P12_BASE64`、`MACOS_SIGNING_P12_PASSWORD`、`MACOS_PROVISIONING_PROFILE_BASE64`。分发 profile 必须为 `local.keeps` 的 Mac App Store profile，并关联 P12 内的分发证书；导出使用本地证书手动签名，证书或 profile 到期前须更新对应 secret。P12 必须包含构建所需开发签名以及 Mac App Distribution、Mac Installer Distribution 身份和私钥；API Key 须有对应应用上传及 provisioning 权限。临时 Keychain 与证书文件在任务结束时清理。PR 和 fork 不获得发布凭据；有 main 写入权限者仍属于发布信任范围，应配合分支保护管理。
 

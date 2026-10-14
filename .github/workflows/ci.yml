@@ -14,24 +14,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  server:
-    name: Rust server
+  scope:
+    name: Changed components
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      server: ${{ steps.scope.outputs.server }}
+      python: ${{ steps.scope.outputs.python }}
+      shared: ${{ steps.scope.outputs.shared }}
+      macos: ${{ steps.scope.outputs.macos }}
+      ios: ${{ steps.scope.outputs.ios }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - name: Install Rust toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
-      - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
-      - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
-      - run: cargo +stable test --manifest-path server/Cargo.toml --locked
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci_scope.py
 
-  apple:
-    name: Apple clients and release scripts
+  checks:
+    name: Repository and release scripts
     runs-on: macos-15
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -43,27 +50,109 @@ jobs:
           gitleaks dir . --redact --no-banner
       - run: python macos/scripts/test_pre_merge_gate.py
       - run: python macos/scripts/test_bundle_ai_runtime.py
-      - name: Toolchain versions
-        run: |
-          swift --version
-          xcodebuild -version
-      - run: swift test --package-path shared
-      - run: swift test --package-path ios
-      - run: swift test --package-path macos
-      - run: swift test --package-path macos/ColorTools
-      - run: bash macos/scripts/package_app.sh
-      - name: Build macOS Xcode app
-        run: xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug -destination 'generic/platform=macOS' CODE_SIGNING_ALLOWED=NO build
-      - name: Build iOS Simulator
-        run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO build
+      - run: python -m unittest discover -s scripts -p 'test_ci_*.py'
       - name: Test release scripts without credentials
         run: |
           python -m pip install 'PyJWT[crypto]>=2.10,<3'
           bash -n scripts/testflight.sh
           python scripts/test_app_store_connect.py
 
+  server:
+    name: Rust server
+    needs: scope
+    if: needs.scope.outputs.server == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: Rust cache identity
+        id: rust
+        run: echo "version=$(rustc +stable --version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
+      - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
+      - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo +stable test --manifest-path server/Cargo.toml --locked
+
+  shared:
+    name: Shared Swift
+    needs: scope
+    if: needs.scope.outputs.shared == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            shared/.build
+          key: swift-shared-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('shared/**/*.swift', 'shared/Package.resolved') }}
+          restore-keys: |
+            swift-shared-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
+      - run: swift test --package-path shared
+
+  macos:
+    name: macOS
+    needs: scope
+    if: needs.scope.outputs.macos == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            macos/.build
+            macos/ColorTools/.build
+            .build/xcode-macos-ci
+          key: swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('macos/**/*.swift', 'macos/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'macos/**/*.pbxproj', 'macos/Version.xcconfig') }}
+          restore-keys: |
+            swift-macos-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
+      - run: swift test --package-path macos
+      - run: swift test --package-path macos/ColorTools
+      - run: bash macos/scripts/package_app.sh
+      - name: Build macOS Xcode app
+        run: xcodebuild -project macos/Keeps.xcodeproj -scheme Keeps -configuration Debug -destination 'generic/platform=macOS' -derivedDataPath .build/xcode-macos-ci CODE_SIGNING_ALLOWED=NO build
+
+  ios:
+    name: iOS
+    needs: scope
+    if: needs.scope.outputs.ios == 'true'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ios/.build
+            .build/xcode-ios-ci
+          key: swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-${{ hashFiles('ios/**/*.swift', 'ios/**/Package.resolved', 'shared/**/*.swift', 'shared/Package.resolved', 'ios/**/*.pbxproj', 'ios/Version.xcconfig') }}
+          restore-keys: |
+            swift-ios-${{ runner.os }}-${{ runner.arch }}-xcode26.3-
+      - run: swift test --package-path ios
+      - name: Build iOS Simulator
+        run: xcodebuild -project ios/KeepsIOS.xcodeproj -scheme KeepsIOS -destination 'generic/platform=iOS Simulator' -derivedDataPath .build/xcode-ios-ci CODE_SIGNING_ALLOWED=NO build
+
   python:
     name: Control plane and migration tools
+    needs: scope
+    if: needs.scope.outputs.python == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -79,7 +168,20 @@ jobs:
       - run: python -m unittest discover -s scripts -p 'test_merge_tracked_folders.py'
       - name: Install Rust for schema integration tests
         run: rustup toolchain install stable --profile minimal
+      - name: Rust cache identity
+        id: rust
+        run: echo "version=$(rustc +stable --version)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            server/target
+          key: rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-${{ github.job }}-${{ github.sha }}
+          restore-keys: |
+            rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - name: Build server for schema integration tests
         run: cargo +stable build --manifest-path server/Cargo.toml --locked --bin keeps-server
       - run: python -m unittest discover -s scripts -p 'test_backfill_standard_names.py'
       - run: python -m unittest discover -s scripts -p 'test_linux_cache_worker.py'
+      - run: python -m unittest discover -s deploy/spk -p 'test_*.py'

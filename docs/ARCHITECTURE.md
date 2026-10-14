@@ -271,7 +271,7 @@ Catalog schema 2 新增按资料库隔离的隐藏目录标记。升级 schema 1
 
 ### 持续集成
 
-GitHub Actions 在 main push、PR 和手动触发时验证 Rust 服务、Apple 客户端、Python 控制平面与迁移工具，执行发布脚本测试和密钥扫描。CI 不持有发布凭据，不自动上传。发布脚本从本机 `codex-secret run app-store-connect` 接收认证环境变量，支持只读构建状态查询；归档和上传使用权限 0600 的临时私钥文件并在退出时清理。
+GitHub Actions 按改动范围验证 Rust 服务、Apple 客户端和 Python 工具；push 范围从上一次成功 CI 计算，PR 使用 merge base，手动运行全部检查。各客户端并行测试，构建缓存按平台和工具链隔离；密钥扫描与发布脚本测试始终运行。无凭据 CI 通过且 macOS 检查实际运行后，独立发布工作流才使用环境凭据归档上传；上传队列仅保留一个待执行构建，Apple 处理等待由另一任务承担。发布构建号沿用 CI run number 加 100，并按同一目标版本和构建号恢复查询。
 
 
 ## 照片版本与持续索引（schema 3）
