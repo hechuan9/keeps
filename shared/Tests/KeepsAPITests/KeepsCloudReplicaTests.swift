@@ -41,6 +41,37 @@ struct KeepsCloudReplicaTests {
         try database.completeSync(revision: revision, isStable: true)
     }
 
+    @Test func immutableSnapshotBrowsingDoesNotCreateAnotherCatalogOrWriteJournals() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let original = root.appendingPathComponent("original")
+        try populate(original, assets: (1...205).map { asset($0) })
+        let source = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: original)
+        let snapshot = root.appendingPathComponent("catalog.snapshot")
+        try source.exportSnapshot(to: snapshot)
+        let originalBytes = try Data(contentsOf: snapshot)
+        let originalFiles = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        let reader = try KeepsLibraryDatabase(snapshotURL: snapshot)
+        try populate(original, assets: [asset(999)], revision: 43)
+        var query = KeepsAssetQuery()
+        query.showHidden = true
+        query.limit = 100
+        var boundary: KeepsAsset?
+        var ids: [UUID] = []
+        repeat {
+            let page = try reader.assets(query: query, olderThan: boundary)
+            #expect(page.revision == 42)
+            ids.append(contentsOf: page.items.map(\.id))
+            boundary = page.nextCursor == nil ? nil : page.items.last
+        } while boundary != nil
+        #expect(ids.count == 205 && Set(ids).count == 205)
+        #expect(throws: KeepsLibraryDatabase.DatabaseError.self) { try reader.update(asset(999)) }
+        #expect(try Data(contentsOf: snapshot) == originalBytes)
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        #expect(Set(files) == Set(originalFiles))
+
+    }
+
     @Test func catalogOnlyRestoreSkipsAvailableCloudImagesAndCacheInventory() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -178,17 +209,20 @@ struct KeepsCloudReplicaTests {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let original = root.appendingPathComponent("original"), cloud = root.appendingPathComponent("cloud")
-        try populate(original, assets: [asset(1)])
+        try populate(original, assets: [asset(1), asset(2)])
         let sourceCache = cache(root.appendingPathComponent("cache"))
         try await sourceCache.store(image, key: key(asset(1)))
         let replica = KeepsCloudReplica(cloudRoot: cloud, cache: sourceCache)
         try await replica.backup(configuration: configuration, databaseRoot: original)
         let namespace = try #require(FileManager.default.contentsOfDirectory(at: cloud, includingPropertiesForKeys: nil).first)
+        let lateKey = key(asset(2))
         let key = key(asset(1))
         let staged = namespace.appendingPathComponent("thumbnails/\(key.prefix(2))/\(key)")
         let oldDate = Date(timeIntervalSince1970: 1000)
         try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: staged.path)
+        try await sourceCache.store(image, key: lateKey)
         try await replica.backup(configuration: configuration, databaseRoot: original)
+        #expect(FileManager.default.fileExists(atPath: namespace.appendingPathComponent("thumbnails/\(lateKey.prefix(2))/\(lateKey)").path))
         #expect(try FileManager.default.attributesOfItem(atPath: staged.path)[.modificationDate] as? Date == oldDate)
         var other = configuration; other.libraryID = "another"
         #expect(try await replica.restore(configuration: other, databaseRoot: root.appendingPathComponent("other")) == false)
@@ -226,12 +260,16 @@ struct KeepsCloudReplicaTests {
         #expect(try await target.containsCachedKey(key(asset(2))))
     }
 
-    @Test func unstableCatalogIsNeverStaged() async throws {
+    @Test(arguments: [false, true]) func unstableCatalogIsNeverStaged(withCheckpoint: Bool) async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let original = root.appendingPathComponent("original"), cloud = root.appendingPathComponent("cloud")
         let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: original)
         try database.ingest([asset(1)])
+        if withCheckpoint {
+            try database.completeSync(revision: 42, isStable: true)
+            try database.ingest([asset(2)], checkpoint: .init(revision: 43, stable: false))
+        }
         let replica = KeepsCloudReplica(cloudRoot: cloud, cache: cache(root.appendingPathComponent("cache")))
         await #expect(throws: KeepsLibraryDatabase.DatabaseError.self) {
             try await replica.backup(configuration: configuration, databaseRoot: original)

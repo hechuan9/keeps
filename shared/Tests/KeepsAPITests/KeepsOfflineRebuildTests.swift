@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 import Testing
 @testable import KeepsAPI
 
@@ -169,6 +170,21 @@ struct KeepsOfflineRebuildTests {
         #expect(result.browseThumbnailCount == 1)
         #expect(try await previewCache.cachedKeys().count == 1)
         #expect(try await browseCache.cachedKeys().count == 1)
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("image.tmp").path))
+        let thumbnailKey = PreviewCache.key(assetID: asset.id, preview: preview, configuration: configuration, role: .thumbnail)
+        let browseKey = PreviewCache.key(assetID: asset.id, preview: preview, configuration: configuration, role: .browse)
+        let thumbnailFile = try #require(try await previewCache.cachedFileURL(forKey: thumbnailKey))
+        let browseFile = try #require(try await browseCache.cachedFileURL(forKey: browseKey))
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        for file in [thumbnailFile, browseFile] {
+            #expect(try autoreleasepool { try Data(contentsOf: file) == image })
+            try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: file.path)
+        }
+        _ = try await service.unpack(archive, root: root, configuration: configuration, databaseRoot: root.appendingPathComponent("target"), progress: { _ in })
+        for file in [thumbnailFile, browseFile] {
+            #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date == oldDate)
+        }
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("image.tmp").path))
         manifest.browseThumbnailCount = 0; manifest.missingBrowseThumbnailCount = 1
         try tar([("manifest.json", try JSONEncoder().encode(manifest))] + entries).write(to: archive)
         let rejected = root.appendingPathComponent("rejected")
@@ -179,6 +195,80 @@ struct KeepsOfflineRebuildTests {
         try tar([("manifest.json", try JSONEncoder().encode(manifest))] + entries.dropLast()).write(to: archive)
         let missing = try await service.unpack(archive, root: root, configuration: configuration, databaseRoot: rejected, progress: { _ in })
         #expect(missing.missingBrowseThumbnailCount == 1)
+    }
+
+    @Test func bulkImportCancellationAndRepeatedRecoveryReuseImages() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let count = Int(ProcessInfo.processInfo.environment["KEEPS_IMPORT_STRESS_COUNT"] ?? "128")!
+        let source = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("source"))
+        let descriptor = KeepsPreview(downloadURL: URL(string: "https://nas.invalid/image")!, width: 1, height: 1, version: "stress")
+        let assets = (0..<count).map { index in
+            var asset = KeepsAsset(id: UUID(), captureTime: nil, cameraMake: "", cameraModel: "", lensModel: "", originalFilename: "sample-\(index).jpg", contentFingerprint: "c", metadataFingerprint: "m", rating: 0, flagState: "none", colorLabel: nil, tags: [], createdAt: "2026-01-01", updatedAt: "2026-01-01", trashed: false, preview: nil, thumbnail: descriptor)
+            asset.browseThumbnail = descriptor
+            return asset
+        }
+        try source.ingest(assets)
+        try source.completeSync(revision: 71, isStable: true)
+        let snapshot = root.appendingPathComponent("source.sqlite")
+        try source.exportSnapshot(to: snapshot)
+        let manifest = KeepsOfflineManifest(formatVersion: 1, libraryID: "main", revision: 71, assetCount: count, thumbnailCount: count, missingThumbnailCount: 0, browseThumbnailCount: count, missingBrowseThumbnailCount: 0)
+        var image = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aEl0AAAAASUVORK5CYII=")!
+        // Padding exercises realistic transfer volume without retaining decoded photo fixtures.
+        image.append(Data(repeating: 0, count: 64 * 1024 - image.count))
+        let archive = root.appendingPathComponent("bundle.tar")
+        try Data().write(to: archive)
+        let output = try FileHandle(forWritingTo: archive)
+        try output.write(contentsOf: tar([("manifest.json", try JSONEncoder().encode(manifest)), ("catalog.sqlite", try Data(contentsOf: snapshot))]).dropLast(1024))
+        for asset in assets {
+            try output.write(contentsOf: tar([("thumbnails/\(asset.id.uuidString).image", image), ("browse-thumbnails/\(asset.id.uuidString).image", image)]).dropLast(1024))
+        }
+        try output.write(contentsOf: Data(repeating: 0, count: 1024))
+        try output.close()
+        let thumbnail = PreviewCache(directory: root.appendingPathComponent("thumbnail"), diskLimit: Int.max, role: .thumbnail)
+        let browse = PreviewCache(directory: root.appendingPathComponent("browse"), diskLimit: Int.max, role: .browse)
+        let service = KeepsOfflineRebuild(cache: thumbnail, browsingCache: browse)
+        let destination = root.appendingPathComponent("destination")
+        let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: destination)
+        try database.completeSync(revision: 7, isStable: true)
+        let cancelled = Task {
+            try await service.unpack(archive, root: root, configuration: configuration, databaseRoot: destination) { update in
+                if update.message == "导入离线图库" { withUnsafeCurrentTask { $0?.cancel() } }
+            }
+        }
+        await #expect(throws: CancellationError.self) { _ = try await cancelled.value }
+        #expect(try database.revision == 7)
+        let oldDate = Date(timeIntervalSince1970: 1_000)
+        var baselineUsage = rusage()
+        getrusage(RUSAGE_SELF, &baselineUsage)
+        for pass in 0..<3 {
+            _ = try await service.unpack(archive, root: root, configuration: configuration, databaseRoot: destination, progress: { _ in })
+            var importedUsage = rusage()
+            getrusage(RUSAGE_SELF, &importedUsage)
+            print("BULK IMPORT MEMORY pass=\(pass) peakResidentBytes=\(importedUsage.ru_maxrss)")
+            #expect(try database.assets(query: .init()).total == count)
+            #expect(try database.revision == 71)
+            for (role, cache) in [(KeepsMediaRole.thumbnail, thumbnail), (.browse, browse)] {
+                #expect(try await cache.cachedKeys().count == count)
+                for asset in assets {
+                    let key = PreviewCache.key(assetID: asset.id, preview: descriptor, configuration: configuration, role: role)
+                    let file = try #require(try await cache.cachedFileURL(forKey: key))
+                    #expect(try autoreleasepool { try Data(contentsOf: file) == image })
+                    if pass == 0 { try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: file.path) }
+                    else { #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.modificationDate] as? Date == oldDate) }
+                }
+            }
+            #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent("image.tmp").path))
+            var usage = rusage()
+            getrusage(RUSAGE_SELF, &usage)
+            print("BULK MEMORY pass=\(pass) peakResidentBytes=\(usage.ru_maxrss)")
+        }
+        if ProcessInfo.processInfo.environment["KEEPS_IMPORT_STRESS_COUNT"] != nil {
+            var finalUsage = rusage()
+            getrusage(RUSAGE_SELF, &finalUsage)
+            #expect(finalUsage.ru_maxrss - baselineUsage.ru_maxrss < max(64 * 1024 * 1024, count * image.count))
+        }
+        print("BULK IMPORT PASS assets=\(count) imageBytes=\(count * 2 * image.count) repeatedPasses=3 cancellation=verified")
     }
 
     @Test(.enabled(if: ProcessInfo.processInfo.environment["KEEPS_OFFLINE_BUNDLE_FIXTURE"] != nil))

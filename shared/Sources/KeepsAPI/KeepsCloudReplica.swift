@@ -35,9 +35,6 @@ public actor KeepsCloudReplica {
         try await makeAvailable(snapshot)
         let localSnapshot = temporary.appendingPathComponent("catalog.snapshot", isDirectory: false)
         try coordinatedRead(snapshot, to: localSnapshot)
-        let database = try KeepsLibraryDatabase(configuration: configuration,
-                                                rootDirectory: temporary.appendingPathComponent("catalog", isDirectory: true))
-        guard try database.restoreSnapshot(from: localSnapshot) else { return false }
         if !includeThumbnails {
             try Task.checkCancellation()
             let local = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseRoot)
@@ -45,6 +42,7 @@ public actor KeepsCloudReplica {
             await workProgress?(1, 1)
             return restored
         }
+        let database = try KeepsLibraryDatabase(snapshotURL: localSnapshot)
         let work = ReplicaWorkProgress(total: try thumbnailWorkTotal(database), callback: workProgress)
         await work.advance(1, force: true)
         var processed = 0
@@ -102,9 +100,7 @@ public actor KeepsCloudReplica {
         defer { try? FileManager.default.removeItem(at: temporary) }
         let snapshot = temporary.appendingPathComponent("catalog.snapshot", isDirectory: false)
         try database.exportSnapshot(to: snapshot)
-        let stable = try KeepsLibraryDatabase(configuration: configuration,
-                                             rootDirectory: temporary.appendingPathComponent("catalog", isDirectory: true))
-        guard try stable.restoreSnapshot(from: snapshot) else { return }
+        let stable = try KeepsLibraryDatabase(snapshotURL: snapshot)
         await progress?("正在把图库数据库交给 iCloud 同步…")
         var existing = try await inventory(root)
         try Task.checkCancellation()

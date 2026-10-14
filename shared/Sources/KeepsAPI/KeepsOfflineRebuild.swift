@@ -86,7 +86,7 @@ public actor KeepsOfflineRebuild {
         var hash = SHA256()
         var verified: Int64 = 0
         var lastVerification = Date.distantPast
-        while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
+        while let data = try autoreleasepool(invoking: { try input.read(upToCount: 1024 * 1024) }), !data.isEmpty {
             try Task.checkCancellation(); hash.update(data: data); verified += Int64(data.count)
             if Date().timeIntervalSince(lastVerification) >= 1 || verified == size {
                 lastVerification = Date()
@@ -143,7 +143,6 @@ public actor KeepsOfflineRebuild {
         let snapshot = try KeepsLibraryDatabase.SnapshotReader(url: catalog)
         var count = 0
         var browseCount = 0
-        let image = root.appendingPathComponent("image.tmp")
         var last = Date.distantPast
         while let entry = try reader.next() {
             try Task.checkCancellation()
@@ -156,9 +155,10 @@ public actor KeepsOfflineRebuild {
                   let asset = try snapshot.asset(id: id),
                   let preview = browsing ? asset.browseThumbnail : asset.thumbnail else { throw failure("离线包缩略图与数据库不匹配") }
             let targetCache = browsing ? browsingCache : cache
-            try await reader.copy(entry.size, to: image) { _ in }
+            // Each bounded image goes directly from the archive to its final cache file.
+            let image = try reader.data(entry.size)
             do {
-                try await targetCache.importCachedFile(from: image, key: PreviewCache.key(assetID: id, preview: preview, configuration: configuration, role: browsing ? .browse : .thumbnail))
+                try await targetCache.importCachedData(image, key: PreviewCache.key(assetID: id, preview: preview, configuration: configuration, role: browsing ? .browse : .thumbnail))
             } catch {
                 try Task.checkCancellation()
                 if error is CancellationError { throw error }
@@ -267,8 +267,11 @@ private final class OfflineTarReader {
     deinit { try? handle.close() }
     private func invalid() -> Error { KeepsLibraryDatabase.DatabaseError(message: "离线包 TAR 格式损坏或不受支持") }
     func data(_ count: Int) throws -> Data {
-        guard let result = try handle.read(upToCount: count), result.count == count else { throw invalid() }
-        return result
+        // Async workers may retain Foundation's autoreleased read buffers for the entire archive.
+        try autoreleasepool {
+            guard let result = try handle.read(upToCount: count), result.count == count else { throw invalid() }
+            return result
+        }
     }
     func next() throws -> Entry? {
         if padding > 0 { _ = try data(padding) }; padding = 0

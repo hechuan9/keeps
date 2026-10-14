@@ -107,6 +107,12 @@ public actor PreviewCache {
         try Self.validateCacheKey(key)
         if try cachedFileURL(forKey: key) != nil { return }
         let data = try Data(contentsOf: source)
+        try importCachedData(data, key: key)
+    }
+
+    func importCachedData(_ data: Data, key: String) throws {
+        try Self.validateCacheKey(key)
+        if try cachedFileURL(forKey: key) != nil { return }
         guard Self.isImage(data) else { throw URLError(.cannotDecodeContentData) }
         try store(data, key: key)
         guard try cachedFileURL(forKey: key) != nil else { throw CocoaError(.fileWriteOutOfSpace) }

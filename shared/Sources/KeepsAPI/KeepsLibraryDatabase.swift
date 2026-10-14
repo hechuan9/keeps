@@ -71,6 +71,19 @@ public final class KeepsLibraryDatabase {
         }
     }
 
+    /// Read an immutable snapshot without copying it into another writable catalog.
+    init(snapshotURL: URL) throws {
+        fileURL = snapshotURL
+        let opened = try Self.openSnapshot(snapshotURL, flags: SQLITE_OPEN_READONLY)
+        connection = opened
+        do { try Self.validateSnapshot(opened) }
+        catch {
+            sqlite3_close(opened)
+            connection = nil
+            throw error
+        }
+    }
+
     deinit { sqlite3_close(connection) }
 
     /// SQLite backup includes committed WAL pages without checkpointing the live catalog.

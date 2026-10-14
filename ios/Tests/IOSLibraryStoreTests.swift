@@ -340,6 +340,72 @@ struct IOSLibraryStoreTests {
         #expect(store.assets.map(\.originalFilename) == ["photo-1"])
     }
 
+    @Test func repeatedForegroundSynchronizationCoalescesOneDownload() async throws {
+        let fixture = ReplicaFixture()
+        let store = await fixture.store()
+        ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<20 { group.addTask { await store.synchronize() } }
+        }
+        #expect(store.syncError == nil)
+        #expect(!store.isSyncing)
+        #expect(store.assets.map(\.originalFilename) == ["photo-1"])
+        #expect(fixture.requests.filter { $0 == "POST /libraries/library/offline-rebuild" }.count == 1)
+        #expect(fixture.requests.filter { $0.hasSuffix("/download") }.count == 1)
+        let before = fixture.requests.count
+        for _ in 0..<10 { await store.synchronize() }
+        #expect(Array(fixture.requests.dropFirst(before)) == Array(repeating: "GET /libraries/library/revision", count: 10))
+    }
+
+    @Test func connectionSwitchDuringDownloadCannotPublishOldCatalog() async throws {
+        let fixture = ReplicaFixture()
+        let store = await fixture.store()
+        ReplicaProtocol.delayDownload(host: fixture.configuration.baseURL.host!)
+        let sync = Task { await store.synchronize() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !fixture.requests.contains(where: { $0.hasSuffix("/download") }), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(fixture.requests.contains(where: { $0.hasSuffix("/download") }))
+        var other = fixture.configuration
+        other.accessCredential = "switched"
+        store.configure(other)
+        await store.waitForLocalLoad()
+        await sync.value
+        #expect(store.configuration == other)
+        #expect(store.assets.isEmpty)
+        #expect(store.timeline.isEmpty)
+        #expect(!store.isSyncing)
+        #expect(store.syncError == nil)
+        #expect(!store.hasLocalCatalog)
+        store.configure(fixture.configuration)
+        await store.waitForLocalLoad()
+        await store.synchronize()
+        #expect(store.assets.map(\.originalFilename) == ["photo-1"])
+        #expect(store.syncError == nil)
+    }
+
+    @Test func repeatedOfflineForegroundRetriesRetainBrowsableCatalog() async throws {
+        let fixture = ReplicaFixture()
+        let store = await fixture.store()
+        await store.synchronize()
+        let expected = store.assets.map(\.id)
+        fixture.offline = true
+        for _ in 0..<10 {
+            await store.synchronize()
+            await store.refresh()
+            #expect(store.assets.map(\.id) == expected)
+            #expect(store.syncError != nil)
+            #expect(!store.isSyncing)
+            #expect(store.hasLocalCatalog)
+        }
+        fixture.offline = false
+        await store.synchronize()
+        #expect(store.syncError == nil)
+        #expect(store.assets.map(\.id) == expected)
+        #expect(fixture.requests.filter { $0 == "POST /libraries/library/offline-rebuild" }.count == 1)
+    }
+
     @Test func firstSynchronizationCanBuildTimelineWithoutBundledThumbnails() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
