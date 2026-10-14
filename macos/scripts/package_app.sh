@@ -10,6 +10,8 @@ RESOURCES_DIR="$CONTENTS_DIR/Resources"
 cd "$ROOT_DIR"
 swift build --arch arm64 >&2
 BIN_DIR="$(swift build --arch arm64 --show-bin-path)"
+KEEPS_API_RESOURCES="$BIN_DIR/KeepsAPI_KeepsAPI.bundle"
+[[ -d "$KEEPS_API_RESOURCES" ]]
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
@@ -26,6 +28,7 @@ BUILD_NUMBER="$(awk '$1 == "CURRENT_PROJECT_VERSION" { print $3 }' "$ROOT_DIR/Ve
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$CONTENTS_DIR/Info.plist"
 cp "$ROOT_DIR/Sources/PhotoAssetManager/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+cp -R "$KEEPS_API_RESOURCES" "$RESOURCES_DIR/"
 bash "$ROOT_DIR/scripts/bundle_ai_runtime.sh" "$RESOURCES_DIR"
 
 # SwiftPM signs the executable alone; the assembled application needs a bundle signature.
