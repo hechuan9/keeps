@@ -445,7 +445,7 @@ struct ContentView: View {
                         Image(systemName: "flag.fill").foregroundStyle(library.selectedAsset?.flagState == "picked" ? WorkspaceStyle.text : Color(white: 0.4))
                     }.buttonStyle(.plain).help("留用")
                     Button { library.updateSelected(KeepsAssetPatch(flagState: library.selectedAsset?.flagState == "rejected" ? "unflagged" : "rejected")) } label: {
-                        Label("弃用", systemImage: library.selectedAsset?.flagState == "rejected" ? "xmark.circle.fill" : "xmark.circle")
+                        Image(systemName: "flag.slash.fill")
                             .foregroundStyle(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.text : Color(white: 0.4))
                             .padding(.horizontal, 8).padding(.vertical, 5)
                             .background(library.selectedAsset?.flagState == "rejected" ? WorkspaceStyle.field : Color.clear, in: RoundedRectangle(cornerRadius: 4))
@@ -540,10 +540,6 @@ struct ContentView: View {
                     Text("全部评分").tag(0)
                     ForEach(1...5, id: \.self) { Text("至少 \($0) 星").tag($0) }
                 }
-                Picker("颜色", selection: Binding(get: { library.query.colorLabel ?? "" }, set: { library.query.colorLabel = $0.isEmpty ? nil : $0 })) {
-                    Text("全部颜色").tag("")
-                    ForEach(Array(zip(["red", "yellow", "green", "blue", "purple"], ["红", "黄", "绿", "蓝", "紫"])), id: \.0) { Text($0.1).tag($0.0) }
-                }
                 Picker("排序", selection: $library.query.sort) {
                     Text("拍摄时间倒序").tag("capture_desc")
                     Text("拍摄时间正序").tag("capture_asc")
@@ -592,30 +588,21 @@ struct AssetDetailView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var exposureTasks: ExposureTaskStore
     var asset: KeepsAsset
-    @State private var tags = ""
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 RemotePreview(asset: asset).frame(height: 164).background(WorkspaceStyle.canvas)
                 Text(asset.originalFilename).font(.headline).textSelection(.enabled)
-                if library.selectedIDs.count > 1 { Text("评分、标记、颜色及标签将应用于所选 \(library.selectedIDs.count) 张照片；底片设置仅作用于当前照片。").font(.caption).foregroundStyle(.secondary) }
+                if library.selectedIDs.count > 1 { Text("评分、标记及标签将应用于所选 \(library.selectedIDs.count) 张照片；底片设置仅作用于当前照片。").font(.caption).foregroundStyle(.secondary) }
                 Text([asset.cameraMake, asset.cameraModel, asset.lensModel].filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption).textSelection(.enabled)
                 if let captureTime = asset.captureTime { Text(captureTime).font(.caption).foregroundStyle(.secondary) }
-                Picker("评分", selection: Binding(get: { asset.rating }, set: { library.updateSelected(KeepsAssetPatch(rating: $0)) })) {
-                    ForEach(0...5, id: \.self) { Text($0 == 0 ? "未评分" : "\($0) 星").tag($0) }
+                PhotoRatingControls(rating: asset.rating, flag: asset.flagState) { rating in
+                    library.updateSelected(KeepsAssetPatch(rating: rating))
+                } setFlag: { flag in
+                    library.updateSelected(KeepsAssetPatch(flagState: flag))
                 }
-                Picker("标记", selection: Binding(get: { asset.flagState }, set: { library.updateSelected(KeepsAssetPatch(flagState: $0)) })) {
-                    Text("未标记").tag("unflagged"); Text("留用").tag("picked"); Text("排除").tag("rejected")
-                }
-                Picker("颜色", selection: Binding(get: { asset.colorLabel ?? "" }, set: { library.updateSelected(KeepsAssetPatch(colorLabel: $0.isEmpty ? nil : $0, clearColorLabel: $0.isEmpty)) })) {
-                    Text("无").tag("")
-                    ForEach(Array(zip(["red", "yellow", "green", "blue", "purple"], ["红", "黄", "绿", "蓝", "紫"])), id: \.0) { Text($0.1).tag($0.0) }
-                }
-                TextField("标签，以逗号分隔", text: $tags).textFieldStyle(.roundedBorder)
-                Button("保存标签") {
-                    library.updateSelected(KeepsAssetPatch(tags: tags.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }))
-                }
+                AssetTagsView(asset: asset)
                 Divider()
                 if let configuration = library.configuration {
                     KeepsAssetVersionsView(assetID: asset.id, revision: asset.updatedAt, configuration: configuration,
@@ -631,8 +618,6 @@ struct AssetDetailView: View {
                 .background(OverlayScrollerConfiguration())
         }
         .font(.system(size: 12))
-        .task(id: asset.id) { tags = asset.tags.joined(separator: ", ") }
-        .onChange(of: asset.tags) { _, value in tags = value.joined(separator: ", ") }
     }
 }
 

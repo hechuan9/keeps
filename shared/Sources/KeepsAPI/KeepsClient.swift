@@ -126,6 +126,16 @@ public final class KeepsClient: Sendable {
         let (data, response) = try await session.upload(for: request, fromFile: file)
         _ = try checkedData(data, response)
     }
+    public func tagLibrary() async throws -> [String] {
+        struct Tags: Decodable { var tags: [String] }
+        let response: Tags = try await request("GET", library + ["tags"])
+        return response.tags
+    }
+    public func addTagsToLibrary(_ tags: [String]) async throws -> [String] {
+        struct Tags: Codable { var tags: [String] }
+        let response: Tags = try await request("POST", library + ["tags"], body: JSONEncoder().encode(Tags(tags: tags)))
+        return response.tags
+    }
     public func updateAsset(id: UUID, patch: KeepsAssetPatch) async throws -> KeepsAsset {
         try await request("PATCH", library + ["assets", id.uuidString], body: JSONEncoder().encode(patch))
     }

@@ -777,7 +777,7 @@ final class LibraryStore: ObservableObject {
 
     func restoreSelected() { mutateSelected(refreshDirectories: true) { client, id in try await client.restoreAsset(id: id) } }
 
-    private func mutateSelected(refreshDirectories: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
+    func mutateSelected(refreshDirectories: Bool = false, _ mutation: @escaping @Sendable (KeepsClient, UUID) async throws -> KeepsAsset) {
         guard !isOperationBlocking, !isSelectingAll, let client, !isMutating, !selectedIDs.isEmpty else { return }
         let ids = selectedIDs
         loadTask?.cancel()

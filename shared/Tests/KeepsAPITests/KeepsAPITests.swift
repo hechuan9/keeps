@@ -316,6 +316,20 @@ struct KeepsAPITests {
         #expect(empty.directories.isEmpty)
     }
 
+    @Test func tagLibraryUsesAuthenticatedLibraryRequests() async throws {
+        let fixture = Fixture { request in
+            #expect(request.url?.path == "/api/libraries/library/tags")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")
+            if request.httpMethod == "POST" {
+                let body = try JSONSerialization.jsonObject(with: request.bodyData) as! [String: Any]
+                #expect(body["tags"] as? [String] == ["旅行"])
+            } else { #expect(request.httpMethod == "GET") }
+            return (200, "{\"tags\":[\"旅行\"]}")
+        }
+        #expect(try await fixture.client.tagLibrary() == ["旅行"])
+        #expect(try await fixture.client.addTagsToLibrary(["旅行"]) == ["旅行"])
+    }
+
     @Test func assetRequestsUseServerFilteringAndAuthenticatedWrites() async throws {
         let fixture = Fixture { request in
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")

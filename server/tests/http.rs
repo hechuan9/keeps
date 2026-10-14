@@ -2714,3 +2714,58 @@ async fn keeps_trash_settings_and_emptying_use_authenticated_count_confirmation(
     );
     assert!(dir.path().join("originals/trash.jpg").exists());
 }
+
+#[tokio::test]
+async fn tag_library_requires_authentication_and_validates_atomic_additions() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = router(state(dir.path()));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/libraries/photos/tags")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"tags":["private"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/libraries/other/tags",
+            json!({"tags":["wrong-library"]})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/libraries/photos/tags",
+            json!({"tags":["旅行", " 旅行 "]})
+        )
+        .await,
+        (StatusCode::OK, json!({"tags":["旅行"]}))
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            "POST",
+            "/libraries/photos/tags",
+            json!({"tags":["new", " "]})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        call(app, "GET", "/libraries/photos/tags", Value::Null).await,
+        (StatusCode::OK, json!({"tags":["旅行"]}))
+    );
+}

@@ -261,7 +261,7 @@ struct AICullingResult: Codable {
             error = message + "\n" + String(reflecting: failure)
         }
     }
-    private nonisolated static func makePreview(source: URL, output: URL) async throws {
+    nonisolated static func makePreview(source: URL, output: URL) async throws {
         let work = Task.detached(priority: .utility) {
             try Task.checkCancellation()
             guard let input = CGImageSourceCreateWithURL(source as CFURL, nil),
@@ -271,10 +271,10 @@ struct AICullingResult: Codable {
                     kCGImageSourceThumbnailMaxPixelSize: 1600
                   ] as CFDictionary),
                   let destination = CGImageDestinationCreateWithURL(output as CFURL, UTType.jpeg.identifier as CFString, 1, nil) else {
-                throw AIEditingFailure("无法生成筛片预览。")
+                throw AIEditingFailure("无法生成 AI 预览。")
             }
             CGImageDestinationAddImage(destination, image, [kCGImageDestinationLossyCompressionQuality: 0.88] as CFDictionary)
-            guard CGImageDestinationFinalize(destination) else { throw AIEditingFailure("无法保存筛片预览。") }
+            guard CGImageDestinationFinalize(destination) else { throw AIEditingFailure("无法保存 AI 预览。") }
         }
         try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }

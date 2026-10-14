@@ -25,6 +25,8 @@ KEEPS_TEST_IMAGE=keeps-server:nas-core python3 server/tests/manual_full_scan_smo
 
 业务 API 使用 Bearer token，预览下载 URL 有效期 15 分钟。共享令牌适用于受信任家庭资料库，不提供独立用户权限体系。
 
+`GET /libraries/{library}/tags` 返回 `{tags:[String]}` 标签库；`POST` 同路径接收 `{tags:[String]}` 添加并返回完整标签库，每次 1–100 个非空标签，每个不超过 128 字节。标签去除首尾空格并去重。schema 17 迁移回填已有照片标签，后续照片标签写入自动收录；从照片移除标签不删除库条目。沿用 Bearer 鉴权与已有备份、`keeps-server migrate` 升级流程。
+
 SQLite 使用 WAL。后台扫描只读原片，文件哈希或精确 JPEG 图像指纹可以自动归组；EXIF 匹配仅作为待视觉确认的候选。普通核对通过原片 size/mtime 与 XMP 状态签名跳过未变文件。扫描仅由用户显式触发；添加目录只登记配置，启动、文件变化和后台维护均不发起扫描。启动取消历史非人工扫描，保留人工任务断点；外部新增、修改、删除和重命名需手动扫描同步。显式导入、移动、默认版本切换与重试继续完成各自必需的索引和预览处理；详见 [架构文档](../docs/ARCHITECTURE.md)。日常媒体解码在 NAS 原生套件执行；Linux 远端 worker 仅用于显式启用的一次性批量处理（`KEEPS_REMOTE_WORKER_ENABLED=1`，默认关闭）。解码依赖 ExifTool、LibRaw、ImageMagick 与 libheif；每个外部进程有时限和内存限制。错误保留完整上下文，单文件失败不阻止处理其他文件。
 
 SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行任务在下次启动恢复；停止追踪仅修改数据库。数据库和文件 I/O 在阻塞线程执行，查询接口不会承担媒体解码。元数据读取使用独立 WAL 快照；交互短事务优先于排队的后台事务，照片身份写入不占数据库锁。NAS 接口保持正常 CPU/I/O 优先级；扫描、编码、导入发布、移动、回收与离线导出使用独立低优先级线程，避免把优先级带入 HTTP 线程池。

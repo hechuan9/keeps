@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 16;
+const VERSION: i64 = 17;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -43,6 +43,7 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         "database schema {version} is newer than this server supports ({VERSION})"
     );
     if version == VERSION {
+        db.prepare("SELECT library_id,name FROM catalog_tags LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,trashed_at FROM catalog_trash_entries LIMIT 0")?;
         db.prepare("SELECT library_id,enabled,retention_days FROM trash_settings LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,metadata FROM photo_edit_decisions LIMIT 0")?;
@@ -169,6 +170,12 @@ CREATE TRIGGER IF NOT EXISTS catalog_trash_enter AFTER UPDATE OF trashed ON cata
 CREATE TRIGGER IF NOT EXISTS catalog_trash_restore AFTER UPDATE OF trashed ON catalog_assets WHEN old.trashed=1 AND new.trashed=0 BEGIN DELETE FROM catalog_trash_entries WHERE library_id=new.library_id AND asset_id=new.id; END;
 CREATE TRIGGER IF NOT EXISTS catalog_trash_insert AFTER INSERT ON catalog_assets WHEN new.trashed=1 BEGIN INSERT INTO catalog_trash_entries VALUES(new.library_id,new.id,unixepoch()); END;
 CREATE TRIGGER IF NOT EXISTS catalog_trash_remove AFTER DELETE ON catalog_assets BEGIN DELETE FROM catalog_trash_entries WHERE library_id=old.library_id AND asset_id=old.id; END;")?;
+    }
+    if version < 17 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_tags(library_id TEXT NOT NULL,name TEXT NOT NULL,PRIMARY KEY(library_id,name));
+INSERT OR IGNORE INTO catalog_tags SELECT a.library_id,trim(t.value) FROM catalog_assets a,json_each(a.snapshot,'$.tags') t WHERE t.type='text' AND length(trim(t.value))>0;
+CREATE TRIGGER IF NOT EXISTS catalog_tags_insert AFTER INSERT ON catalog_assets BEGIN INSERT OR IGNORE INTO catalog_tags SELECT new.library_id,trim(value) FROM json_each(new.snapshot,'$.tags') WHERE type='text' AND length(trim(value))>0; END;
+CREATE TRIGGER IF NOT EXISTS catalog_tags_update AFTER UPDATE OF snapshot ON catalog_assets WHEN json_extract(old.snapshot,'$.tags') IS NOT json_extract(new.snapshot,'$.tags') BEGIN INSERT OR IGNORE INTO catalog_tags SELECT new.library_id,trim(value) FROM json_each(new.snapshot,'$.tags') WHERE type='text' AND length(trim(value))>0; END;")?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -506,6 +513,45 @@ impl Store {
         Ok(
             json!({"directories":counts.into_iter().map(|(path,count)|json!({"path":path,"count":count.len()})).collect::<Vec<_>>()}),
         )
+    }
+    pub fn tag_library(&self, lib: &str) -> Result<Value> {
+        let db = self.read()?;
+        let tags = db
+            .prepare("SELECT name FROM catalog_tags WHERE library_id=? ORDER BY name")?
+            .query_map([lib], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(json!({"tags": tags}))
+    }
+    pub fn add_tags_to_library(&self, lib: &str, body: &Value) -> Result<Value> {
+        let tags = body
+            .get("tags")
+            .and_then(Value::as_array)
+            .filter(|tags| !tags.is_empty() && tags.len() <= 100)
+            .ok_or_else(|| invalid("tags must contain 1...100 nonempty strings"))?;
+        let tags = tags
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty() && tag.len() <= 128)
+                    .ok_or_else(|| {
+                        invalid("tags must contain nonempty strings of at most 128 bytes")
+                    })
+            })
+            .collect::<Result<BTreeSet<_>>>()?;
+        {
+            let mut db = self.lock()?;
+            let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for tag in tags {
+                tx.execute(
+                    "INSERT OR IGNORE INTO catalog_tags(library_id,name) VALUES(?,?)",
+                    params![lib, tag],
+                )?;
+            }
+            tx.commit()?;
+        }
+        self.tag_library(lib)
     }
     pub fn patch_asset(&self, lib: &str, id: &str, patch: &Value) -> Result<Value> {
         let fields = patch
@@ -1138,6 +1184,42 @@ mod tests {
                     row.get(0)
                 })?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+    #[test]
+    fn tag_library_migrates_existing_tags_and_retains_removed_tags() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("catalog.sqlite");
+        let store = Store::open(&path, true)?;
+        let id = store.ingest_original(
+            "lib",
+            "/photo.jpg",
+            &json!({"contentHash":"photo-hash","sizeBytes":1,"role":"jpeg_original"}),
+            &snapshot(),
+        )?;
+        store.patch_asset("lib", &id, &json!({"tags":["旅行"]}))?;
+        store.lock()?.execute_batch("DROP TRIGGER catalog_tags_insert; DROP TRIGGER catalog_tags_update; DROP TABLE catalog_tags; PRAGMA user_version=16;")?;
+        drop(store);
+        assert!(Store::open(&path, false).is_err());
+        let store = Store::open(&path, true)?;
+        assert_eq!(store.tag_library("lib")?, json!({"tags":["旅行"]}));
+        store.patch_asset("lib", &id, &json!({"tags":["风景"]}))?;
+        store.add_tags_to_library("lib", &json!({"tags":[" 人像 ","人像"]}))?;
+        assert!(
+            store
+                .add_tags_to_library("lib", &json!({"tags":["valid", " "]}))
+                .is_err()
+        );
+        assert_eq!(
+            store.tag_library("lib")?,
+            json!({"tags":["人像","旅行","风景"]})
+        );
+        assert_eq!(store.tag_library("other")?, json!({"tags":[]}));
+        drop(store);
+        assert_eq!(
+            Store::open(&path, false)?.tag_library("lib")?,
+            json!({"tags":["人像","旅行","风景"]})
+        );
         Ok(())
     }
     fn snapshot() -> Value {

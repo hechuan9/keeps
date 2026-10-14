@@ -186,7 +186,6 @@ struct IOSAssetDetail: View {
     var onRemoved: (UUID) -> Void = { _ in }
     @State private var rating = 0
     @State private var flag = "unflagged"
-    @State private var color = ""
     @State private var tags = ""
     @State private var busy = false
     @State private var error: String?
@@ -212,17 +211,25 @@ struct IOSAssetDetail: View {
                 }
             }
             Section("整理") {
-                Stepper("评分：\(rating)", value: $rating, in: 0...5)
-                Picker("标记", selection: $flag) {
-                    Text("未标记").tag("unflagged")
-                    Text("留用").tag("picked")
-                    Text("排除").tag("rejected")
+                HStack {
+                    Text("评分")
+                    Spacer()
+                    ForEach(1...5, id: \.self) { value in
+                        Button { rating = rating == value ? 0 : value; saved = false } label: {
+                            Image(systemName: value <= rating ? "star.fill" : "star")
+                        }.buttonStyle(.plain).accessibilityLabel("\(value) 星")
+                    }
                 }
-                Picker("颜色", selection: $color) {
-                    Text("无").tag("")
-                    Text("红色").tag("red"); Text("黄色").tag("yellow")
-                    Text("绿色").tag("green"); Text("蓝色").tag("blue"); Text("紫色").tag("purple")
-                }
+                HStack {
+                    Text("标记")
+                    Spacer()
+                    Button { flag = flag == "picked" ? "unflagged" : "picked"; saved = false } label: {
+                        Image(systemName: "flag.fill").foregroundStyle(flag == "picked" ? Color.primary : .secondary)
+                    }.accessibilityLabel("留用")
+                    Button { flag = flag == "rejected" ? "unflagged" : "rejected"; saved = false } label: {
+                        Image(systemName: "flag.slash.fill").foregroundStyle(flag == "rejected" ? Color.primary : .secondary)
+                    }.accessibilityLabel("弃用")
+                }.buttonStyle(.plain)
                 TextField("标签，以逗号分隔", text: $tags)
                 Button("保存到 NAS") { Task { await save() } }.disabled(busy)
                 if saved { Text("已保存").foregroundStyle(.secondary) }
@@ -248,7 +255,7 @@ struct IOSAssetDetail: View {
         }
     }
     private func applyFields() {
-        rating = asset.rating; flag = asset.flagState; color = asset.colorLabel ?? ""; tags = asset.tags.joined(separator: ", ")
+        rating = asset.rating; flag = asset.flagState; tags = asset.tags.joined(separator: ", ")
     }
     private func save() async {
         guard let configuration = library.configuration else { return }
@@ -256,7 +263,7 @@ struct IOSAssetDetail: View {
         defer { busy = false }
         let tagList = tags.replacingOccurrences(of: "，", with: ",").split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         do {
-            asset = try await KeepsClient(configuration: configuration).updateAsset(id: asset.id, patch: KeepsAssetPatch(rating: rating, flagState: flag, colorLabel: color.isEmpty ? nil : color, clearColorLabel: color.isEmpty, tags: tagList))
+            asset = try await KeepsClient(configuration: configuration).updateAsset(id: asset.id, patch: KeepsAssetPatch(rating: rating, flagState: flag, tags: tagList))
             await library.update(asset); applyFields(); saved = true
         } catch { self.error = String(reflecting: error) }
     }

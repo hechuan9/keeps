@@ -76,6 +76,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(crate::offline_rebuild::router(state.clone()))
         .route("/libraries/{library}/assets", get(assets))
         .route(
+            "/libraries/{library}/tags",
+            get(tag_library).post(add_tags_to_library),
+        )
+        .route(
             "/libraries/{library}/assets/{asset}",
             get(asset).patch(patch_asset),
         )
@@ -313,6 +317,19 @@ fn metadata_guard(jobs: &crate::jobs::Jobs) -> anyhow::Result<std::sync::RwLockR
                 anyhow::anyhow!("directory mutation lock poisoned")
             }
         })
+}
+async fn tag_library(State(state): State<Arc<AppState>>, Path(library): Path<String>) -> ApiResult {
+    Ok(Json(interactive(move || state.store.tag_library(&library)).await?).into_response())
+}
+async fn add_tags_to_library(
+    State(state): State<Arc<AppState>>,
+    Path(library): Path<String>,
+    Json(body): Json<Value>,
+) -> ApiResult {
+    Ok(
+        Json(interactive(move || state.store.add_tags_to_library(&library, &body)).await?)
+            .into_response(),
+    )
 }
 async fn patch_asset(
     State(state): State<Arc<AppState>>,
