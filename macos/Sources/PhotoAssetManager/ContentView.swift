@@ -270,7 +270,9 @@ struct ContentView: View {
     private var gallery: some View {
         Group {
             if detailMode, let asset = library.selectedAsset {
-                RemotePreview(asset: asset, loadStandard: true).padding(24)
+                ZoomablePhotoView(asset: asset, configuration: library.configuration)
+                    .id("\(asset.id)|\(asset.standard?.version ?? "")|\(String(describing: library.configuration))")
+                    .padding(24)
                     .overlay {
                         if asset.isVideo {
                             Button { playVideo(asset) } label: {
