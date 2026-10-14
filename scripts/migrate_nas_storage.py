@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Offline, copy-only NAS storage migration. Default is read-only planning.
+"""Archived Docker-era NAS storage migration. Default is read-only planning.
 
 Stop the container before --apply; this script never changes Docker configuration.
+It is not part of the current SPK deployment or upgrade workflow. Pass --container
+explicitly to identify the historical source service; no retired service is assumed.
 Old Keeps data and standard photos are retained. On failure, keep using old data.
 Rerun against the same destination to resume verified copies. Never start a service
 on the destination until report.json says PASS and deployment checks pass.
@@ -257,7 +259,7 @@ def main():
     parser.add_argument('--destination', type=Path, default=Path('/volume2/docker/keeps/data'))
     parser.add_argument('--standards', type=Path, default=Path('/volume2/myphoto/standard-photos'))
     parser.add_argument('--photos', type=Path, default=Path('/volume2/photo'))
-    parser.add_argument('--container', default='keeps-control-plane')
+    parser.add_argument('--container', required=True, help='Explicit historical Docker service name; not the current SPK service')
     parser.add_argument('--docker', default='/usr/local/bin/docker')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--apply', action='store_true')

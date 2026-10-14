@@ -6,7 +6,7 @@
 
 Keeps 采用一个 NAS 核心服务和两个原生客户端。NAS 是照片索引、整理结果、媒体任务状态和预览对象的权威真源；iOS 使用自己的 SQLite 图库副本直接驱动浏览，网络同步只更新副本。macOS 图库保持在线查询与内存列表缓存，AI 调色工作流由本机 SQLite 持久管理。
 
-客户端使用共享 HTTP API。`chuan_nas` 的正式图库已从 Docker 迁至原生 SPK，原片路径保持不变，数据库与预览使用独立状态副本；旧 Docker 停止并保留。当前使用局域网入口，部署见[原生套件说明](../deploy/spk/README.md)。
+客户端使用共享 HTTP API。`chuan_nas` 的正式图库使用原生 SPK，原片路径保持不变，数据库与预览使用独立状态副本。NAS 原生 SPK 是唯一受支持的服务部署方式；旧 Docker 方案已退役，禁止重启或恢复。当前使用局域网入口，部署见[原生套件说明](../deploy/spk/README.md)。
 
 ```mermaid
 flowchart LR
@@ -32,8 +32,7 @@ flowchart LR
 | `shared/` | `KeepsAPI` Swift 包：HTTP 请求、DTO、连接偏好、Keychain 凭据及 iOS SQLite 副本；无事件回放或照片处理。 |
 | `macos/` | 统一资料库浏览、选择、筛选、整理表单及服务器来源/任务界面；`LibraryStore` 仅保存 UI 内存状态。 |
 | `ios/` | 原生图库、详情与整理交互；`IOSLibraryStore` 从本地 SQLite 查询，`KeepsClient` 在后台同步 NAS。 |
-| `deploy/nas/` | Docker 构建、历史部署与回退参考。 |
-| `deploy/spk/` | 当前原生套件打包、启动与配置。 |
+| `deploy/spk/` | NAS 唯一受支持的原生套件打包、启动与配置。 |
 | `control_plane/` | 旧 Python 协议、迁移 seed 工具与对照测试；不是第二套活跃后端。 |
 | `scripts/` | 客户端打包入口和显式执行的迁移工具。 |
 
@@ -129,7 +128,7 @@ schema 14 统一既有编辑状态与导入批次逐路径计算租约。兼容 
 
 身份 metadata 补写只在用户触发的照片处理流程内执行，不再后台回填。仅 metadata 写入造成的字节哈希变化在现有数据库事务中更新文件、版本、默认图、已完成远端任务及缓存描述，保留照片 UUID 与缩略图。合法 ID 已存在时不重写。
 
-临时 worker 在数据库事务中从现有状态索引直接领取一个到期 pending 项（LIMIT 1），不做全库优先排序，也不另设内存任务队列。缺标准的 RAW 仍在同一个任务中先生成完整标准图再生成小图，尚未拆为两个独立阶段。默认 4 并发、8 CPU、12GiB RAM、32GiB 临时预算。日常默认 NAS 本地编码开启（KEEPS_LOCAL_CACHE_ENCODING_ENABLED=1），全库远端派发关闭（KEEPS_REMOTE_WORKER_ENABLED 未设或为 0）。Mac 导入批次的有效计算租约允许其独立领取该批次任务，不需要开启全库远端派发。Linux 只在用户明确安排的一次性大规模处理时启用；服务器开关设为 1 后才能领取任务，Compose 需要显式 bulk profile，且不自动重启。批量处理结束恢复远端开关为 0 并停止 worker。部署见 [Linux worker](../deploy/linux-worker/README.md)。
+临时 worker 在数据库事务中从现有状态索引直接领取一个到期 pending 项（LIMIT 1），不做全库优先排序，也不另设内存任务队列。缺标准的 RAW 仍在同一个任务中先生成完整标准图再生成小图，尚未拆为两个独立阶段。默认 4 并发、8 CPU、12GiB RAM、32GiB 临时预算。日常默认 NAS 本地编码开启（KEEPS_LOCAL_CACHE_ENCODING_ENABLED=1），全库远端派发关闭（KEEPS_REMOTE_WORKER_ENABLED 未设或为 0）。Mac 导入批次的有效计算租约允许其独立领取该批次任务，不需要开启全库远端派发。Linux 只在用户明确安排的一次性大规模处理时启用；服务器开关设为 1 后才能领取任务，worker 使用显式 bulk profile，且不自动重启。批量处理结束恢复远端开关为 0 并停止 worker。部署见 [Linux worker](../deploy/linux-worker/README.md)。
 
 `KEEPS_CACHE_GC_ENABLED=1` 时，新图验证后在同一事务切换旧 preview 引用并将旧对象放入持久 `media_cache_gc`。等待 20 分钟，每轮最多回收 20 个无当前引用对象，删除前再次核对 derivative_objects 与 media_cache。仅允许专用缓存根内的新 preview/thumbnail/browse 路径及已确认的历史 `64位hex-1200.heic` 格式；原片和标准照片不进入回收队列。尚有引用或生成失败时保留旧文件。状态由 `GET /libraries/{libraryID}/cache-status` 提供；retry/rebuild 每次选择最多 20 张照片，建立独立的一次性手动作业；实际重建在该照片获得执行机会后开始，不抢占当前照片。
 
@@ -137,7 +136,7 @@ schema 14 统一既有编辑状态与导入批次逐路径计算租约。兼容 
 
 macOS 目录树使用 `NSViewRepresentable` 包装原生 `NSOutlineView`，由 AppKit 负责树形行复用、展开折叠及键盘导航；SwiftUI 保留其它界面。目录节点按路径保持稳定身份，数据和展开状态由 `LibraryStore` 管理，Coordinator 仅桥接视图。数据源同步读取内存缓存，异步响应仅更新变化节点；收起再展开不重复请求，刷新保留有效展开、选择和滚动位置，切换服务器才重置。`local.keeps` 的 `navigation` 日志记录目录请求耗时与返回数量，不记录路径或凭据。
 
-路径统一以 NAS 真实绝对路径为身份，例如 `/volume2/photo/照片`。原生套件直接访问照片目录，Docker 历史部署以宿主同路径挂入容器；导航、查询、追踪配置、扫描状态和 catalog_paths 使用同一路径，不再使用 `/originals/library` 别名或 Mac `/Volumes` 路径。唯一照片根为 `/volume2/photo`，`myphoto` 不参与追踪或挂载。历史目录关联可通过 `scripts/migrate_nas_paths.py` 离线恢复，核对文件存在/大小及既有资产记录；恢复不代表重新校验内容哈希。
+路径统一以 NAS 真实绝对路径为身份，例如 `/volume2/photo/照片`。原生套件直接访问照片目录；导航、查询、追踪配置、扫描状态和 catalog_paths 使用同一路径，不使用容器路径别名或 Mac `/Volumes` 路径。唯一照片根为 `/volume2/photo`，`myphoto` 不参与追踪或挂载。历史目录关联可通过 `scripts/migrate_nas_paths.py` 离线恢复，核对文件存在/大小及既有资产记录；恢复不代表重新校验内容哈希。
 
 导航条目包含当前目录 `directPhotoCount` 和递归总数 `photoCount`，客户端显示为“当前数（递归总数）”；旧服务或旧离线缓存缺失当前数时显示“—”，不虚构为零。在线导航与离线包使用同一计数口径，按 `(library_id,path)` 索引范围查询后代路径并对未回收资产去重；不枚举文件系统统计照片、不逐项请求图库分页。目录行在子目录或所选目录内容读取期间显示原生旋转指示，完成后恢复文件夹图标。计数独立于图库筛选条件。
 
@@ -186,8 +185,7 @@ Mac 顶栏“导入”（⌘⇧I）选择本机来源文件夹和已有的 NAS �
 
 ## 数据与照片安全
 
-- `KEEPS_ROOT=/keeps` 保存数据库、任务数据和可重建预览；宿主机路径 `/volume2/docker/keeps/data`。
-- Compose 只挂载系统数据和 `/volume2/photo` 两个目录，服务端 `ORIGINAL_ROOT=/volume2/photo`。
+- 原生套件状态位于 `/volume2/@appdata/KeepsNativeProbe/production-state`，服务直接访问 `/volume2/photo`。
 - `/volume2/photo` 需要写权限用于创建标准照片；任何已有照片、RAW、sidecar 文件都不得删除、移动或以另一张照片覆盖；允许补写身份 metadata，但不得改变像素或 RAW 成像数据。标准图写入须防止重名覆盖。
 - 停止目录追踪和移入 Keeps 回收站只改变服务器记录。删除弃用照片先进入 Keeps 回收站；数量确认清空或可调期限（默认 30 天）到期后，NAS 持久任务通过 DSM 原生回收接口处理原片版本和 XMP，全部回收后清理图库资料与生成缓存。恢复取消入站计时，重新入站重新计时；schema 16 迁移时历史回收站照片从迁移当天计时。删除文件夹仍要求同名确认。不永久删除，不自行移动到 `#recycle`。
 - 预览写入 `KEEPS_ROOT/previews`。维护生成的预览和缓存不能触碰原片。
@@ -197,9 +195,9 @@ Mac 顶栏“导入”（⌘⇧I）选择本机来源文件夹和已有的 NAS �
 
 ## HTTPS 外网入口
 
-目标入口为同一 Keeps HTTPS 域名，经家庭路由器 TCP 443 转发到 NAS 专用 8443 上的 DSM 反向代理，再转发 NAS 本机 127.0.0.1:2283。仓库 Compose 仅将应用端口绑定到回环地址；域名、证书、路由规则及维护窗口确认后才可应用到现有服务。`CONTROL_PLANE_PUBLIC_BASE_URL` 必须与客户端 HTTPS 入口一致，使签名预览链接也可在外网访问。Keeps Bearer 鉴权不由 DSM 登录取代，原片仍仅由服务只读访问。
+目标入口为同一 Keeps HTTPS 域名，经家庭路由器 TCP 443 转发到 NAS 专用 8443 上的 DSM 反向代理，再转发 NAS 本机 127.0.0.1:2283。域名、证书、路由规则及维护窗口确认后才可应用到现有服务。`CONTROL_PLANE_PUBLIC_BASE_URL` 必须与客户端 HTTPS 入口一致，使签名预览链接也可在外网访问。Keeps Bearer 鉴权不由 DSM 登录取代，原片仍仅由服务只读访问。
 
-这项部署配置不代表外网已上线，实际验收见 [NAS 部署说明](../deploy/nas/README.md)。
+这项入口配置不代表外网已上线，NAS 服务部署与验收见 [原生套件说明](../deploy/spk/README.md)。
 
 ## 客户端发布
 
@@ -234,7 +232,7 @@ macOS 发布构建启用 App Sandbox，只授权出站网络访问，不请求�
     "macos_app": "macos",
     "ios_app": "ios",
     "legacy_migration_reference": "control_plane",
-    "nas_deploy": "deploy/nas"
+    "nas_deploy": "deploy/spk"
   },
   "entrypoints": [
     "server/src/main.rs",
@@ -248,7 +246,7 @@ macOS 发布构建启用 App Sandbox，只授权出站网络访问，不请求�
     "macos/Sources/PhotoAssetManager/PhotoAssetManagerApp.swift",
     "ios/KeepsIOS.xcodeproj/project.pbxproj",
     "ios/Sources/KeepsIOS/KeepsIOSApp.swift",
-    "deploy/nas/docker-compose.yml"
+    "deploy/spk/pack.py"
   ],
   "server_modules": [
     "server/src/catalog.rs",

@@ -10,18 +10,18 @@ NAS 核心服务已于 2026-09-26 部署并迁移历史资料库，首次全库�
 - `shared/`：两端共用的 `KeepsAPI` Swift 包，含 DTO、HTTP 客户端和连接配置。
 - `macos/`：SwiftUI 三栏浏览、筛选、多选整理与 NAS 任务管理。
 - `ios/`：SwiftUI 图库、详情与整理界面。
-- `deploy/nas/`：Docker Compose 和 NAS 部署说明。
+- `deploy/spk/`：NAS 唯一受支持的原生套件部署方式；Docker 不用于部署 NAS 服务。
 - `control_plane/`：旧 Python 协议与迁移对照工具，不作为第二套运行后端。
 - [docs/UX_DESIGN.md](docs/UX_DESIGN.md)：产品行为与能力边界；[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：当前架构与职责。
 - `feature.md`：早期需求草案，包含尚未实现或已调整的设想，不是当前架构依据。
 
 ## NAS 部署与客户端连接
 
-部署、环境变量、状态目录和验收步骤见 [deploy/nas/README.md](deploy/nas/README.md)。Rust 开发说明见 [server/README.md](server/README.md)。
+NAS 部署、升级、恢复和验收步骤见 [deploy/spk/README.md](deploy/spk/README.md)。旧 NAS Docker Compose 部署已退役，仓库不再提供可启动入口。Rust 开发说明见 [server/README.md](server/README.md)。
 
 macOS 在 Keeps → 设置（⌘,）的 Server 页面配置照片服务地址、资料库名称和服务访问令牌，验证连接成功后保存；iOS 在连接设置中配置同一服务。地址及资料库保留在 UserDefaults，凭据保存在 Keychain；原有连接偏好会迁移。客户端只保存界面状态和可丢弃的图片缓存，所有业务读写经 NAS API。
 
-客户端不需要 SMB 挂载或本地资料库；主入口为统一照片资料库，目录仅作为服务器来源。原片与服务状态目录分开，NAS 容器内的原片目录映射为只读。扫描、停止追踪和图库回收站均不得删除、移动或覆盖原片。macOS 显式“删除文件夹”例外：输入完全一致的目录名后，由服务端移动到已启用的 NAS 共享目录回收站，禁止永久删除或覆盖已有文件。
+客户端不需要 SMB 挂载或本地资料库；主入口为统一照片资料库，目录仅作为服务器来源。原片与服务状态目录分开，NAS 套件按服务配置访问原片。扫描、停止追踪和图库回收站均不得删除、移动或覆盖原片。macOS 显式“删除文件夹”例外：输入完全一致的目录名后，由服务端移动到已启用的 NAS 共享目录回收站，禁止永久删除或覆盖已有文件。
 
 ## 开发与验证
 

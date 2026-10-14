@@ -3,11 +3,9 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 import statistics
-import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -21,7 +19,6 @@ def main():
     parser.add_argument('--backup', required=True)
     parser.add_argument('--base-url', default='http://127.0.0.1:2283')
     parser.add_argument('--library', default='local-library')
-    parser.add_argument('--container', default='keeps-control-plane')
     parser.add_argument('--report', required=True)
     args = parser.parse_args()
     settings = dict(line.split('=', 1) for line in Path(args.env_file).read_text().splitlines()
@@ -48,17 +45,8 @@ def main():
     prefix = '/libraries/' + urllib.parse.quote(args.library, safe='')
     report = {'checkedAtUTC': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'checks': results}
     try:
-        inspect = json.loads(subprocess.check_output(['docker','inspect',args.container]))[0]
-        state = inspect['State']
-        assert state['Running'] and state['Health']['Status'] == 'healthy'
-        assert not state['OOMKilled']
-        mounts = inspect['Mounts']
-        photo_mounts = [m for m in mounts if m['Destination'] == '/volume2/photo']
-        assert len(photo_mounts) == 1 and photo_mounts[0]['RW']
-        assert all('/myphoto' not in m['Source'] and '/myphoto' not in m['Destination'] for m in mounts)
-        assert len(mounts) == 2 and any(m['Destination'] == '/keeps' and m['RW'] for m in mounts)
-        passed('container_health_and_single_photo_mount', image=inspect['Image'], restarts=inspect['RestartCount'], photoMounts=len(photo_mounts))
         assert get('/healthz', False) == {'status':'ok'}
+        passed('nas_service_health')
         status(prefix+'/assets',401,False)
         status(prefix+'/ops',404)
         status(prefix+'/assets?cursor=invalid',422)

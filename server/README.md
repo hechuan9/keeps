@@ -5,17 +5,15 @@ NAS 常驻服务使用 Rust、Axum 和 SQLite，负责资产查询、评分/标�
 ```bash
 cargo test --manifest-path server/Cargo.toml
 cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
-docker build -f server/Dockerfile -t keeps-server:nas-core .
-KEEPS_TEST_IMAGE=keeps-server:nas-core python3 server/tests/docker_smoke.py
-KEEPS_TEST_IMAGE=keeps-server:nas-core python3 server/tests/mechanisms_smoke.py
-KEEPS_TEST_IMAGE=keeps-server:nas-core python3 server/tests/task_scheduler_smoke.py
-KEEPS_TEST_IMAGE=keeps-server:nas-core python3 server/tests/manual_full_scan_smoke.py
+docker build -f server/Dockerfile -t keeps-server:spk .
+python3 deploy/spk/export_runtime.py --image keeps-server:spk --output /tmp/keeps-native-payload
+python3 deploy/spk/pack.py --payload /tmp/keeps-native-payload --output /tmp/KeepsNativeProbe.spk
 ```
 
 配置：
 
 - `KEEPS_ROOT`：服务状态目录；`db/control_plane.sqlite` 保存资产，`db/jobs.sqlite` 保存扫描任务。
-- `ORIGINAL_ROOT`：容器内已存在的原片根目录，与服务状态目录分离；显式导入需要目标目录可写，扫描继续只读原片。
+- `ORIGINAL_ROOT`：NAS 上已存在的原片根目录，与服务状态目录分离；显式导入需要目标目录可写，扫描继续只读原片。
 - `CONTROL_PLANE_PUBLIC_BASE_URL`：客户端可达的服务地址。
 - `KEEPS_ACCESS_TOKEN`：至少 32 字节的共享访问凭据。
 - `CONTROL_PLANE_AUTO_CREATE_SCHEMA=1`：新空库初始化；现有库设 `0`，升级前备份并执行 `keeps-server migrate`。
@@ -33,9 +31,9 @@ SQLite 使用 WAL。后台扫描只读原片，文件哈希或精确 JPEG 图像
 
 SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行任务在下次启动恢复；停止追踪仅修改数据库。数据库和文件 I/O 在阻塞线程执行，查询接口不会承担媒体解码。元数据读取使用独立 WAL 快照；交互短事务优先于排队的后台事务，照片身份写入不占数据库锁。NAS 接口保持正常 CPU/I/O 优先级；扫描、编码、导入发布、移动、回收与离线导出使用独立低优先级线程，避免把优先级带入 HTTP 线程池。
 
-部署路径、迁移备份和现场验证见 [NAS 部署说明](../deploy/nas/README.md)。同一资料库只能有一个服务进程管理。
+NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现场验收见 [套件说明](../deploy/spk/README.md)。旧 Docker Compose 部署已退役，不得用于启动 NAS 服务。同一资料库只能有一个服务进程管理。
 
-版本机制需要 catalog schema 3，迁移只增加表，不回填或重组历史照片。升级前备份两个 SQLite 数据库。`mechanisms_smoke.py` 使用一次性 Linux Docker volume 和临时样本，不访问 NAS 照片；验收覆盖新增文件等待手动扫描、重启不自动补扫及显式扫描后的索引更新。
+版本机制需要 catalog schema 3，迁移只增加表，不回填或重组历史照片。升级前备份两个 SQLite 数据库。`mechanisms_smoke.py` 使用一次性 Linux Docker volume 和临时样本，不访问 NAS 照片；验收覆盖新增文件等待手动扫描、重启不自动补扫及显式扫描后的索引更新。Docker smoke 脚本仅用于隔离测试，不是 NAS 部署入口。
 
 离线逐文件夹精确重复整理使用 [批量整理脚本](../docs/folder-merge.md)。镜像包含只读 NDJSON 媒体检查命令 `keeps-inspect`；新文件归组仅匹配同一直接父目录内的原片证据，已有路径关联保留。
 
@@ -45,7 +43,7 @@ SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行
 
 服务读取 DSM `/etc/samba/smb.share.conf`，按最长匹配的共享路径确认 `enable recycle bin=yes`，随后通过参数数组调用 NAS 原生 `/usr/syno/bin/synorecycle --rmdir share=<共享名> rpath=<相对目录>`。回收位置、重名处理和删除时间记录由 DSM 管理；Keeps 不手工移动到 `#recycle`、不生成恢复记录，也不以 `rm` 或文件系统删除兜底。配置不可读、回收站未启用或原生程序不可用时明确失败。立即返回 `202` 任务对象 `{id,path,status,phase,error,createdAt,updatedAt,finishedAt}`（时间为 Unix 秒），不等待文件回收。`GET /libraries/{library}/directories/trash/{requestID}` 查询任务；未提交为 404。相同 ID 与参数重复提交返回原任务，参数不同或同一资料库已有其他删除任务为 409；缺少 ID 的旧客户端收到 422 升级提示。任务存于 `jobs.sqlite`，由进程级独立 worker 执行；状态查询使用独立连接，不等待目录执行锁或扫描事务。`status` 为 `pending/running/completed/failed`，真实阶段 `phase` 为 `waiting/recycling/reconciling/completed/failed`，没有推测百分比。客户端断连不取消操作。重启后 waiting 可执行，reconciling 继续对账；recycling 中断只检查原路径是否消失，已消失则继续对账，仍存在则对账并明确失败、提醒检查部分回收，绝不盲目重放原生回收。恢复使用 File Station 的标准回收站操作，保留期限由 NAS 设置决定。
 
-扫描、身份核对与导入发布同目录移动互斥，原生删除后核对并移除已消失的原路径索引、更新修订并停用被移动的追踪根；没有其他可用原片路径的资产从普通列表和计数排除，按 ID 的资产历史保留，不加入 Keeps 软件回收站；仍有其他路径的资产保留。通过 File Station 恢复后重新扫描（若追踪根已停用则重新追踪）才恢复可用。原生程序失败也会核对已消失的路径，避免部分完成后索引不一致；错误提醒检查 NAS 回收站，不能将错误理解为文件均仍在原目录。此接口只支持可读取真实 DSM 共享配置的 NAS 原生部署；Docker 默认未挂载该配置时不可用。
+扫描、身份核对与导入发布同目录移动互斥，原生删除后核对并移除已消失的原路径索引、更新修订并停用被移动的追踪根；没有其他可用原片路径的资产从普通列表和计数排除，按 ID 的资产历史保留，不加入 Keeps 软件回收站；仍有其他路径的资产保留。通过 File Station 恢复后重新扫描（若追踪根已停用则重新追踪）才恢复可用。原生程序失败也会核对已消失的路径，避免部分完成后索引不一致；错误提醒检查 NAS 回收站，不能将错误理解为文件均仍在原目录。此接口只支持可读取真实 DSM 共享配置的 NAS 原生部署；配置不可读时会明确失败。
 
 ## 显式回收所有弃用照片
 

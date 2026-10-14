@@ -1,6 +1,6 @@
 # Synology 原生套件
 
-Keeps 在 NAS 原生运行，Docker 只用于构建。当前支持 DS1520+ 的 geminilake 架构及 DSM 7；尚未取得 Synology 官方套件审核。
+Keeps 在 NAS 原生运行，这是唯一受支持的 NAS 服务部署方式。Docker 不用于部署 NAS 服务；仓库中的 Docker 流程只构建 SPK 运行时、运行隔离测试或执行明确安排的一次性 Linux worker。旧 NAS Docker Compose 方案已退役，不得重新启用。当前支持 DS1520+ 的 geminilake 架构及 DSM 7；尚未取得 Synology 官方套件审核。
 
 ## 构建与安装
 
@@ -41,6 +41,6 @@ python3 -m unittest discover -s deploy/spk -p 'test_*.py'
 
 恢复只写 Keeps 状态和配置，保留当前 `KEEPS_ROOT`，恢复前状态保存在该目录的 `backups/restore-before-*`。恢复后须核对服务健康、资料库及整理数据。尚未完成 Hyper Backup 备份和恢复验证前，不删除旧数据库备份。
 
-`/volume2/docker/keeps/releases/` 是历史部署目录，不作为长期备份位置；其中还混有 RAW、照片和修复前副本，禁止整目录删除。旧 Docker 服务 `keeps-control-plane` 保持停止；它保存的是迁移时点的旧状态，不能直接启动代替当前服务。原片始终保留原位，不参与套件清理。
+`/volume2/docker/keeps/releases/` 是历史部署目录，不作为长期备份位置；其中还混有 RAW、照片和修复前副本，禁止整目录删除。旧 Docker 服务 `keeps-control-plane` 已退役并保持停止；它保存的是迁移时点的旧状态，不能启动、恢复或替代当前服务。NAS 服务只能通过本说明中的 SPK 流程部署。原片始终保留原位，不参与套件清理。
 
 接口线程保持正常 CPU/I/O 优先级，扫描、编码、导入发布、移动、回收及离线导出在线程级使用 `Nice=10` 和 best-effort I/O 优先级 7，避免整个套件降级拖慢元数据同步。
