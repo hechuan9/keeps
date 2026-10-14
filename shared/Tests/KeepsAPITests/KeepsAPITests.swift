@@ -7,6 +7,29 @@ private let assetJSON = """
 """
 
 struct KeepsAPITests {
+    @Test func videoPlaybackRequestsSignedURLWithAuthentication() async throws {
+        let id = UUID()
+        let hash = String(repeating: "a", count: 64)
+        let fixture = Fixture { request in
+            #expect(request.httpMethod == "GET")
+            #expect(request.url!.path == "/api/libraries/library/assets/\(id.uuidString)/versions/\(hash)/playback")
+            #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")
+            return (200, #"{"playbackURL":"https://media.example/derivatives/local-playback/signed-token","expiresAt":2000000000}"#)
+        }
+        let playback = try await fixture.client.videoPlayback(assetID: id, contentHash: hash)
+        #expect(playback.playbackURL.absoluteString == "https://media.example/derivatives/local-playback/signed-token")
+        #expect(playback.expiresAt == 2000000000)
+    }
+
+    @Test func videoPlaybackRejectsNonHTTPMediaSources() async throws {
+        let fixture = Fixture { _ in
+            (200, #"{"playbackURL":"file:///photos/sample.mov","expiresAt":2000000000}"#)
+        }
+        await #expect(throws: KeepsAPIError.self) {
+            try await fixture.client.videoPlayback(assetID: UUID(), contentHash: String(repeating: "a", count: 64))
+        }
+    }
+
     @Test func directoryMetadataRefreshSubmitsServerPathAndReturnsPersistentJob() async throws {
         let fixture = Fixture { request in
             #expect(request.httpMethod == "POST")

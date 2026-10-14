@@ -10,7 +10,6 @@ final class VideoPlaybackStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var error: String?
     private var task: Task<Void, Never>?
-    private var directory: URL?
     private var observation: NSKeyValueObservation?
     private let logger = Logger(subsystem: "local.keeps", category: "VideoPlayback")
 
@@ -29,40 +28,36 @@ final class VideoPlaybackStore: ObservableObject {
         error = nil
         isLoading = true
         task = Task { [self] in
-            let temporary = FileManager.default.temporaryDirectory.appendingPathComponent("KeepsVideo-" + UUID().uuidString)
-            var installed = false
-            defer {
-                if !installed { removeTemporary(temporary) }
-            }
             do {
                 let versions = try await client.versions(assetID: asset.id)
                 try Task.checkCancellation()
                 guard let version = Self.playableVersion(versions) else {
                     throw PlaybackError.unavailable
                 }
-                try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: true)
-                let url = temporary.appendingPathComponent("video").appendingPathExtension(URL(fileURLWithPath: version.filename).pathExtension)
-                try await client.downloadVersion(assetID: asset.id, contentHash: version.contentHash, to: url)
+                let descriptor = try await client.videoPlayback(assetID: asset.id, contentHash: version.contentHash)
                 try Task.checkCancellation()
-                let media = AVURLAsset(url: url)
-                guard try await media.load(.isPlayable) else { throw PlaybackError.unsupported }
-                try Task.checkCancellation()
+                let media = AVURLAsset(url: descriptor.playbackURL)
                 let item = AVPlayerItem(asset: media)
                 let playback = AVPlayer(playerItem: item)
-                observation = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-                    guard item.status == .failed else { return }
-                    let message = String(reflecting: item.error)
+                player = playback
+                observation = item.observe(\.status, options: [.initial, .new]) { [weak self] item, _ in
                     Task { @MainActor [weak self] in
                         guard let self, self.player?.currentItem === item else { return }
-                        self.error = "影片播放失败：\(message)"
-                        self.logger.error("Playback failed: \(message, privacy: .public)")
-                        self.player?.pause()
+                        switch item.status {
+                        case .readyToPlay:
+                            self.isLoading = false
+                        case .failed:
+                            self.isLoading = false
+                            let message = String(reflecting: item.error)
+                            self.error = descriptor.expiresAt <= Date().timeIntervalSince1970
+                                ? "播放地址已过期，请重新打开影片。\n\(message)"
+                                : "影片播放失败，请检查网络或影片格式后重新打开。\n\(message)"
+                            self.logger.error("Playback failed: \(message, privacy: .private)")
+                            playback.pause()
+                        default: break
+                        }
                     }
                 }
-                directory = temporary
-                installed = true
-                player = playback
-                isLoading = false
                 playback.play()
             } catch {
                 guard !Task.isCancelled else { return }
@@ -80,23 +75,15 @@ final class VideoPlaybackStore: ObservableObject {
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
-        if let directory { removeTemporary(directory) }
-        directory = nil
+        error = nil
         isLoading = false
     }
 
-    private func removeTemporary(_ url: URL) {
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        do { try FileManager.default.removeItem(at: url) }
-        catch { logger.error("Video cache cleanup failed: \(String(reflecting: error), privacy: .public)") }
-    }
-
     private enum PlaybackError: LocalizedError {
-        case unavailable, unsupported
+        case unavailable
         var errorDescription: String? {
             switch self {
             case .unavailable: "服务器没有可用的影片原文件。"
-            case .unsupported: "macOS 播放器不支持此影片的编码或格式。"
             }
         }
     }
@@ -108,16 +95,17 @@ struct VideoPlaybackWindow: View {
     var body: some View {
         ZStack {
             Color.black
+            if let player = store.player {
+                VideoPlayer(player: player)
+            }
             if let error = store.error {
                 ScrollView { Text(error).textSelection(.enabled).padding(24) }
             } else if store.isLoading {
                 VStack(spacing: 16) {
                     ProgressView().progressViewStyle(.linear).frame(width: 260)
-                    Text("正在从服务器下载影片，下载完成后开始播放…")
+                    Text("正在连接服务器并缓冲影片…")
                 }.padding(24)
-            } else if let player = store.player {
-                VideoPlayer(player: player)
-            } else {
+            } else if store.player == nil {
                 Text("在图库中双击影片开始播放。")
             }
         }

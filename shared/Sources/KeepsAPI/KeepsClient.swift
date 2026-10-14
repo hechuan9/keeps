@@ -42,6 +42,12 @@ public final class KeepsClient: Sendable {
     public func versionDetails(assetID: UUID) async throws -> KeepsAssetVersions {
         try await request("GET", library + ["assets", assetID.uuidString, "versions"])
     }
+    public func videoPlayback(assetID: UUID, contentHash: String) async throws -> KeepsVideoPlayback {
+        let playback: KeepsVideoPlayback = try await request("GET", library + ["assets", assetID.uuidString, "versions", contentHash, "playback"])
+        guard ["http", "https"].contains(playback.playbackURL.scheme?.lowercased() ?? ""),
+              playback.playbackURL.host != nil else { throw KeepsAPIError.invalidResponse }
+        return playback
+    }
     public func downloadVersion(assetID: UUID, contentHash: String, to destination: URL) async throws {
         var request = try makeRequest("GET", library + ["assets", assetID.uuidString, "versions", contentHash, "download"])
         request.setValue("application/octet-stream", forHTTPHeaderField: "Accept")

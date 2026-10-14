@@ -20,6 +20,11 @@ public struct KeepsPreview: Codable, Equatable, Sendable {
     public var version: String
 }
 
+public struct KeepsVideoPlayback: Decodable, Sendable {
+    public var playbackURL: URL
+    public var expiresAt: TimeInterval
+}
+
 public struct KeepsAsset: Codable, Identifiable, Equatable, Sendable {
     public var id: UUID
     public var captureTime: String?

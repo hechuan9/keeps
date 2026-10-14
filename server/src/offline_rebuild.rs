@@ -594,7 +594,7 @@ async fn status(
     )
     .into_response())
 }
-fn range(value: &str, length: u64) -> Result<(u64, u64)> {
+pub(crate) fn range(value: &str, length: u64) -> Result<(u64, u64)> {
     let value = value.strip_prefix("bytes=").context("invalid range unit")?;
     let (start, end) = value.split_once('-').context("invalid range")?;
     ensure!(!value.contains(','), "multiple ranges unsupported");

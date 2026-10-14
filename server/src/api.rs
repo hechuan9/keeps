@@ -4,7 +4,7 @@ use crate::{previews::PreviewStorage, store::Store};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -107,6 +107,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/libraries/{library}/assets/{asset}/default-version",
             axum::routing::put(default_version),
         )
+        .route(
+            "/libraries/{library}/assets/{asset}/versions/{hash}/playback",
+            get(version_playback),
+        )
         .route("/libraries/{library}/revision", get(revision))
         .route("/libraries/{library}/counts", get(counts))
         .route("/libraries/{library}/cache-status", get(cache_status))
@@ -174,6 +178,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(protected)
         .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/derivatives/local-download/{token}", get(local_download))
+        .route("/derivatives/local-playback/{token}", get(local_playback))
         .route(
             "/derivatives/local-upload/{token}",
             axum::routing::put(crate::edits::upload),
@@ -812,79 +817,215 @@ async fn versions(
     let id = asset_id(&id)?;
     Ok(Json(blocking(move || state.store.versions(&library, &id)).await?).into_response())
 }
-async fn version_download(
-    State(state): State<Arc<AppState>>,
-    Path((library, id, hash)): Path<(String, String, String)>,
-) -> ApiResult {
-    require_library(&state, &library)?;
-    let id = asset_id(&id)?;
+fn open_version_source(
+    state: &AppState,
+    library: &str,
+    id: &str,
+    hash: &str,
+) -> anyhow::Result<(std::fs::File, &'static str)> {
+    let validation_error = |error: ApiError| {
+        anyhow::Error::new(crate::store::StoreError {
+            status: error.0.as_u16(),
+            code: error.1,
+            message: error.2,
+        })
+    };
+    require_library(state, library).map_err(validation_error)?;
+    let id = asset_id(id).map_err(validation_error)?;
     if hash.len() != 64
         || !hash
             .bytes()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
-        return Err(resource_error(400, "invalid content hash").into());
+        return Err(resource_error(400, "invalid content hash"));
     }
-    let file = blocking(move || {
-        let versions = state.store.versions(&library, &id)?;
-        let version = versions["items"]
-            .as_array()
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|v| v["contentHash"] == hash && v["available"] == true)
-            })
-            .ok_or_else(|| resource_error(404, "version not available for this asset"))?;
-        let folders = state.jobs.folders()?;
-        for location in version["paths"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|p| p["available"] == true)
-        {
-            let Some(raw_path) = location["path"].as_str() else {
-                continue;
-            };
-            let path = std::path::Path::new(raw_path);
-            let Some(folder) = folders
+    let versions = state.store.versions(library, &id)?;
+    let version = versions["items"]
+        .as_array()
+        .and_then(|items| {
+            items
                 .iter()
-                .find(|f| f.active && f.library_id == library && path.starts_with(&f.path))
-            else {
-                continue;
-            };
-            let Some(record) = state.jobs.file_state(&folder.id, raw_path)? else {
-                continue;
-            };
-            if record.asset_id != id || record.version != hash || record.error.is_some() {
-                continue;
-            }
-            let Ok(metadata) = std::fs::symlink_metadata(path) else {
-                continue;
-            };
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err(resource_error(409, "version source is not a regular file"));
-            }
-            state.jobs.validate_path(
-                path.parent()
-                    .ok_or_else(|| resource_error(409, "missing source parent"))?,
-            )?;
-            let file = std::fs::File::open(path)?;
-            let metadata = file.metadata()?;
-            let modified = metadata
-                .modified()?
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos();
-            if metadata.len() != record.size as u64 || modified != record.mtime_ns as u128 {
-                return Err(resource_error(
-                    409,
-                    "version source changed; refresh inventory",
-                ));
-            }
-            return Ok(file);
+                .find(|v| v["contentHash"] == hash && v["available"] == true)
+        })
+        .ok_or_else(|| resource_error(404, "version not available for this asset"))?;
+    let folders = state.jobs.folders()?;
+    for location in version["paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|p| p["available"] == true)
+    {
+        let Some(raw_path) = location["path"].as_str() else {
+            continue;
+        };
+        let path = std::path::Path::new(raw_path);
+        let Some(folder) = folders
+            .iter()
+            .find(|f| f.active && f.library_id == library && path.starts_with(&f.path))
+        else {
+            continue;
+        };
+        let Some(record) = state.jobs.file_state(&folder.id, raw_path)? else {
+            continue;
+        };
+        if record.asset_id != id || record.version != hash || record.error.is_some() {
+            continue;
         }
-        Err(resource_error(404, "tracked version source unavailable"))
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(resource_error(409, "version source is not a regular file"));
+        }
+        state.jobs.validate_path(
+            path.parent()
+                .ok_or_else(|| resource_error(409, "missing source parent"))?,
+        )?;
+        let file = std::fs::File::open(path)?;
+        let metadata = file.metadata()?;
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        if metadata.len() != record.size as u64 || modified != record.mtime_ns as u128 {
+            return Err(resource_error(
+                409,
+                "version source changed; refresh inventory",
+            ));
+        }
+        return Ok((file, video_mime(path)));
+    }
+    Err(resource_error(404, "tracked version source unavailable"))
+}
+fn video_mime(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|v| v.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "mts" | "m2ts" | "ts" => "video/mp2t",
+        "mpg" | "mpeg" => "video/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn version_playback(
+    State(state): State<Arc<AppState>>,
+    Path((library, id, hash)): Path<(String, String, String)>,
+) -> ApiResult {
+    Ok(Json(
+        blocking(move || {
+            open_version_source(&state, &library, &id, &hash)?;
+            state.previews.playback_descriptor(&library, &id, &hash)
+        })
+        .await?,
+    )
+    .into_response())
+}
+
+async fn local_playback(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    method: Method,
+    headers: HeaderMap,
+) -> ApiResult {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let (file, mime, hash) = blocking(move || {
+        let payload = state.previews.verify(&token, "playback")?;
+        let (file, mime) = open_version_source(
+            &state,
+            payload["library"].as_str().unwrap(),
+            payload["asset"].as_str().unwrap(),
+            payload["hash"].as_str().unwrap(),
+        )?;
+        Ok((file, mime, payload["hash"].as_str().unwrap().to_owned()))
     })
     .await?;
+    let mut file = tokio::fs::File::from_std(file);
+    let length = file.metadata().await.map_err(anyhow::Error::from)?.len();
+    let etag = format!("\"{hash}\"");
+    let requested = headers.get(header::RANGE).filter(|value| {
+        method == Method::GET
+            && value
+                .to_str()
+                .is_ok_and(|value| value.starts_with("bytes="))
+            && headers
+                .get(header::IF_RANGE)
+                .is_none_or(|v| v.to_str().ok() == Some(etag.as_str()))
+    });
+    let selected = if let Some(value) = requested {
+        match value
+            .to_str()
+            .ok()
+            .and_then(|v| crate::offline_rebuild::range(v, length).ok())
+        {
+            Some(range) => Some(range),
+            None => {
+                return Ok((
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    [
+                        (header::CONTENT_RANGE, format!("bytes */{length}")),
+                        (header::ACCEPT_RANGES, "bytes".into()),
+                        (header::ETAG, etag),
+                    ],
+                )
+                    .into_response());
+            }
+        }
+    } else {
+        None
+    };
+    let (start, count) = selected
+        .map(|(start, end)| (start, end - start + 1))
+        .unwrap_or((0, length));
+    let body = if method == Method::HEAD {
+        axum::body::Body::empty()
+    } else {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(anyhow::Error::from)?;
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file.take(count)))
+    };
+    let mut response = body.into_response();
+    *response.status_mut() = if selected.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    for (key, value) in [
+        (header::CONTENT_TYPE, mime.to_owned()),
+        (header::CONTENT_LENGTH, count.to_string()),
+        (header::ACCEPT_RANGES, "bytes".into()),
+        (header::ETAG, etag),
+        (header::CACHE_CONTROL, "private, no-store".into()),
+    ] {
+        response
+            .headers_mut()
+            .insert(key, value.parse().map_err(anyhow::Error::from)?);
+    }
+    if let Some((start, end)) = selected {
+        response.headers_mut().insert(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{length}")
+                .parse()
+                .map_err(anyhow::Error::from)?,
+        );
+    }
+    Ok(response)
+}
+
+async fn version_download(
+    State(state): State<Arc<AppState>>,
+    Path((library, id, hash)): Path<(String, String, String)>,
+) -> ApiResult {
+    let (file, _) = blocking(move || open_version_source(&state, &library, &id, &hash)).await?;
     let file = tokio::fs::File::from_std(file);
     let length = file.metadata().await.map_err(anyhow::Error::from)?.len();
     let body = axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(file));

@@ -117,6 +117,17 @@ impl PreviewStorage {
         self.signed_url(object_ref, "download")
     }
 
+    pub(crate) fn playback_descriptor(
+        &self,
+        library: &str,
+        asset: &str,
+        hash: &str,
+    ) -> Result<Value> {
+        let expires = now()? + 24 * 60 * 60;
+        let payload = json!({"library": library, "asset": asset, "hash": hash, "operation": "playback", "expires": expires});
+        Ok(json!({"playbackURL": self.sign_payload(&payload, "playback")?, "expiresAt": expires}))
+    }
+
     pub fn write(&self, token: &str, bytes: &[u8]) -> Result<()> {
         let object = self.verify(token, "upload")?;
         let path = self.object_path(&object)?;
@@ -210,7 +221,11 @@ impl PreviewStorage {
     pub(crate) fn signed_url(&self, object: &Value, operation: &str) -> Result<String> {
         self.object_path(object)?;
         let payload = json!({"bucket": text(object, "bucket")?, "key": text(object, "key")?, "operation": operation, "expires": now()? + TOKEN_LIFETIME});
-        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload)?);
+        self.sign_payload(&payload, operation)
+    }
+
+    fn sign_payload(&self, payload: &Value, operation: &str) -> Result<String> {
+        let encoded = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload)?);
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.signing_key)?;
         mac.update(encoded.as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
@@ -241,7 +256,13 @@ impl PreviewStorage {
             let expires = payload["expires"]
                 .as_u64()
                 .context("missing token expiry")?;
-            validate_object(&payload)?;
+            if operation != "playback" {
+                validate_object(&payload)?;
+            } else {
+                for field in ["library", "asset", "hash"] {
+                    text(&payload, field)?;
+                }
+            }
             Ok((payload, expires))
         })()
         .map_err(|error| {
@@ -261,7 +282,9 @@ impl PreviewStorage {
             };
             return Err(error.context(context));
         }
-        self.object_path(&payload)?;
+        if operation != "playback" {
+            self.object_path(&payload)?;
+        }
         Ok(payload)
     }
 }
@@ -383,6 +406,32 @@ mod tests {
     }
     fn token(url: &str) -> &str {
         url.rsplit('/').next().unwrap()
+    }
+
+    #[test]
+    fn playback_tokens_are_scoped_expiring_and_operation_specific() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = PreviewStorage::new(dir.path(), None, "http://localhost", "key")?;
+        let descriptor = storage.playback_descriptor("library", "asset", "hash")?;
+        let value = token(descriptor["playbackURL"].as_str().unwrap());
+        let payload = storage.verify(value, "playback")?;
+        assert_eq!(payload["library"], "library");
+        assert_eq!(payload["asset"], "asset");
+        assert_eq!(payload["hash"], "hash");
+        assert_eq!(payload["expires"], descriptor["expiresAt"]);
+        assert!(payload["expires"].as_u64().unwrap() >= now()? + 86399);
+        assert!(storage.verify(value, "download").is_err());
+        assert!(storage.verify(&format!("{value}x"), "playback").is_err());
+        let mut expired = payload;
+        expired["expires"] = json!(now()? - 1);
+        let url = storage.sign_payload(&expired, "playback")?;
+        assert!(storage.verify(token(&url), "playback").is_err());
+        let preview = storage.upload(&request())?;
+        let token = token(preview["uploadURL"].as_str().unwrap());
+        assert!(storage.verify(token, "playback").is_err());
+        let upload = storage.verify(token, "upload")?;
+        assert!(upload["expires"].as_u64().unwrap() <= now()? + TOKEN_LIFETIME);
+        Ok(())
     }
 
     #[test]

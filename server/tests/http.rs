@@ -2769,3 +2769,155 @@ async fn tag_library_requires_authentication_and_validates_atomic_additions() {
         (StatusCode::OK, json!({"tags":["旅行"]}))
     );
 }
+
+#[tokio::test]
+async fn playback_streams_ranges_and_revalidates_original() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let state = state(&root);
+    let path = root.join("originals/sample.MP4");
+    let content = b"0123456789abcdef";
+    std::fs::write(&path, content).unwrap();
+    let hash = "a".repeat(64);
+    let id = state.store.ingest_original("photos", path.to_str().unwrap(),
+        &json!({"contentHash":hash,"sizeBytes":16,"role":"video_original"}),
+        &json!({"originalFilename":"sample.MP4","contentFingerprint":hash,"metadataFingerprint":"sample","rating":0,"tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})).unwrap();
+    let folder = state.jobs.add_folder("photos", ".").unwrap();
+    let mtime = std::fs::metadata(&path)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    state
+        .jobs
+        .record_file(
+            &folder.id,
+            path.to_str().unwrap(),
+            16,
+            mtime,
+            &id,
+            &hash,
+            None,
+        )
+        .unwrap();
+    let app = router(state.clone());
+    let descriptor = format!("/libraries/photos/assets/{id}/versions/{hash}/playback");
+    let unauth = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&descriptor)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    let (status, descriptor) = call(app.clone(), "GET", &descriptor, Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let url = descriptor["playbackURL"].as_str().unwrap();
+    let route = url.strip_prefix("http://localhost").unwrap();
+    for (method, range, if_range, status, expected) in [
+        ("GET", None, None, StatusCode::OK, &content[..]),
+        (
+            "GET",
+            Some("bytes=0-1"),
+            None,
+            StatusCode::PARTIAL_CONTENT,
+            &content[..2],
+        ),
+        (
+            "GET",
+            Some("bytes=10-"),
+            None,
+            StatusCode::PARTIAL_CONTENT,
+            &content[10..],
+        ),
+        (
+            "GET",
+            Some("bytes=-3"),
+            None,
+            StatusCode::PARTIAL_CONTENT,
+            &content[13..],
+        ),
+        (
+            "GET",
+            Some("bytes=3-5"),
+            Some("\"different\""),
+            StatusCode::OK,
+            &content[..],
+        ),
+        ("GET", Some("items=3-5"), None, StatusCode::OK, &content[..]),
+        ("HEAD", None, None, StatusCode::OK, &content[..0]),
+        (
+            "HEAD",
+            Some("bytes=3-5"),
+            None,
+            StatusCode::OK,
+            &content[..0],
+        ),
+    ] {
+        let mut request = Request::builder().method(method).uri(route);
+        if let Some(range) = range {
+            request = request.header("range", range);
+        }
+        if let Some(value) = if_range {
+            request = request.header("if-range", value);
+        }
+        let response = app
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert_eq!(response.headers()["content-type"], "video/mp4");
+        assert_eq!(response.headers()["accept-ranges"], "bytes");
+        assert_eq!(response.headers()["etag"], format!("\"{hash}\""));
+        if method == "HEAD" {
+            assert_eq!(response.headers()["content-length"], "16");
+        }
+        if status == StatusCode::OK {
+            assert!(response.headers().get("content-range").is_none());
+        }
+        if range == Some("bytes=0-1") {
+            assert_eq!(response.headers()["content-range"], "bytes 0-1/16");
+        }
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            expected
+        );
+    }
+    for range in ["bytes=16-", "bytes=3-2", "bytes=0-1,3-4", "bytes=-0"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .header("range", range)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(response.headers()["content-range"], "bytes */16");
+    }
+    std::fs::write(&path, b"changed").unwrap();
+    assert_eq!(
+        call(app.clone(), "GET", route, Value::Null).await.0,
+        StatusCode::CONFLICT
+    );
+    state.jobs.remove_folder(&folder.id).unwrap();
+    assert_eq!(
+        call(app, "GET", route, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
