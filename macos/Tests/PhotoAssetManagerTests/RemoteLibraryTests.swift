@@ -5,6 +5,52 @@ import KeepsAPI
 @testable import PhotoAssetManager
 
 @MainActor struct RemoteLibraryTests {
+    @Test func directoryMenuUsesEntireVisibleRowAndPreservesSelection() async throws {
+        _ = NSApplication.shared
+        let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://tree.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)
+        store.refreshNavigation()
+        try await waitUntil { !store.isLoadingNavigation }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 120), styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let scroll = NSScrollView(frame: NSRect(x: 10, y: 10, width: 300, height: 40))
+        let outline = DirectoryOutlineView.DirectoryOutline(frame: NSRect(x: 0, y: 0, width: 300, height: 200))
+        outline.headerView = nil
+        outline.rowHeight = 30
+        let column = NSTableColumn(identifier: .init("directory"))
+        column.width = 300
+        outline.addTableColumn(column)
+        outline.outlineTableColumn = column
+        let coordinator = DirectoryOutlineView.Coordinator(library: store)
+        coordinator.outline = outline
+        outline.dataSource = coordinator
+        outline.delegate = coordinator
+        outline.contextMenuForItem = { coordinator.contextMenu(for: $0) }
+        scroll.documentView = outline
+        window.contentView?.addSubview(scroll)
+        coordinator.update()
+        outline.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        let selectedPath = store.query.directory
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 25))
+        let clicked = try #require(outline.item(atRow: 1) as? DirectoryOutlineView.Coordinator.Node)
+        for x in [2.0, 18.0, 50.0, 180.0, 290.0] {
+            for controlClick in [false, true] {
+                let point = outline.convert(NSPoint(x: x, y: outline.rect(ofRow: 1).midY), to: nil)
+                let event = try #require(NSEvent.mouseEvent(with: controlClick ? .leftMouseDown : .rightMouseDown, location: point, modifierFlags: controlClick ? .control : [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+                let hitPoint = scroll.contentView.convert(point, from: nil)
+                #expect(outline.hitTest(hitPoint) === outline)
+                let menu = try #require(outline.menu(for: event))
+                let entry = try #require(menu.items.first { $0.title == "复制服务器路径" })
+                #expect((entry.representedObject as? DirectoryOutlineView.Coordinator.Node)?.path == clicked.path)
+                #expect(outline.selectedRow == 0)
+                #expect(store.query.directory == selectedPath)
+            }
+        }
+        let outside = try #require(NSEvent.mouseEvent(with: .rightMouseDown, location: NSPoint(x: 5, y: 5), modifierFlags: [], timestamp: 0, windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        #expect(outline.hitTest(scroll.contentView.convert(outside.locationInWindow, from: nil)) == nil)
+
+    }
+
     @Test func metadataRefreshTargetsRightClickedDirectoryWithoutChangingSelection() async throws {
         _ = NSApplication.shared
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://tree.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false)

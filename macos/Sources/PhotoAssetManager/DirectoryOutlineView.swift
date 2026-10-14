@@ -57,6 +57,33 @@ struct DirectoryOutlineView: NSViewRepresentable {
     final class DirectoryOutline: NSOutlineView {
         var contextMenuForItem: ((Any) -> NSMenu?)?
         private(set) var dropTargetRow = -1
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            guard let hit = super.hitTest(point) else { return nil }
+            let location = convert(point, from: superview)
+            let index = row(at: location)
+            // 目录整行统一接收鼠标事件；状态行保留重试按钮的原生交互。
+            if index >= 0, item(atRow: index) is Coordinator.Node { return self }
+            return hit
+        }
+
+        override func mouseDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.control) {
+                rightMouseDown(with: event)
+                return
+            }
+            let location = convert(event.locationInWindow, from: nil)
+            let index = row(at: location)
+            if index >= 0, let item = item(atRow: index), isExpandable(item),
+               frameOfOutlineCell(atRow: index).contains(location) {
+                if isItemExpanded(item) {
+                    if delegate?.outlineView?(self, shouldCollapseItem: item) != false { collapseItem(item) }
+                } else {
+                    if delegate?.outlineView?(self, shouldExpandItem: item) != false { expandItem(item) }
+                }
+                return
+            }
+            super.mouseDown(with: event)
+        }
 
         func highlightDropTarget(row: Int) {
             if dropTargetRow != row {
@@ -118,13 +145,6 @@ struct DirectoryOutlineView: NSViewRepresentable {
             let index = row(at: convert(event.locationInWindow, from: nil))
             guard index >= 0, let item = item(atRow: index) else { return nil }
             return contextMenuForItem?(item)
-        }
-
-        override func hitTest(_ point: NSPoint) -> NSView? {
-            guard let hit = super.hitTest(point) else { return nil }
-            // 右键由目录树按整行定位，避免箭头或文字控件截获上下文菜单事件。
-            if NSApp.currentEvent?.type == .rightMouseDown { return self }
-            return hit
         }
 
         override func rightMouseDown(with event: NSEvent) {
