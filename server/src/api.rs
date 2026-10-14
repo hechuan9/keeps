@@ -840,25 +840,12 @@ fn open_version_source(
     {
         return Err(resource_error(400, "invalid content hash"));
     }
-    let versions = state.store.versions(library, &id)?;
-    let version = versions["items"]
-        .as_array()
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|v| v["contentHash"] == hash && v["available"] == true)
-        })
-        .ok_or_else(|| resource_error(404, "version not available for this asset"))?;
+    let paths = state.store.available_version_paths(library, &id, hash)?;
+    if paths.is_empty() {
+        return Err(resource_error(404, "version not available for this asset"));
+    }
     let folders = state.jobs.folders()?;
-    for location in version["paths"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|p| p["available"] == true)
-    {
-        let Some(raw_path) = location["path"].as_str() else {
-            continue;
-        };
+    for raw_path in &paths {
         let path = std::path::Path::new(raw_path);
         let Some(folder) = folders
             .iter()

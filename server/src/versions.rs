@@ -5,6 +5,10 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+// Path ordering otherwise encourages SQLite to scan the library-wide path primary key.
+const VERSION_PATHS: &str = "SELECT p.path,p.available FROM catalog_version_paths p INDEXED BY catalog_version_paths_asset WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
+const AVAILABLE_VERSION_PATHS: &str = "SELECT p.path FROM catalog_version_paths p INDEXED BY catalog_version_paths_asset JOIN catalog_versions v USING(library_id,asset_id,content_hash) JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path";
+
 #[derive(Default, Debug, Clone)]
 pub struct VersionEvidence {
     /// Exact image content only: never a perceptual or downsampled hash.
@@ -369,6 +373,13 @@ impl Store {
     pub fn default_version(&self, lib: &str, id: &str) -> Result<Option<DefaultVersion>> {
         Ok(self.read()?.query_row("SELECT d.content_hash,p.path FROM catalog_defaults d JOIN catalog_version_paths p USING(library_id,asset_id,content_hash) WHERE d.library_id=? AND d.asset_id=? AND p.available=1 AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path LIMIT 1",params![lib,id],|r|Ok(DefaultVersion{content_hash:r.get(0)?,path:r.get(1)?})).optional()?)
     }
+    pub fn available_version_paths(&self, lib: &str, id: &str, hash: &str) -> Result<Vec<String>> {
+        let db = self.read()?;
+        let mut statement = db.prepare(AVAILABLE_VERSION_PATHS)?;
+        Ok(statement
+            .query_map(params![lib, id, hash], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     pub fn versions(&self, lib: &str, id: &str) -> Result<Value> {
         let mut connection = self.read()?;
         let db = connection.transaction()?;
@@ -401,7 +412,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let mut items = Vec::new();
         for (hash, width, height, priority, evidence, default, user, available) in rows {
-            let mut paths=db.prepare("SELECT p.path,p.available FROM catalog_version_paths p WHERE p.library_id=? AND p.asset_id=? AND p.content_hash=? AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY p.path")?;
+            let mut paths = db.prepare(VERSION_PATHS)?;
             let paths = paths
                 .query_map(params![lib, id, hash], |r| {
                     Ok(json!({"path":r.get::<_,String>(0)?,"available":r.get::<_,bool>(1)?}))
@@ -468,6 +479,76 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_paths_are_scoped_available_and_not_deprecated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let id =
+            store.ingest_original("lib", "/photos/a.mp4", &file("video", false), &snapshot())?;
+        {
+            let db = store.lock()?;
+            for (path, available) in [
+                ("/photos/z.mp4", 1),
+                ("/photos/missing.mp4", 0),
+                ("/photos/deprecated.mp4", 1),
+            ] {
+                db.execute(
+                    "INSERT INTO catalog_version_paths VALUES(?,?,?,?,?)",
+                    params!["lib", path, id, "video", available],
+                )?;
+            }
+            db.execute(
+                "INSERT INTO catalog_deprecated_files VALUES(?,?,?,?,?)",
+                params![
+                    "lib",
+                    "/photos/deprecated.mp4",
+                    "/photos/a.mp4",
+                    "duplicate",
+                    "duplicate"
+                ],
+            )?;
+        }
+        assert_eq!(
+            store.available_version_paths("lib", &id, "video")?,
+            vec!["/photos/a.mp4", "/photos/z.mp4"]
+        );
+        assert!(
+            store
+                .available_version_paths("other", &id, "video")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .available_version_paths("lib", "other", "video")?
+                .is_empty()
+        );
+        assert!(
+            store
+                .available_version_paths("lib", &id, "other")?
+                .is_empty()
+        );
+        let versions = store.versions("lib", &id)?;
+        assert_eq!(versions["items"][0]["paths"].as_array().unwrap().len(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_version_paths_use_asset_index_instead_of_library_scan() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let db = store.read()?;
+        for sql in [VERSION_PATHS, AVAILABLE_VERSION_PATHS] {
+            let mut query = db.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let plan = query
+                .query_map(params!["lib", "asset", "hash"], |row| {
+                    row.get::<_, String>(3)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(plan.iter().any(|step| step.contains("SEARCH p USING INDEX catalog_version_paths_asset (library_id=? AND asset_id=? AND content_hash=?")), "{plan:?}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn standard_names_skip_user_files_and_reuse_confirmed_versions() -> Result<()> {
         let dir = tempfile::tempdir()?;
