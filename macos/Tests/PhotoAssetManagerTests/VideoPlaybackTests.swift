@@ -2,10 +2,34 @@ import Foundation
 import Testing
 import KeepsAPI
 import AVFoundation
+import AVKit
+import SwiftUI
 @testable import PhotoAssetManager
 
 @MainActor
 struct VideoPlaybackTests {
+    @Test func rendersNativePlayerInHostingWindow() throws {
+        _ = NSApplication.shared
+        let player = AVPlayer()
+        let hosting = NSHostingView(rootView: NativeVideoPlayer(player: player))
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 360),
+            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = hosting
+        defer { window.contentView = nil; window.close() }
+        window.orderFront(nil)
+        hosting.layoutSubtreeIfNeeded()
+        window.displayIfNeeded()
+        func playerView(in view: NSView) -> AVPlayerView? {
+            if let view = view as? AVPlayerView { return view }
+            return view.subviews.lazy.compactMap { playerView(in: $0) }.first
+        }
+        let view = try #require(playerView(in: hosting))
+        #expect(view.player === player)
+        NativeVideoPlayer.dismantleNSView(view, coordinator: ())
+        #expect(view.player == nil)
+    }
+
     @Test func deniedPlaybackDoesNotFallBackToDownloadingOriginal() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DeniedPlaybackProtocol.self]

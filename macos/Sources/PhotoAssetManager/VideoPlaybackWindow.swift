@@ -96,7 +96,7 @@ struct VideoPlaybackWindow: View {
         ZStack {
             Color.black
             if let player = store.player {
-                VideoPlayer(player: player)
+                NativeVideoPlayer(player: player)
             }
             if let error = store.error {
                 ScrollView { Text(error).textSelection(.enabled).padding(24) }
@@ -113,5 +113,27 @@ struct VideoPlaybackWindow: View {
         .frame(minWidth: 480, minHeight: 300)
         .navigationTitle(store.title)
         .onDisappear { store.close() }
+    }
+}
+
+struct NativeVideoPlayer: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.controlsStyle = .floating
+        view.videoGravity = .resizeAspect
+        view.player = player
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        if view.player !== player {
+            view.player = player
+        }
+    }
+
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: ()) {
+        view.player = nil
     }
 }
