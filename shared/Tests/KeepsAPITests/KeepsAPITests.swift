@@ -43,10 +43,10 @@ struct KeepsAPITests {
             #expect(request.httpMethod == "GET")
             #expect(request.url!.path == "/api/libraries/library/assets/\(id.uuidString)/versions/\(hash)/playback")
             #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-credential")
-            return (200, #"{"playbackURL":"https://media.example/derivatives/local-playback/signed-token","expiresAt":2000000000}"#)
+            return (200, #"{"playbackURL":"http://192.168.0.50:2283/derivatives/local-playback/signed-token","expiresAt":2000000000}"#)
         }
         let playback = try await fixture.client.videoPlayback(assetID: id, contentHash: hash)
-        #expect(playback.playbackURL.absoluteString == "https://media.example/derivatives/local-playback/signed-token")
+        #expect(playback.playbackURL == fixture.client.configuration.baseURL.appendingPathComponent("derivatives/local-playback/signed-token"))
         #expect(playback.expiresAt == 2000000000)
     }
 

@@ -79,6 +79,7 @@ final class VideoPlaybackStore: ObservableObject {
                                 : "影片播放失败，请检查网络或影片格式后重新打开。\n\(message)"
                             self.logger.error("Playback failed: \(message, privacy: .private)")
                             playback.pause()
+                            self.player = nil
                         default: break
                         }
                     }
@@ -258,17 +259,23 @@ struct VideoPlaybackWindow: View {
     var body: some View {
         ZStack {
             Color.black
-            if let player = store.player {
+            if let error = store.error {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("影片播放失败").font(.headline)
+                        Text(error).textSelection(.enabled)
+                        Text("关闭此窗口后重新打开影片以重试。")
+                    }.padding(24).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else if let player = store.player {
                 NativeVideoPlayer(player: player)
             }
-            if let error = store.error {
-                ScrollView { Text(error).textSelection(.enabled).padding(24) }
-            } else if store.isLoading {
+            if store.error == nil && store.isLoading {
                 VStack(spacing: 16) {
                     ProgressView().progressViewStyle(.linear).frame(width: 260)
                     Text("正在连接服务器并缓冲影片…")
                 }.padding(24)
-            } else if store.player == nil {
+            } else if store.error == nil && store.player == nil {
                 Text("在图库中双击影片开始播放。")
             }
         }

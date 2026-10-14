@@ -67,6 +67,22 @@ struct VideoPlaybackTests {
         #expect(store.player == nil)
     }
 
+    @Test func failedMediaConnectionClearsPlayerAndLoadingState() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DeniedPlaybackProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+        let client = KeepsClient(configuration: KeepsConfiguration(baseURL: URL(string: "http://127.0.0.1:1")!, libraryID: "test", accessCredential: "test-token"), session: session)
+        let asset = try JSONDecoder().decode(KeepsAsset.self, from: Data(#"{"id":"00000000-0000-0000-0000-000000000001","cameraMake":"","cameraModel":"","lensModel":"","originalFilename":"synthetic.mp4","contentFingerprint":"test","metadataFingerprint":"test","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2026-01-01","updatedAt":"2026-01-01","trashed":false}"#.utf8))
+        let store = VideoPlaybackStore()
+        defer { store.close() }
+        store.open(asset: asset, client: client)
+        try await waitUntil { store.error != nil }
+        #expect(store.error?.contains("影片播放失败") == true)
+        #expect(!store.isLoading)
+        #expect(store.player == nil)
+    }
+
     @Test(.enabled(if: ProcessInfo.processInfo.environment["KEEPS_TEST_VIDEO_BASE_URL"] != nil))
     func streamsAndSeeksSyntheticVideoFromLocalServer() async throws {
         let baseURL = try #require(URL(string: ProcessInfo.processInfo.environment["KEEPS_TEST_VIDEO_BASE_URL"] ?? ""))
@@ -159,10 +175,13 @@ private final class DeniedPlaybackProtocol: URLProtocol, @unchecked Sendable {
         #expect(request.value(forHTTPHeaderField: "Authorization") == "Bearer test-token")
         let isVersions = request.url!.path.hasSuffix("/versions")
         #expect(isVersions || request.url!.path.hasSuffix("/playback"))
+        let mediaFailure = request.url?.host == "127.0.0.1"
         let body = isVersions
             ? #"{"items":[{"contentHash":"test","width":640,"height":360,"priority":2,"isDefault":true,"userSelected":false,"available":true,"paths":[{"path":"/samples/synthetic.mp4","available":true}]}]}"#
-            : #"{"detail":"playback denied"}"#
-        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: isVersions ? 200 : 403, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+            : mediaFailure
+                ? #"{"playbackURL":"http://192.0.2.1:2283/derivatives/local-playback/synthetic-token","expiresAt":4102444800}"#
+                : #"{"detail":"playback denied"}"#
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: isVersions || mediaFailure ? 200 : 403, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(body.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }

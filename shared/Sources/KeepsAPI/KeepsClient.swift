@@ -43,9 +43,14 @@ public final class KeepsClient: Sendable {
         try await request("GET", library + ["assets", assetID.uuidString, "versions"])
     }
     public func videoPlayback(assetID: UUID, contentHash: String) async throws -> KeepsVideoPlayback {
-        let playback: KeepsVideoPlayback = try await request("GET", library + ["assets", assetID.uuidString, "versions", contentHash, "playback"])
+        var playback: KeepsVideoPlayback = try await request("GET", library + ["assets", assetID.uuidString, "versions", contentHash, "playback"])
         guard ["http", "https"].contains(playback.playbackURL.scheme?.lowercased() ?? ""),
               playback.playbackURL.host != nil else { throw KeepsAPIError.invalidResponse }
+        let parts = playback.playbackURL.path.split(separator: "/").map(String.init)
+        guard parts.count >= 3, Array(parts.suffix(3).prefix(2)) == ["derivatives", "local-playback"],
+              let token = parts.last, !token.isEmpty else { throw KeepsAPIError.invalidResponse }
+        // The signed token identifies the media; use the same reachable entry point as the API.
+        playback.playbackURL = try makeRequest("GET", ["derivatives", "local-playback", token]).url!
         return playback
     }
     public func trimVideo(assetID: UUID, trim: KeepsVideoTrimRequest) async throws -> KeepsVideoTrim {
