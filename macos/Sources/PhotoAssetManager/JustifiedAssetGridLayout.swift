@@ -12,6 +12,19 @@ enum JustifiedAssetGridLayout {
         return CGFloat(preview.width) / CGFloat(preview.height)
     }
 
+    static func retainedAnchorIndex(oldIDs: [UUID], newIDs: [UUID], topIndex: Int) -> Int? {
+        guard oldIDs.indices.contains(topIndex), !newIDs.isEmpty else { return nil }
+        let positions = Dictionary(uniqueKeysWithValues: newIDs.enumerated().map { ($0.element, $0.offset) })
+        // 被移走的首张照片以其后仍存在的照片接续；末尾整批移走时再向前寻找。
+        for id in oldIDs[topIndex...] {
+            if let index = positions[id] { return index }
+        }
+        for id in oldIDs[..<topIndex].reversed() {
+            if let index = positions[id] { return index }
+        }
+        return nil
+    }
+
     static func rows(aspectRatios: [CGFloat], availableWidth: CGFloat, targetHeight: CGFloat) -> [Row] {
         let width = max(1, availableWidth)
         var rows: [Row] = []

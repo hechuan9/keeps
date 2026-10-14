@@ -3,6 +3,16 @@ import Testing
 @testable import PhotoAssetManager
 
 struct JustifiedAssetGridLayoutTests {
+    @Test func movingPhotosKeepsNearestSurvivingScrollAnchor() {
+        let ids = (0..<12).map { _ in UUID() }
+        #expect(JustifiedAssetGridLayout.retainedAnchorIndex(oldIDs: ids, newIDs: Array(ids.dropFirst(2)), topIndex: 6) == 4)
+        let withoutVisibleFirst = Array(ids.prefix(6)) + Array(ids.suffix(4))
+        #expect(JustifiedAssetGridLayout.retainedAnchorIndex(oldIDs: ids, newIDs: withoutVisibleFirst, topIndex: 6) == 6)
+        #expect(JustifiedAssetGridLayout.retainedAnchorIndex(oldIDs: ids, newIDs: Array(ids.prefix(3)), topIndex: 6) == 2)
+        #expect(JustifiedAssetGridLayout.retainedAnchorIndex(oldIDs: ids, newIDs: [UUID()], topIndex: 6) == nil)
+        #expect(JustifiedAssetGridLayout.retainedAnchorIndex(oldIDs: ids, newIDs: [], topIndex: 6) == nil)
+    }
+
     @Test func mixedOrientationsFillRowsWithOnePointGaps() {
         let ratios: [CGFloat] = [1.5, 2.0 / 3, 1, 2, 0.5, 1.5, 1]
         for width: CGFloat in [240, 600, 1100] {

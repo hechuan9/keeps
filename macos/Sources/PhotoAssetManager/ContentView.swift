@@ -49,6 +49,7 @@ struct ContentView: View {
     @State private var thumbnailSize = 190.0
     @State private var detailMode = false
     @State private var galleryReturnAssetID: UUID?
+    @State private var galleryTopRow: Int?
     @State private var assetToCrop: KeepsAsset?
 
     var body: some View {
@@ -145,7 +146,10 @@ struct ContentView: View {
             if !blocking { batch.restore(library: library) }
         }
         .task { batch.restore(library: library); library.refresh(); library.refreshNavigation(force: false) }
-        .onChange(of: library.query) { _, _ in library.refresh() }
+        .onChange(of: library.query) { _, _ in
+            galleryTopRow = nil
+            library.refresh()
+        }
         .onChange(of: library.query.directory) { _, _ in
             detailMode = false
             galleryReturnAssetID = nil
@@ -288,8 +292,7 @@ struct ContentView: View {
                             LazyVStack(alignment: .leading, spacing: 1) {
                                 ForEach(rows, id: \.indices.lowerBound) { row in
                                     HStack(spacing: 1) {
-                                        ForEach(row.indices, id: \.self) { index in
-                                            let asset = library.assets[index]
+                                        ForEach(library.assets[row.indices]) { asset in
                                             galleryTile(asset, height: row.height)
                                         }
                                     }
@@ -303,8 +306,17 @@ struct ContentView: View {
                                         .onAppear { library.setPaginationVisible(true) }
                                         .onDisappear { library.setPaginationVisible(false) }
                                 }
-                            }.padding(1)
+                            }.scrollTargetLayout()
+                                .padding(1)
                                 .background(OverlayScrollerConfiguration())
+                        }
+                        .scrollPosition(id: $galleryTopRow, anchor: .top)
+                        .onChange(of: library.assets.map(\.id)) { oldIDs, newIDs in
+                            guard let top = galleryTopRow,
+                                  let index = JustifiedAssetGridLayout.retainedAnchorIndex(
+                                    oldIDs: oldIDs, newIDs: newIDs, topIndex: top),
+                                  let row = rows.first(where: { $0.indices.contains(index) }) else { return }
+                            galleryTopRow = row.indices.lowerBound
                         }
                         .onAppear {
                             guard let assetID = galleryReturnAssetID,

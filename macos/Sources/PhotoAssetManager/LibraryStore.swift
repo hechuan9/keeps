@@ -138,7 +138,7 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var isMutating = false
     @Published private(set) var isCheckingRevision = false
     var hasLoadedResults: Bool { displayedPage != nil }
-    var hasCurrentPhotoResults: Bool { displayedPage != nil && displayedQuery == effectiveQuery }
+    var hasCurrentPhotoResults: Bool { displayedPage != nil && displayedQuery == effectiveQuery && !movedResultsNeedRefresh }
     @Published private(set) var configuration: KeepsConfiguration?
     @Published var lastError: String?
     @Published private(set) var isCheckingConnection = false
@@ -189,6 +189,7 @@ final class LibraryStore: ObservableObject {
     private let assetCache = KeepsAssetCache()
     private var displayedQuery: KeepsAssetQuery?
     private var displayedPage: KeepsAssetPage?
+    private var movedResultsNeedRefresh = false
     private var directoryPrefetchTask: Task<Void, Never>?
     private var directoryPrefetchQuery: KeepsAssetQuery?
     private var directoryPrefetchRevision: Int64?
@@ -287,10 +288,8 @@ final class LibraryStore: ObservableObject {
     func completePhotoMove() {
         photoMove = nil
         preferences.removeObject(forKey: "keeps.pendingPhotoMove")
-        selectedIDs = []
-        assetCache.removeAll()
-        displayedQuery = nil
-        displayedPage = nil
+        deselectAll()
+        movedResultsNeedRefresh = displayedQuery == effectiveQuery
         refreshNavigation()
         refresh(force: true)
     }
@@ -300,10 +299,10 @@ final class LibraryStore: ObservableObject {
             value == path || value.hasPrefix(path + "/") ? destination + value.dropFirst(path.count) : value
         }
         let expanded = Set(expandedPaths.map(relocated)).union([parentPath])
+        let retainsResults = displayedQuery == effectiveQuery
         if let selected = query.directory { query.directory = relocated(selected) }
-        assetCache.removeAll()
-        displayedQuery = nil
-        displayedPage = nil
+        if retainsResults { displayedQuery = effectiveQuery }
+        movedResultsNeedRefresh = retainsResults
         resetNavigation()
         expandedPaths = expanded
         directoryMove = nil
@@ -332,6 +331,7 @@ final class LibraryStore: ObservableObject {
     }
 
     private func clearResults() {
+        movedResultsNeedRefresh = false
         cancelDirectoryPrefetch()
         loadTask?.cancel()
         loadGeneration += 1
@@ -615,13 +615,13 @@ final class LibraryStore: ObservableObject {
         if force { assetCache.removeAll() }
         let targetCount = max(assets.count, 1)
         isLoading = true
-        isCheckingRevision = !force && displayedPage != nil
+        isCheckingRevision = !force && !movedResultsNeedRefresh && displayedPage != nil
         lastError = nil
         loadTask = Task {
             defer { finishLoading(generation: requestGeneration) }
             do {
-                var needsFetch = force || displayedPage == nil
-                if !force {
+                var needsFetch = force || movedResultsNeedRefresh || displayedPage == nil
+                if !force && !movedResultsNeedRefresh {
                     let revision = try await client.revision(path: requestedQuery.directory)
                     try Task.checkCancellation()
                     guard requestGeneration == loadGeneration else { return }
@@ -637,8 +637,8 @@ final class LibraryStore: ObservableObject {
                         nextQuery.cursor = cursor
                         let next = try await client.assets(query: nextQuery)
                         guard next.revision == combined.revision else {
-                            combined = try await client.assets(query: requestedQuery)
-                            break
+                            throw NSError(domain: "Keeps.LibraryRefresh", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: "图库在分页刷新期间发生变化，请重试。"])
                         }
                         let known = Set(combined.items.map(\.id))
                         combined = KeepsAssetPage(items: combined.items + next.items.filter { !known.contains($0.id) }, total: next.total,
@@ -647,12 +647,15 @@ final class LibraryStore: ObservableObject {
                     try Task.checkCancellation()
                     guard requestGeneration == loadGeneration else { return }
                     display(combined)
+                    movedResultsNeedRefresh = false
                     assetCache.store(combined, for: requestedQuery)
                     lastAssetFetch = Date()
                 }
                 refreshCounts(client: client, showHidden: requestedQuery.showHidden, force: force)
             } catch {
-                if !Task.isCancelled && requestGeneration == loadGeneration { lastError = Self.describe(error) }
+                if !Task.isCancelled && requestGeneration == loadGeneration {
+                    lastError = (movedResultsNeedRefresh ? "移动已完成，列表更新失败。请刷新重试。\n" : "") + Self.describe(error)
+                }
             }
         }
     }
@@ -698,7 +701,7 @@ final class LibraryStore: ObservableObject {
     }
 
     func loadMore() {
-        guard !isOperationBlocking else { return }
+        guard !isOperationBlocking, !movedResultsNeedRefresh else { return }
         guard let client, let cursor = nextCursor, !isLoading, displayedQuery == effectiveQuery else { return }
         let generation = loadGeneration
         var requestedQuery = query
