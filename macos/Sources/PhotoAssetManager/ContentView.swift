@@ -31,6 +31,8 @@ extension FocusedValues {
 }
 
 struct ContentView: View {
+    @Environment(\.openWindow) private var openWindow
+    @EnvironmentObject private var videoPlayback: VideoPlaybackStore
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var batch: AIEditingBatchStore
     @EnvironmentObject private var geometryTasks: GeometryTaskStore
@@ -269,6 +271,13 @@ struct ContentView: View {
         Group {
             if detailMode, let asset = library.selectedAsset {
                 RemotePreview(asset: asset, loadStandard: true).padding(24)
+                    .overlay {
+                        if asset.isVideo {
+                            Button { playVideo(asset) } label: {
+                                Label("播放影片", systemImage: "play.circle.fill").font(.title2).padding(12)
+                            }.buttonStyle(.borderedProminent)
+                        }
+                    }
                     .overlay(alignment: .topLeading) {
                         if asset.flagState == "rejected" {
                             Label("已弃用", systemImage: "xmark.circle.fill")
@@ -382,7 +391,7 @@ struct ContentView: View {
             .overlay {
                 PhotoDragSource(item: { library.photoDragItem(for: asset.id) }, open: {
                     library.select(asset.id, extending: false)
-                    detailMode = true
+                    if asset.isVideo { playVideo(asset) } else { detailMode = true }
                     galleryFocused = true
                 }) { modifiers in
                     galleryFocused = true
@@ -392,6 +401,7 @@ struct ContentView: View {
             }
             .help(asset.originalFilename)
             .contextMenu {
+                if asset.isVideo { Button("播放影片") { playVideo(asset) } }
                 rotationActions(for: asset)
                 Divider()
                 Button("选择此照片") { library.select(asset.id, extending: false) }
@@ -402,6 +412,12 @@ struct ContentView: View {
             .accessibilityAddTraits(.isButton)
             .accessibilityAction { library.select(asset.id) }
             .accessibilityAddTraits(library.selectedIDs.contains(asset.id) ? [.isSelected] : [])
+    }
+
+    private func playVideo(_ asset: KeepsAsset) {
+        guard let client = library.client else { return }
+        videoPlayback.open(asset: asset, client: client)
+        openWindow(id: "video-player")
     }
 
     private func configureGeometryTasks() {

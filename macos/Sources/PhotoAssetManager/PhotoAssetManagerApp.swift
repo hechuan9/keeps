@@ -5,6 +5,7 @@ import KeepsAPI
 struct PhotoAssetManagerApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var library = LibraryStore()
+    @StateObject private var videoPlayback = VideoPlaybackStore()
     @StateObject private var exposureTasks = ExposureTaskStore()
     @StateObject private var importTasks = ImportTaskOwner()
     @StateObject private var batch = AIEditingBatchStore()
@@ -13,7 +14,7 @@ struct PhotoAssetManagerApp: App {
     @FocusedValue(\.gallerySelection) private var gallerySelection
     var body: some Scene {
         WindowGroup {
-            LibraryStartupView().environmentObject(library).environmentObject(batch).environmentObject(geometryTasks).environmentObject(importTasks).environmentObject(exposureTasks).frame(minWidth: 1080, minHeight: 720)
+            LibraryStartupView().environmentObject(videoPlayback).environmentObject(library).environmentObject(batch).environmentObject(geometryTasks).environmentObject(importTasks).environmentObject(exposureTasks).frame(minWidth: 1080, minHeight: 720)
                 .onReceive(batch.editor.$isBusy, perform: synchronizeEditorActivity)
                 .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in batch.stopForExit() }
         }
@@ -62,6 +63,11 @@ struct PhotoAssetManagerApp: App {
                 }.disabled(!library.isStartupReady || library.isOperationBlocking || library.isSelectingAll)
             }
         }
+        Window("影片播放", id: "video-player") {
+            VideoPlaybackWindow(store: videoPlayback)
+        }
+        .defaultSize(width: 960, height: 600)
+        .windowResizability(.contentMinSize)
         Settings {
             TabView {
                 ServerSettingsView()
