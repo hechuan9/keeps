@@ -9,6 +9,10 @@ final class VideoPlaybackStore: ObservableObject {
     @Published private(set) var player: AVPlayer?
     @Published private(set) var isLoading = false
     @Published private(set) var error: String?
+    @Published private(set) var rotationQuarterTurns = 0
+    @Published private(set) var rotationBusy = false
+    @Published private(set) var rotationError: String?
+    private var rotationTask: Task<Void, Never>?
     @Published var isTrimming = false
     @Published var trimStart = 0.0
     @Published var trimEnd = 0.0
@@ -107,6 +111,65 @@ final class VideoPlaybackStore: ObservableObject {
                 isLoading = false
             }
         }
+    }
+
+    func rotate(clockwise: Bool) {
+        setRotation((rotationQuarterTurns + (clockwise ? 1 : 3)) % 4)
+    }
+
+    private func setRotation(_ turns: Int) {
+        guard !rotationBusy, let player, let item = player.currentItem else { return }
+        rotationBusy = true
+        rotationError = nil
+        rotationTask = Task { [weak self] in
+            guard let self else { return }
+            defer { if !Task.isCancelled { rotationBusy = false } }
+            do {
+                var composition: AVMutableVideoComposition?
+                if turns != 0 {
+                    guard let track = try await item.asset.loadTracks(withMediaType: .video).first else {
+                        throw PlaybackError.unavailable
+                    }
+                    let size = try await track.load(.naturalSize)
+                    let preferred = try await track.load(.preferredTransform)
+                    let frameDuration = try await track.load(.minFrameDuration)
+                    let duration = try await item.asset.load(.duration)
+                    let geometry = Self.rotationGeometry(size: size, preferred: preferred, turns: turns)
+                    let layer = AVMutableVideoCompositionLayerInstruction(assetTrack: track)
+                    layer.setTransform(geometry.transform, at: .zero)
+                    let instruction = AVMutableVideoCompositionInstruction()
+                    instruction.timeRange = CMTimeRange(start: .zero, duration: duration)
+                    instruction.layerInstructions = [layer]
+                    let rotated = AVMutableVideoComposition()
+                    rotated.instructions = [instruction]
+                    rotated.renderSize = geometry.size
+                    rotated.frameDuration = frameDuration.isNumeric && frameDuration.seconds > 0
+                        ? frameDuration : CMTime(value: 1, timescale: 30)
+                    composition = rotated
+                }
+                try Task.checkCancellation()
+                guard self.player === player, player.currentItem === item else { return }
+                let paused = player.rate == 0
+                let position = player.currentTime()
+                item.videoComposition = composition
+                rotationQuarterTurns = turns
+                if paused {
+                    await player.seek(to: position, toleranceBefore: .zero, toleranceAfter: .zero)
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                rotationError = "旋转失败：\(error.localizedDescription)"
+                logger.error("Video rotation failed: \(String(reflecting: error), privacy: .private)")
+            }
+        }
+    }
+
+    static func rotationGeometry(size: CGSize, preferred: CGAffineTransform, turns: Int)
+        -> (transform: CGAffineTransform, size: CGSize) {
+        let rotated = preferred.concatenating(CGAffineTransform(rotationAngle: CGFloat(turns) * .pi / 2))
+        let bounds = CGRect(origin: .zero, size: size).applying(rotated)
+        return (rotated.concatenating(CGAffineTransform(translationX: -bounds.minX, y: -bounds.minY)),
+                CGSize(width: bounds.width.rounded(), height: bounds.height.rounded()))
     }
 
     var validTrim: Bool {
@@ -220,6 +283,11 @@ final class VideoPlaybackStore: ObservableObject {
     }
 
     func close() {
+        rotationTask?.cancel()
+        rotationTask = nil
+        rotationQuarterTurns = 0
+        rotationBusy = false
+        rotationError = nil
         trimTask?.cancel()
         trimTask = nil
         source = nil
@@ -287,11 +355,23 @@ struct VideoPlaybackWindow: View {
                 HStack {
                     Toggle("裁剪时长", isOn: $store.isTrimming).toggleStyle(.button)
                         .disabled(store.trimBusy || store.hasPendingTrim || store.savedAssetID != nil)
+                    HStack(spacing: 8) {
+                        Button { store.rotate(clockwise: false) } label: {
+                            Image(systemName: "rotate.left")
+                        }.help("向左旋转 90°（仅播放）").accessibilityLabel("向左旋转 90 度")
+                        Button { store.rotate(clockwise: true) } label: {
+                            Image(systemName: "rotate.right")
+                        }.help("向右旋转 90°（仅播放）").accessibilityLabel("向右旋转 90 度")
+                    }.disabled(store.player == nil || store.isLoading || store.rotationBusy)
                     Spacer()
+                    if store.rotationBusy { ProgressView().controlSize(.small) }
                     if store.trimBusy { ProgressView().controlSize(.small) }
                     if store.savedAssetID != nil {
                         Button("播放新视频") { store.openSavedVideo() }
                     }
+                }
+                if let error = store.rotationError {
+                    Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                 }
                 if store.isTrimming {
                     if store.duration > 0 {

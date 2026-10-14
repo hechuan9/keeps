@@ -8,6 +8,22 @@ import SwiftUI
 
 @MainActor
 struct VideoPlaybackTests {
+    @Test func rotationFitsLandscapeAndPortraitWithoutClipping() {
+        let raw = CGSize(width: 1920, height: 1080)
+        let portrait = CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 1080, ty: 0)
+        for preferred in [CGAffineTransform.identity, portrait] {
+            for turns in 0..<4 {
+                let geometry = VideoPlaybackStore.rotationGeometry(size: raw, preferred: preferred, turns: turns)
+                let bounds = CGRect(origin: .zero, size: raw).applying(geometry.transform)
+                #expect(abs(bounds.minX) < 0.001 && abs(bounds.minY) < 0.001)
+                #expect(abs(bounds.width - geometry.size.width) < 0.001)
+                #expect(abs(bounds.height - geometry.size.height) < 0.001)
+                let swapped = (turns + (preferred == portrait ? 1 : 0)) % 2 == 1
+                #expect(geometry.size == (swapped ? CGSize(width: 1080, height: 1920) : raw))
+            }
+        }
+    }
+
     @Test func resumesPersistedTrimWithoutCreatingAnotherRequest() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [CompletedTrimProtocol.self]

@@ -45,24 +45,60 @@ struct LiveVideoPlaybackTests {
         #expect(firstFrame < 10)
         let sampleSeconds = Int(env["KEEPS_LIVE_VIDEO_SECONDS"] ?? "12") ?? 12
         try #require((1...120).contains(sampleSeconds))
+        let duration = try await item.asset.load(.duration).seconds
         let initial = player.currentTime().seconds
+        let sampleWindow = min(Double(sampleSeconds), max(0, duration - initial))
+        let sampleStart = Date()
         var waiting = 0
-        for _ in 0..<(sampleSeconds * 10) {
+        for _ in 0..<Int(ceil(sampleWindow * 10)) {
             try await Task.sleep(for: .milliseconds(100))
             if player.timeControlStatus == .waitingToPlayAtSpecifiedRate { waiting += 1 }
         }
         let advance = player.currentTime().seconds - initial
-        print("LIVE_VIDEO continuous_wall_seconds=\(sampleSeconds) advanced_seconds=\(advance) buffering_samples=\(waiting)")
-        #expect(advance >= Double(sampleSeconds) - 2)
+        print("LIVE_VIDEO continuous_wall_seconds=\(Date().timeIntervalSince(sampleStart)) advanced_seconds=\(advance) buffering_samples=\(waiting)")
+        #expect(advance >= max(sampleWindow - 2, sampleWindow * 0.8))
         #expect(store.error == nil)
-        let duration = try await item.asset.load(.duration).seconds
+        if env["KEEPS_LIVE_VIDEO_ROTATION"] == "1" {
+            let track = try #require(try await item.asset.loadTracks(withMediaType: .video).first)
+            let size = try await track.load(.naturalSize)
+            let preferred = try await track.load(.preferredTransform)
+            player.pause()
+            let pausedPosition = player.currentTime().seconds
+            for turns in [1, 2, 3, 0] {
+                let began = Date()
+                store.rotate(clockwise: true)
+                try await wait { !store.rotationBusy }
+                try #require(store.rotationError == nil)
+                #expect(store.rotationQuarterTurns == turns)
+                #expect(player.currentItem === item)
+                let expected = VideoPlaybackStore.rotationGeometry(size: size, preferred: preferred, turns: turns).size
+                try await wait {
+                    guard let pixel = output.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil) else { return false }
+                    return CVPixelBufferGetWidth(pixel) == Int(expected.width)
+                        && CVPixelBufferGetHeight(pixel) == Int(expected.height)
+                }
+                print("LIVE_VIDEO rotation_degrees=\(turns * 90) frame_seconds=\(Date().timeIntervalSince(began))")
+                if turns == 1 {
+                    #expect(abs(player.currentTime().seconds - pausedPosition) < 0.1)
+                    #expect(player.rate == 0)
+                    player.play()
+                }
+            }
+            store.rotate(clockwise: false)
+            try await wait { !store.rotationBusy }
+            #expect(store.rotationQuarterTurns == 3)
+            store.rotate(clockwise: true)
+            try await wait { !store.rotationBusy }
+            #expect(store.rotationQuarterTurns == 0)
+            #expect(item.videoComposition == nil)
+        }
         for fraction in [0.5, 0.9] {
             let target = duration * fraction
             let began = Date()
             let reached = await player.seek(to: CMTime(seconds: target, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             #expect(reached)
             player.play()
-            try await wait { player.currentTime().seconds > target + 0.1 && output.hasNewPixelBuffer(forItemTime: player.currentTime()) || store.error != nil }
+            try await wait { player.currentTime().seconds > target + min(0.1, (duration - target) / 3) && output.hasNewPixelBuffer(forItemTime: player.currentTime()) || store.error != nil }
             try #require(store.error == nil)
             let latency = Date().timeIntervalSince(began)
             print("LIVE_VIDEO seek_fraction=\(fraction) decoded_frame_seconds=\(latency)")
