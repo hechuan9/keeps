@@ -170,12 +170,6 @@ struct ContentView: View {
             } label: { Label("导入", systemImage: "square.and.arrow.down") }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
                 .disabled(library.client == nil)
-            Button {
-                guard library.query.directory != nil else { return }
-                showsCulling = true
-            } label: { Label("AI 筛片", systemImage: "photo.on.rectangle.angled") }
-                .disabled(library.query.directory == nil || library.client == nil || library.isMutating || batch.isRunning || batch.editor.isBusy)
-                .help(library.query.directory == nil ? "请先选择一个目录" : "让 AI 引导筛选当前目录，或继续上次筛片")
             Spacer(minLength: 12)
             HStack(spacing: 10) {
                 Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
@@ -523,9 +517,14 @@ struct ContentView: View {
                 }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             Divider()
-            Button { openAIWorkspace() } label: {
-                Label(aiEditingTitle, systemImage: "wand.and.stars").frame(maxWidth: .infinity)
-            }.disabled(!canStartAIEditing).padding(16)
+            VStack(spacing: 10) {
+                Button { openAIWorkspace() } label: {
+                    Label(aiEditingTitle, systemImage: "wand.and.stars").frame(maxWidth: .infinity)
+                }.disabled(!canStartAIEditing)
+                Button { showsCulling = true } label: {
+                    Label("AI 筛片", systemImage: "photo.on.rectangle.angled").frame(maxWidth: .infinity)
+                }.disabled(!canStartAICulling).help(aiCullingHelp)
+            }.padding(16)
         }.background(WorkspaceStyle.panel)
     }
 
@@ -545,12 +544,24 @@ struct ContentView: View {
         !library.isImportingPhotos && library.directoryToCreate == nil && library.directoryToRename == nil && library.directoryToTrash == nil
     }
 
+    private var canStartAICulling: Bool {
+        library.query.directory != nil && library.client != nil && !library.isMutating && !batch.isRunning && !batch.editor.isBusy
+    }
+
+    private var aiCullingHelp: String {
+        library.query.directory == nil ? "请先选择一个目录" : "让 AI 引导筛选当前目录，或继续上次筛片"
+    }
+
     private var inspectorRail: some View {
         VStack {
             railButton("照片信息", icon: "info.circle", selected: showsInspector) { showsInspector.toggle() }
             railButton(aiEditingTitle, icon: "wand.and.stars", selected: false) { openAIWorkspace() }
                 .disabled(!canStartAIEditing)
                 .accessibilityIdentifier("ai-editing-selected-photos")
+            railButton("AI 筛片", icon: "photo.on.rectangle.angled", selected: showsCulling) { showsCulling = true }
+                .disabled(!canStartAICulling)
+                .help(aiCullingHelp)
+                .accessibilityIdentifier("ai-culling-directory")
             Spacer()
         }.padding(.top, 18).frame(width: 48).background(WorkspaceStyle.panel)
     }
