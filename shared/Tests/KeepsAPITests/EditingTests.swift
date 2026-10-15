@@ -19,6 +19,22 @@ struct EditingTests {
         #expect(try String(contentsOf: destination, encoding: .utf8) == "current displayed photo")
     }
 
+    @Test func downloadsDeclaredThumbnailWithoutRequestingStandard() async throws {
+        let id = UUID()
+        let fixture = EditingFixture { request in
+            if request.url?.path == "/api/derivatives/\(id)" {
+                #expect(URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.contains(URLQueryItem(name: "role", value: "thumbnail")) == true)
+                return (200, "{\"downloadURL\":\"https://\(request.url!.host!)/thumbnail\",\"version\":\"v1\",\"width\":512,\"height\":384}")
+            }
+            #expect(request.url?.path == "/thumbnail")
+            return (200, "thumbnail bytes")
+        }
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: destination) }
+        try await fixture.client.downloadPreview(assetID: id, role: .thumbnail, to: destination)
+        #expect(try String(contentsOf: destination, encoding: .utf8) == "thumbnail bytes")
+    }
+
     @Test func darktableRecipeRoundtripsWithoutExposureField() throws {
         let recipe = KeepsEditRecipe(recipeJSON: "{\"exposureEV\":0.5}", xmp: "<rdf:Description darktable:xmp_version=\"5\"/>")
         let commit = KeepsEditCommit(requestID: UUID().uuidString, expectedRevision: 2,

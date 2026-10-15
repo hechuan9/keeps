@@ -102,7 +102,10 @@ public final class KeepsClient: Sendable {
         try await request("PUT", library + ["assets", assetID.uuidString, "edit"], body: JSONEncoder().encode(edit))
     }
     public func downloadCurrentStandard(assetID: UUID, to destination: URL) async throws {
-        let descriptor = try await refreshPreviewDescriptor(assetID: assetID, role: .standard)
+        try await downloadPreview(assetID: assetID, role: .standard, to: destination)
+    }
+    public func downloadPreview(assetID: UUID, role: KeepsMediaRole, to destination: URL) async throws {
+        let descriptor = try await refreshPreviewDescriptor(assetID: assetID, role: role)
         let (data, response) = try await session.data(from: descriptor.downloadURL)
         let checked = try checkedData(data, response)
         try Task.checkCancellation()

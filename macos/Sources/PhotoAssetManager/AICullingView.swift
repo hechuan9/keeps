@@ -10,6 +10,9 @@ struct AICullingView: View {
     @State private var includeSubdirectories = true
     @State private var preferenceError: String?
     @State private var editsPreferences = false
+    @State private var editsInstruction = false
+    @State private var preferenceDraft = ""
+    @State private var instructionDraft = ""
     @State private var enlarged: KeepsAsset?
     @State private var exposureSettings: [UUID: CullingExposureSettings] = [:]
     @Environment(\.dismiss) private var dismiss
@@ -33,7 +36,7 @@ struct AICullingView: View {
                     Text("偏好在开始时固定。新的长期偏好用于下一次目录筛片。")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Button("编辑长期偏好") { preferences = store.preferences; editsPreferences = true }
+                Button("编辑长期偏好") { beginPreferenceEditing() }
                     .disabled(store.busy)
             }
             if store.session == nil {
@@ -86,20 +89,22 @@ struct AICullingView: View {
         .onChange(of: store.session?.completed) { _, _ in exposureSettings.removeAll() }
         .onChange(of: store.readyForAnalysis) { _, ready in if ready { analyze() } }
         .sheet(isPresented: $editsPreferences) {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("长期筛片偏好").font(.title2)
-                Text("写下你通常想保留什么，例如人物表情、构图差异、纪念价值，以及相似照片希望保留的数量。")
-                TextEditor(text: $preferences).frame(height: 180)
-                if let preferenceError { Text(preferenceError).foregroundStyle(.red).textSelection(.enabled) }
-                HStack {
-                    Button("取消") { editsPreferences = false }
-                    Spacer()
-                    Button("保存偏好") {
-                        do { try store.savePreferences(preferences); preferenceError = nil; editsPreferences = false }
-                        catch { preferenceError = String(reflecting: error) }
-                    }
-                }
-            }.padding(24).frame(width: 580)
+            textEditingSheet(title: "长期筛片偏好", text: $preferenceDraft,
+                             error: preferenceError, cancel: { editsPreferences = false }) {
+                do {
+                    try store.savePreferences(preferenceDraft)
+                    preferences = preferenceDraft
+                    preferenceError = nil
+                    editsPreferences = false
+                } catch { preferenceError = String(reflecting: error) }
+            }
+        }
+        .sheet(isPresented: $editsInstruction) {
+            textEditingSheet(title: "本次目录的补充要求", text: $instructionDraft,
+                             cancel: { editsInstruction = false }) {
+                instruction = instructionDraft
+                editsInstruction = false
+            }
         }
         .onDisappear { store.cancel(); library.isCullingActive = false; library.refresh(force: true) }
         .sheet(item: $enlarged) { asset in
@@ -121,16 +126,20 @@ struct AICullingView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text(library.query.directory ?? "请先在服务器来源中打开要筛选的目录").font(.headline)
+                    .fixedSize(horizontal: false, vertical: true)
                 Toggle("包含子目录", isOn: $includeSubdirectories)
                 Text("从整个目录读取照片清单，AI 按场景带你逐组过目。确认或跳过后自动继续，直到清单全部看完。当前搜索、评分筛选和照片选择不限制本次范围，隐藏目录仍遵循图库设置。")
                 Text("个人长期偏好").font(.headline)
-                TextEditor(text: $preferences).frame(height: 100).border(.secondary.opacity(0.3))
+                preferenceSummary(preferences, placeholder: "尚未设置长期偏好", action: beginPreferenceEditing)
                 Text("例如：更重视真实表情；不同构图都保留；家庭纪念照宁可多留；连拍通常留两张。")
                     .font(.caption).foregroundStyle(.secondary)
                 Text("本次目录的补充要求")
-                TextEditor(text: $instruction).frame(height: 65).border(.secondary.opacity(0.3))
+                preferenceSummary(instruction, placeholder: "未设置补充要求") {
+                    instructionDraft = instruction
+                    editsInstruction = true
+                }
                 Text("确认一组后，所选标为留用、其余标为弃用；跳过保持原标记。不会移动或删除文件。长期偏好由你明确保存，不从单次改选自动推断。")
-                Text("使用「AI 修图」账户发送照片预览分析。推荐基于预览，不能代替原片级对焦检查；进度保存在这台 Mac。")
+                Text("使用「AI 修图」账户发送照片预览分析。无标准图时使用缩略图，推荐不能代替原片级对焦检查；进度保存在这台 Mac。")
                     .font(.callout).foregroundStyle(.secondary)
                 if let preferenceError { Text(preferenceError).foregroundStyle(.red).textSelection(.enabled) }
                 Button("保存偏好并开始此目录") {
@@ -143,7 +152,55 @@ struct AICullingView: View {
                     } catch { preferenceError = String(reflecting: error) }
                 }.disabled(library.query.directory == nil || store.busy || store.loadFailed)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(2)
         }
+    }
+
+    private func beginPreferenceEditing() {
+        preferenceDraft = preferences
+        preferenceError = nil
+        editsPreferences = true
+    }
+
+    private func preferenceSummary(_ text: String, placeholder: String, action: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(text.isEmpty ? placeholder : text)
+                .foregroundStyle(text.isEmpty ? .secondary : .primary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("双击编辑").font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.3)))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2, perform: action)
+        .accessibilityAction(named: Text("编辑"), action)
+    }
+
+    private func textEditingSheet(title: String, text: Binding<String>, error: String? = nil,
+                                  cancel: @escaping () -> Void, save: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text(title).font(.title2)
+            TextEditor(text: text)
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(.background, in: RoundedRectangle(cornerRadius: 8))
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.3)))
+            if let error {
+                ScrollView { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                    .frame(maxHeight: 80)
+            }
+            HStack {
+                Button("取消", action: cancel).keyboardShortcut(.cancelAction)
+                Spacer()
+                Button("确认保存", action: save).keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 580, height: 360)
     }
 
     private func card(_ photo: AICullingResult.Photo, asset: KeepsAsset) -> some View {

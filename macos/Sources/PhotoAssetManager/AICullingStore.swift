@@ -18,6 +18,13 @@ struct AICullingResult: Codable {
     }
     let groups: [Group]
 
+    static func previewRole(for asset: KeepsAsset) throws -> KeepsMediaRole {
+        if asset.standard != nil { return .standard }
+        if asset.thumbnail != nil { return .thumbnail }
+        if asset.preview != nil { return .preview }
+        throw AIEditingFailure("照片 \(asset.originalFilename)（\(asset.id)）尚无可用预览，请先完成目录的媒体处理。")
+    }
+
     func validate(count: Int) throws {
         let indices = groups.flatMap { $0.photos.map(\.index) }
         guard count > 0, !groups.isEmpty, groups.allSatisfy({ !$0.photos.isEmpty }),
@@ -162,14 +169,19 @@ struct AICullingResult: Codable {
                 try Task.checkCancellation()
                 self.status = "准备预览 \(index + 1)/\(assets.count)"
                 let source = job.appendingPathComponent("source-\(index)")
-                try await client.downloadCurrentStandard(assetID: asset.id, to: source)
+                do {
+                    let role = try AICullingResult.previewRole(for: asset)
+                    try await client.downloadPreview(assetID: asset.id, role: role, to: source)
+                } catch {
+                    throw AIEditingFailure("准备照片 \(asset.originalFilename)（\(asset.id)）失败：\n" + String(reflecting: error))
+                }
                 let output = job.appendingPathComponent("photo-\(index).jpg")
                 try await Self.makePreview(source: source, output: output)
                 try FileManager.default.removeItem(at: source)
                 images.append(output)
             }
             self.status = "AI 正在比较照片并分组"
-            let data = try await editor.cullPhotos(images, instruction: session.prompt, job: job)
+            let data = try await editor.cullPhotos(images, instruction: session.prompt + "\n\n输入图像可能是低分辨率缩略图。只按可见信息判断，不将缺少细节视为失焦，不推断原片清晰度。", job: job)
             try Task.checkCancellation()
             let result = try JSONDecoder().decode(AICullingResult.self, from: data)
             try result.validate(count: assets.count)

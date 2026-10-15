@@ -4,6 +4,21 @@ import Testing
 @testable import PhotoAssetManager
 
 struct AICullingTests {
+    @Test func choosesDeclaredPreviewForRAWWithoutStandard() throws {
+        var photo = try JSONDecoder().decode(KeepsAsset.self, from: Data("""
+        {"id":"00000000-0000-0000-0000-000000000001","cameraMake":"","cameraModel":"","lensModel":"","originalFilename":"sample.3FR","contentFingerprint":"hash","metadataFingerprint":"meta","rating":0,"flagState":"unflagged","tags":[],"createdAt":"","updatedAt":"","trashed":false}
+        """.utf8))
+        let descriptor = try JSONDecoder().decode(KeepsPreview.self, from: Data("""
+        {"downloadURL":"https://example.invalid/image","width":512,"height":384,"version":"v1"}
+        """.utf8))
+        photo.browseThumbnail = descriptor
+        #expect(throws: AIEditingFailure.self) { try AICullingResult.previewRole(for: photo) }
+        photo.thumbnail = descriptor
+        #expect(try AICullingResult.previewRole(for: photo) == .thumbnail)
+        photo.standard = descriptor
+        #expect(try AICullingResult.previewRole(for: photo) == .standard)
+    }
+
     @Test func rejectsDuplicatePhotoAcrossGroups() {
         let result = AICullingResult(groups: [group([photo(0)]), group([photo(0)])])
         #expect(throws: AIEditingFailure.self) { try result.validate(count: 2) }
