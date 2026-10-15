@@ -2649,7 +2649,7 @@ async fn keeps_trash_settings_and_emptying_use_authenticated_count_confirmation(
     let settings = "/libraries/photos/trash/settings";
     assert_eq!(
         call(app.clone(), "GET", settings, Value::Null).await,
-        (StatusCode::OK, json!({"enabled":true,"retentionDays":30}))
+        (StatusCode::OK, json!({"enabled":false,"retentionDays":30}))
     );
     for days in [0, 3651] {
         assert_eq!(

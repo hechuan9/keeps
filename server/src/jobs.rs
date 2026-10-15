@@ -1,10 +1,11 @@
 //! Durable scan scheduling and incremental file state. Originals are never mutated.
+use crate::task_state::{Event, transition};
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::{
     path::{Component, Path},
-    sync::{Mutex, RwLock},
+    sync::{Condvar, Mutex, RwLock},
 };
 use uuid::Uuid;
 
@@ -32,6 +33,7 @@ pub struct Job {
     pub path_sync: bool,
     pub wait_for_quiet: bool,
     pub status: String,
+    pub phase: String,
     pub error: Option<String>,
     pub processed: i64,
     pub skipped: i64,
@@ -50,6 +52,7 @@ pub struct FileState {
     pub error: Option<String>,
 }
 pub struct Jobs {
+    scan_wakeup: (Mutex<bool>, Condvar),
     pub(crate) directory_mutation: RwLock<()>,
     pub(crate) import_mutation: Mutex<()>,
     pub(crate) db: crate::database::Database,
@@ -84,9 +87,10 @@ fn job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         path_sync: row.get(14)?,
         scope_kind: row.get(15)?,
         work_class: row.get(16)?,
+        phase: row.get(17)?,
     })
 }
-const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class FROM jobs j JOIN folders f ON f.id=j.folder_id";
+const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class,j.phase FROM jobs j JOIN folders f ON f.id=j.folder_id";
 
 fn covers(parent: &Job, child: &Job) -> bool {
     if parent.folder_id != child.folder_id || parent.work_class != child.work_class {
@@ -145,6 +149,31 @@ fn same_photo_stem(left: &Path, right: &Path) -> bool {
 }
 
 impl Jobs {
+    pub fn wake_scan_worker(&self) {
+        let (pending, signal) = &self.scan_wakeup;
+        *pending.lock().unwrap() = true;
+        signal.notify_one();
+    }
+
+    pub fn scan_wait_duration(&self) -> Result<std::time::Duration> {
+        let available: Option<i64> = self.db.lock().unwrap().query_row(
+            "SELECT MIN(j.available_at) FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE j.status='pending' AND j.work_class='manual' AND f.active=1",
+            [], |row| row.get(0),
+        )?;
+        let seconds = available
+            .map(|at| (at - chrono::Utc::now().timestamp()).clamp(1, 30))
+            .unwrap_or(30);
+        Ok(std::time::Duration::from_secs(seconds as u64))
+    }
+
+    pub fn wait_for_scan_work(&self, timeout: std::time::Duration) {
+        let (pending, signal) = &self.scan_wakeup;
+        let (mut pending, _) = signal
+            .wait_timeout_while(pending.lock().unwrap(), timeout, |pending| !*pending)
+            .unwrap();
+        *pending = false;
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -180,13 +209,14 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
           CREATE TABLE IF NOT EXISTS folders(id TEXT PRIMARY KEY,library_id TEXT NOT NULL,path TEXT NOT NULL,active INTEGER NOT NULL DEFAULT 1,UNIQUE(library_id,path));
           CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,folder_id TEXT NOT NULL REFERENCES folders(id),status TEXT NOT NULL,error TEXT,processed INTEGER NOT NULL DEFAULT 0,skipped INTEGER NOT NULL DEFAULT 0,failed INTEGER NOT NULL DEFAULT 0,current_path TEXT,started_at INTEGER,finished_at INTEGER,created_at INTEGER NOT NULL DEFAULT(unixepoch()),updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
           CREATE TABLE IF NOT EXISTS files(folder_id TEXT NOT NULL REFERENCES folders(id),path TEXT NOT NULL,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,asset_id TEXT NOT NULL,version TEXT NOT NULL,error TEXT,PRIMARY KEY(folder_id,path));
-          UPDATE jobs SET status='pending',updated_at=unixepoch() WHERE status='running';")?;
+")?;
         let columns: Vec<String> = db
             .prepare("PRAGMA table_info(jobs)")?
             .query_map([], |row| row.get(1))?
             .collect::<rusqlite::Result<_>>()?;
         for (name, definition) in [
             ("work_class", "TEXT NOT NULL DEFAULT 'automatic'"),
+            ("phase", "TEXT NOT NULL DEFAULT 'waiting'"),
             ("scope_path", "TEXT"),
             ("scope_kind", "TEXT NOT NULL DEFAULT 'recursive'"),
             ("checkpoint", "TEXT"),
@@ -235,11 +265,16 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             CREATE UNIQUE INDEX jobs_live_scope ON jobs(folder_id,scope_path,scope_kind,work_class) WHERE status IN ('pending','running');")?;
         crate::directory_move::initialize(&db)?;
         crate::video_trim::initialize(&db)?;
+        for status in ["pending", "running"] {
+            let interrupted = transition(status, Event::Interrupt)?;
+            db.execute("UPDATE jobs SET status=?1,error=CASE WHEN error IS NULL THEN '任务因服务重启已中断，请人工重试' ELSE error || char(10) || '任务因服务重启已中断，请人工重试' END,finished_at=unixepoch(),updated_at=unixepoch() WHERE status=?2", params![interrupted, status])?;
+        }
         let trash_db = Connection::open(path)?;
         trash_db.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::directory_trash::initialize(&trash_db)?;
         crate::rejected_trash::initialize(&trash_db)?;
         let jobs = Self {
+            scan_wakeup: (Mutex::new(false), Condvar::new()),
             trash_db: Mutex::new(trash_db),
             directory_mutation: RwLock::new(()),
             import_mutation: Mutex::new(()),
@@ -430,37 +465,6 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
     pub fn enqueue_manual_file(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(folder_id, path, 0, true, false, true, "file", "manual")
     }
-    pub fn ensure_file_retry(&self, folder_id: &str, path: &Path) -> Result<Option<Job>> {
-        let path = self.validate_scan_path(path, "file")?;
-        let mut db = self.db.lock().unwrap();
-        let tx = db.transaction()?;
-        let tracked: Option<String> = tx
-            .query_row(
-                "SELECT path FROM folders WHERE id=?1 AND active=1",
-                [folder_id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let tracked = tracked.context("folder is missing or inactive")?;
-        if !path.starts_with(&tracked) {
-            bail!("scan scope must be within tracked folder");
-        }
-        let scope = path.to_str().context("scan scope must be UTF-8")?;
-        let id = Uuid::new_v4().to_string();
-        let inserted = tx.execute(
-            "INSERT INTO jobs(id,folder_id,scope_path,scope_kind,status,available_at,wait_for_quiet,path_sync,work_class)
-             SELECT ?1,?2,?3,'file','pending',0,1,1,'manual' WHERE NOT EXISTS(
-             SELECT 1 FROM jobs WHERE folder_id=?2 AND scope_path=?3 AND scope_kind='file' AND status IN ('pending','running','failed'))",
-            params![id,folder_id,scope],
-        )?;
-        let result = if inserted == 0 {
-            None
-        } else {
-            Some(tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&id], job)?)
-        };
-        tx.commit()?;
-        Ok(result)
-    }
     pub fn enqueue_manual_directory(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
@@ -617,6 +621,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&original.id], job)?
         };
         tx.commit()?;
+        self.wake_scan_worker();
         Ok(result)
     }
     pub fn coalesce_pending(&self) -> Result<()> {
@@ -695,11 +700,13 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             tx.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [id])?;
             existing
         } else {
-            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,status='pending',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",[id])?;
+            let status = transition(&failed.status, Event::Retry)?;
+            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,status=?2,phase='waiting',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![id,status])?;
             id.to_owned()
         };
         let result = tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&retry_id], job)?;
         tx.commit()?;
+        self.wake_scan_worker();
         Ok(result)
     }
     pub fn has_pending_changes(&self, excluding_id: &str) -> Result<bool> {
@@ -825,26 +832,61 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let Some(mut next) = next else {
             return Ok(None);
         };
-        tx.execute("UPDATE jobs SET status='running',rerun=CASE WHEN checkpoint IS NULL THEN 0 ELSE rerun END,processed=CASE WHEN checkpoint IS NULL THEN 0 ELSE processed END,skipped=CASE WHEN checkpoint IS NULL THEN 0 ELSE skipped END,failed=CASE WHEN checkpoint IS NULL THEN 0 ELSE failed END,current_path=CASE WHEN checkpoint IS NULL THEN NULL ELSE current_path END,started_at=CASE WHEN checkpoint IS NULL THEN unixepoch() ELSE started_at END,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",[&next.id])?;
+        let status = transition(&next.status, Event::Start)?;
+        tx.execute("UPDATE jobs SET status=?2,rerun=CASE WHEN checkpoint IS NULL THEN 0 ELSE rerun END,processed=CASE WHEN checkpoint IS NULL THEN 0 ELSE processed END,skipped=CASE WHEN checkpoint IS NULL THEN 0 ELSE skipped END,failed=CASE WHEN checkpoint IS NULL THEN 0 ELSE failed END,current_path=CASE WHEN checkpoint IS NULL THEN NULL ELSE current_path END,started_at=CASE WHEN checkpoint IS NULL THEN unixepoch() ELSE started_at END,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![next.id,status])?;
         next = tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&next.id], job)?;
         tx.commit()?;
         Ok(Some(next))
     }
     pub fn yield_job(&self, id: &str) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE jobs SET status='pending',updated_at=unixepoch() WHERE id=?1 AND status='running'", [id])?;
+        let status = transition("running", Event::Yield)?;
+        self.db.lock().unwrap().execute(
+            "UPDATE jobs SET status=?2,updated_at=unixepoch() WHERE id=?1 AND status='running'",
+            params![id, status],
+        )?;
+        Ok(())
+    }
+    pub fn set_phase(&self, id: &str, phase: &str) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "UPDATE jobs SET phase=?2,updated_at=unixepoch() WHERE id=?1 AND status='running'",
+            params![id, phase],
+        )?;
         Ok(())
     }
     pub fn finish(&self, id: &str, error: Option<&str>) -> Result<()> {
-        self.db.lock().unwrap().execute("UPDATE jobs SET
-            status=CASE WHEN rerun=1 OR (?2 IS NOT NULL AND attempts<3) THEN 'pending' WHEN ?2 IS NOT NULL THEN 'failed' ELSE 'completed' END,
-            available_at=CASE WHEN ?2 IS NOT NULL THEN MAX(available_at,unixepoch() + 5 * (1 << attempts)) ELSE available_at END,
-            attempts=CASE WHEN rerun=1 OR ?2 IS NULL THEN 0 ELSE attempts+1 END,
-            checkpoint=NULL,
-            processed=CASE WHEN rerun=1 OR (?2 IS NOT NULL AND attempts<3) THEN 0 ELSE processed END,
-            skipped=CASE WHEN rerun=1 OR (?2 IS NOT NULL AND attempts<3) THEN 0 ELSE skipped END,
-            failed=CASE WHEN rerun=1 OR (?2 IS NOT NULL AND attempts<3) THEN 0 ELSE failed END,
-            error=?2,current_path=NULL,finished_at=unixepoch(),updated_at=unixepoch()
-            WHERE id=?1 AND status='running'",params![id,error])?;
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction()?;
+        let rerun: Option<bool> = tx
+            .query_row(
+                "SELECT rerun FROM jobs WHERE id=?1 AND status='running'",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(rerun) = rerun else {
+            return Ok(());
+        };
+        let event = if error.is_some() {
+            Event::Fail
+        } else if rerun {
+            Event::Yield
+        } else {
+            Event::Complete
+        };
+        let status = transition("running", event)?;
+        tx.execute(
+            "UPDATE jobs SET status=?3,
+            phase=CASE WHEN ?3='completed' THEN 'completed' WHEN ?3='pending' THEN 'waiting' ELSE phase END,
+            checkpoint=CASE WHEN ?2 IS NULL THEN NULL ELSE checkpoint END,
+            processed=CASE WHEN ?3='pending' THEN 0 ELSE processed END,
+            skipped=CASE WHEN ?3='pending' THEN 0 ELSE skipped END,
+            failed=CASE WHEN ?3='pending' THEN 0 ELSE failed END,
+            rerun=0,error=?2,current_path=CASE WHEN ?2 IS NULL THEN NULL ELSE current_path END,
+            finished_at=CASE WHEN ?3='pending' THEN NULL ELSE unixepoch() END,updated_at=unixepoch()
+            WHERE id=?1",
+            params![id, error, status],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn update_progress(
@@ -939,6 +981,24 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
 mod tests {
     use super::*;
     #[test]
+    fn task_phase_retains_failure_and_resets_on_explicit_retry() {
+        let (_dir, jobs, folder) = setup();
+        let queued = jobs.enqueue_scan(&folder.id).unwrap();
+        assert_eq!(queued.phase, "waiting");
+        jobs.set_phase(&queued.id, "scanning").unwrap();
+        assert_eq!(jobs.job(&queued.id).unwrap().unwrap().phase, "waiting");
+        let running = jobs.claim_class("manual").unwrap().unwrap();
+        jobs.set_phase(&running.id, "media").unwrap();
+        jobs.finish(&running.id, Some("media failure")).unwrap();
+        assert_eq!(jobs.job(&running.id).unwrap().unwrap().phase, "media");
+        assert_eq!(jobs.retry(&running.id).unwrap().phase, "waiting");
+        jobs.claim_class("manual").unwrap().unwrap();
+        jobs.set_phase(&running.id, "publishing").unwrap();
+        jobs.finish(&running.id, None).unwrap();
+        assert_eq!(jobs.job(&running.id).unwrap().unwrap().phase, "completed");
+    }
+
+    #[test]
     fn manual_only_scans_cancel_all_legacy_work_and_preserve_explicit_operations() {
         let (dir, jobs, folder) = setup();
         std::fs::create_dir(jobs.root().join("child")).unwrap();
@@ -970,7 +1030,7 @@ mod tests {
         drop(jobs);
         let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
         assert_eq!(jobs.cancel_automatic_scans().unwrap(), 0);
-        assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "pending");
+        assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "failed");
     }
 
     fn setup() -> (tempfile::TempDir, Jobs, Folder) {
@@ -1102,8 +1162,9 @@ mod tests {
             jobs.job(&automatic.id).unwrap().unwrap().work_class,
             "automatic"
         );
-        let resumed = jobs.claim_class("reconcile").unwrap().unwrap();
-        assert_eq!(resumed.id, reconcile.id);
+        assert!(jobs.claim_class("reconcile").unwrap().is_none());
+        let resumed = jobs.job(&reconcile.id).unwrap().unwrap();
+        assert_eq!(resumed.status, "failed");
         assert_eq!(resumed.processed, 7);
         assert_eq!(
             jobs.load_checkpoint(&reconcile.id).unwrap().as_deref(),
@@ -1151,7 +1212,6 @@ mod tests {
         assert!(!retry.wait_for_quiet);
         assert_eq!(retry.processed, 0);
         assert!(jobs.load_checkpoint(&retry.id).unwrap().is_none());
-        assert!(jobs.ensure_file_retry(&folder.id, &path).unwrap().is_none());
         jobs.claim_class("manual").unwrap().unwrap();
         let another = jobs.enqueue_file_change(&folder.id, &path, 0).unwrap();
         jobs.db
@@ -1179,27 +1239,6 @@ mod tests {
             jobs.enqueue_manual_file(&folder.id, &path).unwrap().id,
             manual.id
         );
-    }
-    #[test]
-    fn historical_error_gets_only_one_file_retry_until_completed() {
-        let (_dir, jobs, folder) = setup();
-        let path = jobs.root().join("bad.jpg");
-        let retry = jobs.ensure_file_retry(&folder.id, &path).unwrap().unwrap();
-        assert_eq!(retry.scope_kind, "file");
-        assert!(jobs.ensure_file_retry(&folder.id, &path).unwrap().is_none());
-        assert_eq!(jobs.claim_next().unwrap().unwrap().id, retry.id);
-        assert!(jobs.ensure_file_retry(&folder.id, &path).unwrap().is_none());
-        jobs.db
-            .lock()
-            .unwrap()
-            .execute("UPDATE jobs SET attempts=3 WHERE id=?1", [&retry.id])
-            .unwrap();
-        jobs.finish(&retry.id, Some("invalid photo")).unwrap();
-        assert!(jobs.ensure_file_retry(&folder.id, &path).unwrap().is_none());
-        jobs.retry(&retry.id).unwrap();
-        jobs.claim_next().unwrap().unwrap();
-        jobs.finish(&retry.id, None).unwrap();
-        assert!(jobs.ensure_file_retry(&folder.id, &path).unwrap().is_some());
     }
     #[test]
     fn manual_scopes_do_not_absorb_automatic_events() {
@@ -1400,7 +1439,7 @@ mod tests {
         );
     }
     #[test]
-    fn checkpoint_survives_yield_restart_and_concurrent_event_gets_fresh_pass() {
+    fn checkpoint_survives_restart_without_automatic_resume() {
         let (dir, jobs, folder) = setup();
         let queued = jobs.enqueue_scan(&folder.id).unwrap();
         jobs.claim_next().unwrap().unwrap();
@@ -1415,14 +1454,16 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        let resumed = jobs.claim_next().unwrap().unwrap();
+        assert!(jobs.claim_next().unwrap().is_none());
+        let resumed = jobs.job(&queued.id).unwrap().unwrap();
+        assert_eq!(resumed.status, "failed");
         assert_eq!((resumed.processed, resumed.skipped), (2, 7));
         assert_eq!(resumed.current_path.as_deref(), Some("previous.jpg"));
         assert_eq!(
             jobs.load_checkpoint(&queued.id).unwrap().as_deref(),
             Some("frontier")
         );
-        jobs.finish(&queued.id, None).unwrap();
+        jobs.retry(&queued.id).unwrap();
         assert!(jobs.load_checkpoint(&queued.id).unwrap().is_none());
         let rerun = jobs.claim_next().unwrap().unwrap();
         assert_eq!((rerun.processed, rerun.skipped), (0, 0));
@@ -1598,7 +1639,10 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert_eq!(jobs.claim_next().unwrap().unwrap().id, scoped.id);
+        assert!(jobs.claim_next().unwrap().is_none());
+        let stopped = jobs.job(&scoped.id).unwrap().unwrap();
+        assert_eq!(stopped.status, "failed");
+        assert!(stopped.path_sync);
         assert!(
             !jobs
                 .path_sync_pending("library", &jobs.root().join("elsewhere.raw"))
@@ -1626,6 +1670,8 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
+        assert!(jobs.claim_next().unwrap().is_none());
+        jobs.retry(&manual.id).unwrap();
         let recovered = jobs.claim_next().unwrap().unwrap();
         assert_eq!(recovered.id, manual.id);
         assert!(!recovered.wait_for_quiet);
@@ -1664,7 +1710,7 @@ mod tests {
         assert!(jobs.job(&queued.id).unwrap().unwrap().wait_for_quiet);
     }
     #[test]
-    fn queue_deduplicates_and_recovers_after_restart() {
+    fn queue_deduplicates_and_requires_retry_after_restart() {
         let (dir, jobs, folder) = setup();
         let a = jobs.enqueue_scan(&folder.id).unwrap();
         assert_eq!(a.id, jobs.enqueue_scan(&folder.id).unwrap().id);
@@ -1676,6 +1722,11 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
+        assert!(jobs.claim_next().unwrap().is_none());
+        let interrupted = jobs.job(&a.id).unwrap().unwrap();
+        assert_eq!(interrupted.status, "failed");
+        assert!(interrupted.error.unwrap().contains("已中断"));
+        jobs.retry(&a.id).unwrap();
         assert_eq!(jobs.claim_next().unwrap().unwrap().id, a.id);
         jobs.finish(&a.id, None).unwrap();
         assert_eq!(jobs.jobs(10).unwrap()[0].status, "completed");
@@ -1700,6 +1751,8 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
+        assert!(jobs.claim_next().unwrap().is_none());
+        jobs.retry(&queued.id).unwrap();
         let rerun = jobs.claim_next().unwrap().unwrap();
         assert_eq!(rerun.path, scope.to_str().unwrap());
         jobs.finish(&rerun.id, None).unwrap();
@@ -1743,17 +1796,18 @@ mod tests {
         let a = jobs.enqueue_scan(&folder.id).unwrap();
         jobs.claim_next().unwrap();
         jobs.update_progress(&a.id, 1, 2, 3, Some("a.jpg")).unwrap();
+        jobs.save_checkpoint(&a.id, "failed-step").unwrap();
+        jobs.enqueue_scan(&folder.id).unwrap();
         jobs.finish(&a.id, Some("decoder failed")).unwrap();
-        for _ in 0..3 {
-            jobs.db
-                .lock()
-                .unwrap()
-                .execute("UPDATE jobs SET available_at=0", [])
-                .unwrap();
-            jobs.claim_next().unwrap().unwrap();
-            jobs.update_progress(&a.id, 1, 2, 3, Some("a.jpg")).unwrap();
-            jobs.finish(&a.id, Some("decoder failed")).unwrap();
-        }
+        assert_eq!(
+            jobs.load_checkpoint(&a.id).unwrap().as_deref(),
+            Some("failed-step")
+        );
+        assert!(jobs.claim_next().unwrap().is_none());
+        assert_eq!(
+            jobs.job(&a.id).unwrap().unwrap().current_path.as_deref(),
+            Some("a.jpg")
+        );
         let failed = jobs.jobs(1).unwrap().remove(0);
         assert_eq!((failed.processed, failed.skipped, failed.failed), (1, 2, 3));
         assert!(failed.finished_at.is_some());

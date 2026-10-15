@@ -515,6 +515,9 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
             let descriptor = json!({"objectRef":object,"width":bm.width,"height":bm.height,"sizeBytes":fs::metadata(&browse)?.len(),"version":format!("{}:{}",crate::browse_cache::SPEC,hash),"spec":crate::browse_cache::SPEC,"sourceThumbnailVersion":version});
             crate::browse_cache::publish(&s.store, lib, &t.asset, &t.hash, version, &descriptor)?;
         }
+        crate::browse_cache::process_asset(&s.store, &s.previews, lib, &t.asset)?;
+        s.store
+            .collect_asset_cache_garbage(&s.previews, lib, &t.asset)?;
         fs::remove_dir_all(root)?;
         return Ok(json!({"ok":true}));
     }
@@ -643,6 +646,9 @@ fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
             &descriptor,
         )?;
     }
+    crate::browse_cache::process_asset(&s.store, &s.previews, lib, &t.asset)?;
+    s.store
+        .collect_asset_cache_garbage(&s.previews, lib, &t.asset)?;
     fs::remove_dir_all(root)?;
     Ok(json!({"ok":true}))
 }
@@ -861,7 +867,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                17
+                18
             );
             let edited: (f64, Option<String>) = db.query_row(
                 "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",
@@ -1174,7 +1180,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn startup_preserves_active_lease_and_expiry_requeues_once() -> Result<()> {
+    fn startup_preserves_active_lease_and_expiry_fails_once() -> Result<()> {
         let (_root, store) = setup()?;
         add_indexed_source(_root.path(), &store)?;
         store.recover_cache()?;
@@ -1184,7 +1190,7 @@ mod tests {
             .execute("UPDATE remote_cache_tasks SET expires_at=0", [])?;
         assert!(task(&store, "lib", "task").is_err());
         expire(&*store.lock()?)?;
-        assert_eq!(store.cache_status("lib")?["counts"]["pending"], 1);
+        assert_eq!(store.cache_status("lib")?["counts"]["failed"], 1);
         store
             .lock()?
             .execute("UPDATE media_cache SET status='processing'", [])?;
@@ -1193,9 +1199,51 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn completed_receipt_does_not_skip_failed_browse_step() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let originals = root.path().join("photos");
+        fs::create_dir(&originals)?;
+        let store = Store::open(&root.path().join("keeps/db/catalog.sqlite"), true)?;
+        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag) VALUES('lib','asset','{}','hash','fp','2024','photo.jpg',0,'none')", [])?;
+        store.reconcile_cache()?;
+        store.lock()?.execute("INSERT INTO remote_cache_tasks VALUES('task','lib','asset','hash','hash','/photo/test.jpg','worker',0,1)", [])?;
+        let thumbnail = json!({"objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/thumbnail/missing.heic"},"version":"spec:hash","width":10,"height":10,"sizeBytes":10});
+        store.lock()?.execute(
+            "UPDATE media_cache SET status='ready',thumbnail=?",
+            [thumbnail.to_string()],
+        )?;
+        let state = AppState {
+            previews: Arc::new(crate::previews::PreviewStorage::new(
+                &root.path().join("keeps"),
+                Some(&originals),
+                "http://localhost",
+                "test",
+            )?),
+            store: Arc::new(store),
+            jobs: Arc::new(crate::jobs::Jobs::open(
+                &root.path().join("jobs.sqlite"),
+                &originals,
+            )?),
+            access_token: "test".into(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        };
+        for _ in 0..2 {
+            assert!(complete_sync(&state, "lib", "task").is_err());
+        }
+        let error: Option<String> = state.store.lock()?.query_row(
+            "SELECT browse_last_error FROM media_cache",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(error.is_some());
+        Ok(())
+    }
+
+    #[test]
     fn publish_commits_receipt_with_cache_and_retry_survives_expiry() -> Result<()> {
         let (_root, store) = setup()?;
-        let thumbnail = json!({"objectRef":{"bucket":"keeps-previews","key":"lib/asset/thumbnail/hash.heic"},"width":10,"height":10});
+        let thumbnail = json!({"objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/thumbnail/hash.heic"},"version":"spec:hash","width":10,"height":10,"sizeBytes":10});
         store.cache_publish("lib", "asset", "hash", &thumbnail, &json!({}))?;
         assert_eq!(task(&store, "lib", "task")?.completed, 1);
         store
@@ -1206,12 +1254,12 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn expired_fourth_attempt_is_failed_and_stale_failure_cannot_touch_replacement() -> Result<()> {
+    fn expired_first_attempt_is_failed_and_stale_failure_cannot_touch_replacement() -> Result<()> {
         let (_root, store) = setup()?;
         add_indexed_source(_root.path(), &store)?;
         store
             .lock()?
-            .execute("UPDATE media_cache SET attempts=4", [])?;
+            .execute("UPDATE media_cache SET attempts=1", [])?;
         store
             .lock()?
             .execute("UPDATE remote_cache_tasks SET expires_at=0", [])?;

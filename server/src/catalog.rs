@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 17;
+const VERSION: i64 = 18;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -59,7 +59,7 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         db.prepare("SELECT id,expires_at,completed FROM remote_cache_tasks LIMIT 0")?;
         db.prepare("SELECT library_id,batch_id,path,worker_id,expires_at FROM import_compute_leases LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,role,file_object,object_bucket,object_key,object_etag,pixel_width,pixel_height,updated_at FROM derivative_objects LIMIT 0")?;
-        db.prepare("SELECT library_id,bucket,object_key,not_before,attempts,last_error FROM media_cache_gc LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,bucket,object_key,not_before,attempts,last_error FROM media_cache_gc LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM photos LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM videos LIMIT 0")?;
         db.prepare("SELECT library_id,path,parent_path FROM directories LIMIT 0")?;
@@ -176,6 +176,9 @@ CREATE TRIGGER IF NOT EXISTS catalog_trash_remove AFTER DELETE ON catalog_assets
 INSERT OR IGNORE INTO catalog_tags SELECT a.library_id,trim(t.value) FROM catalog_assets a,json_each(a.snapshot,'$.tags') t WHERE t.type='text' AND length(trim(t.value))>0;
 CREATE TRIGGER IF NOT EXISTS catalog_tags_insert AFTER INSERT ON catalog_assets BEGIN INSERT OR IGNORE INTO catalog_tags SELECT new.library_id,trim(value) FROM json_each(new.snapshot,'$.tags') WHERE type='text' AND length(trim(value))>0; END;
 CREATE TRIGGER IF NOT EXISTS catalog_tags_update AFTER UPDATE OF snapshot ON catalog_assets WHEN json_extract(old.snapshot,'$.tags') IS NOT json_extract(new.snapshot,'$.tags') BEGIN INSERT OR IGNORE INTO catalog_tags SELECT new.library_id,trim(value) FROM json_each(new.snapshot,'$.tags') WHERE type='text' AND length(trim(value))>0; END;")?;
+    }
+    if version < 18 {
+        crate::cache_gc::migrate_asset_ownership(&tx)?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -632,6 +635,7 @@ impl Store {
                     crate::cache_gc::enqueue(
                         &tx,
                         lib,
+                        id,
                         &value["objectRef"],
                         &Value::Null,
                         Utc::now().timestamp(),

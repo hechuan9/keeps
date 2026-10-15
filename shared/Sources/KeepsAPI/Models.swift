@@ -231,6 +231,8 @@ public struct KeepsAutomaticTaskStatus: Decodable, Equatable, Sendable {
 }
 
 public struct KeepsLongTaskStatus: Decodable, Equatable, Sendable {
+    public var jobID: String?
+    public var phase: String?
     public var status: String
     public var kind: String?
     public var error: String?

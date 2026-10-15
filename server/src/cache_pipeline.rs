@@ -7,11 +7,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
-use std::{
-    fs,
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use std::{fs, path::Path};
 
 pub fn thumbnail_quality() -> Result<u8> {
     static QUALITY: std::sync::OnceLock<Result<u8, String>> = std::sync::OnceLock::new();
@@ -46,10 +42,10 @@ pub fn local_encoding_enabled() -> Result<bool> {
         .map_err(anyhow::Error::msg)
 }
 pub const BATCH: usize = 20;
-const MAX_ATTEMPTS: i64 = 4;
+const MAX_ATTEMPTS: i64 = 1;
 
-/// Recheck this failed attempt against current catalog state before consuming retries.
-/// Returns false when the attempt is obsolete, so callers do not fail its parent photo job.
+/// Preserve a terminal failure without overwriting a newer source attempt.
+/// Returns whether the failed attempt still owns the current cache source.
 pub(crate) fn record_failure(
     db: &Connection,
     lib: &str,
@@ -82,19 +78,19 @@ pub(crate) fn record_failure(
             Ok(false)
         }
         Some(hash) if hash != expected_hash => {
-            db.execute("UPDATE media_cache SET source_hash=?,spec=?,status='pending',attempts=0,available_at=0,last_error=NULL,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![hash,spec()?,lib,id])?;
+            db.execute("UPDATE media_cache SET source_hash=?,spec=?,status='failed',attempts=0,available_at=0,last_error=?,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![hash,spec()?,error,lib,id])?;
             tracing::info!(
                 library_id = lib,
                 asset_id = id,
                 source_hash = expected_hash,
                 new_hash = hash,
                 error,
-                "Media task retargeted after source change"
+                "Media task stopped after source change"
             );
             Ok(false)
         }
         Some(_) => {
-            db.execute("UPDATE media_cache SET status=CASE WHEN attempts>=? THEN 'failed' ELSE 'pending' END,last_error=?,available_at=unixepoch()+60*attempts*attempts,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![MAX_ATTEMPTS,error,lib,id])?;
+            db.execute("UPDATE media_cache SET status='failed',last_error=?,available_at=0,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![error,lib,id])?;
             Ok(true)
         }
     }
@@ -143,27 +139,9 @@ impl Store {
     }
     pub fn recover_cache(&self) -> Result<()> {
         self.lock()?.execute(
-            "UPDATE media_cache SET status='pending' WHERE status='processing' AND NOT EXISTS(SELECT 1 FROM remote_cache_tasks r WHERE r.library_id=media_cache.library_id AND r.asset_id=media_cache.asset_id AND r.completed=0 AND r.expires_at>unixepoch())",
+            "UPDATE media_cache SET status='failed',last_error='服务已重启，媒体处理已中断，请人工重试' WHERE status='processing' AND NOT EXISTS(SELECT 1 FROM remote_cache_tasks r WHERE r.library_id=media_cache.library_id AND r.asset_id=media_cache.asset_id AND r.completed=0 AND r.expires_at>unixepoch())",
             [],
         )?;
-        Ok(())
-    }
-    // Revisit one terminal failure per existing idle maintenance pass, without encoding.
-    fn recheck_failed_cache(&self) -> Result<()> {
-        let mut db = self.lock()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let row: Option<(String,String,String,String)> = tx.query_row(
-            "SELECT library_id,asset_id,source_hash,coalesce(last_error,'media generation failed') FROM media_cache WHERE status='failed' AND available_at<=unixepoch() ORDER BY available_at LIMIT 1",
-            [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)),
-        ).optional()?;
-        if let Some((lib, id, hash, error)) = row {
-            tx.execute(
-                "UPDATE media_cache SET status='processing' WHERE library_id=? AND asset_id=?",
-                params![lib, id],
-            )?;
-            record_failure(&tx, &lib, &id, &hash, &error)?;
-        }
-        tx.commit()?;
         Ok(())
     }
     pub fn cache_status(&self, library: &str) -> Result<Value> {
@@ -229,34 +207,6 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         crate::remote_worker::expire(&tx)?;
         let row=tx.query_row("SELECT library_id,asset_id,source_hash FROM media_cache WHERE status='pending' AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.expires_at>unixepoch()) ORDER BY updated_at,asset_id LIMIT 1",[],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
-        if let Some((lib, id, _)) = &row {
-            tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
-        }
-        tx.commit()?;
-        Ok(row)
-    }
-    fn claim_import_cache(&self) -> Result<Option<(String, String, String)>> {
-        let _source = self
-            .source_mutation
-            .read()
-            .map_err(|_| anyhow::anyhow!("source mutation lock poisoned"))?;
-        let mut db = self.lock()?;
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        crate::remote_worker::expire(&tx)?;
-        if !local_encoding_enabled()? {
-            tx.commit()?;
-            return Ok(None);
-        }
-        let row = tx.query_row(
-            "SELECT c.library_id,c.asset_id,c.source_hash FROM media_cache c
-             WHERE c.status='pending' AND c.available_at<=unixepoch() AND c.attempts<?1
-             AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=c.library_id AND a.id=c.asset_id AND a.trashed=0)
-             AND EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at<=unixepoch())
-             AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch())
-             AND NOT EXISTS(SELECT 1 FROM remote_cache_tasks r WHERE r.library_id=c.library_id AND r.asset_id=c.asset_id AND r.completed=0 AND r.expires_at>unixepoch())
-             ORDER BY c.updated_at,c.asset_id LIMIT 1",
-            [MAX_ATTEMPTS], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)),
-        ).optional()?;
         if let Some((lib, id, _)) = &row {
             tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
         }
@@ -335,55 +285,42 @@ impl Store {
                 crate::cache_gc::enqueue(
                     &tx,
                     lib,
+                    id,
                     &previous["objectRef"],
                     &thumbnail["objectRef"],
                     chrono::Utc::now().timestamp(),
                 )?;
             }
-            if crate::cache_gc::enabled()? {
-                crate::cache_gc::switch_preview(
-                    &tx,
-                    lib,
-                    id,
-                    thumbnail,
-                    chrono::Utc::now().timestamp(),
-                )?;
-            }
+            crate::cache_gc::switch_preview(
+                &tx,
+                lib,
+                id,
+                thumbnail,
+                chrono::Utc::now().timestamp(),
+            )?;
             tx.execute("INSERT OR IGNORE INTO catalog_revision_dirty(library_id,kind,key) VALUES(?,'asset',?)",params![lib,id])?;
         }
         crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(())
     }
-    pub fn audit_cache(&self, previews: &PreviewStorage) -> Result<()> {
-        let rows = {
-            let db = self.lock()?;
-            let mut q=db.prepare("SELECT library_id,asset_id,thumbnail,standard FROM media_cache WHERE status='ready' ORDER BY audited_at LIMIT 20")?;
-            q.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (lib, id, thumb, standard) in rows {
-            let thumb: Value = serde_json::from_str(&thumb)?;
-            let standard: Value = serde_json::from_str(&standard)?;
-            if let Some(browse) = self.browse_descriptor(&lib, &id)?
-                && !previews.contains(&browse["objectRef"])?
-            {
-                self.lock()?.execute("UPDATE media_cache SET browse_thumbnail=NULL,browse_attempts=0,browse_available_at=0 WHERE library_id=? AND asset_id=?",params![lib,id])?;
-            }
-            if !previews.contains(&thumb["objectRef"])? || !standard_current(&standard)? {
-                self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0 WHERE library_id=? AND asset_id=?",params![lib,id])?;
-            } else {
-                self.lock()?.execute("UPDATE media_cache SET audited_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
-            }
+    fn asset_cache_current(&self, previews: &PreviewStorage, lib: &str, id: &str) -> Result<bool> {
+        let (thumbnail, standard): (String, String) = self.lock()?.query_row(
+            "SELECT thumbnail,standard FROM media_cache WHERE library_id=? AND asset_id=?",
+            params![lib, id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let thumbnail: Value = serde_json::from_str(&thumbnail)?;
+        let standard: Value = serde_json::from_str(&standard)?;
+        if let Some(browse) = self.browse_descriptor(lib, id)?
+            && !previews.contains(&browse["objectRef"])?
+        {
+            self.lock()?.execute(
+                "UPDATE media_cache SET browse_thumbnail=NULL WHERE library_id=? AND asset_id=?",
+                params![lib, id],
+            )?;
         }
-        Ok(())
+        Ok(previews.contains(&thumbnail["objectRef"])? && standard_current(&standard)?)
     }
 }
 
@@ -456,14 +393,21 @@ pub fn process_asset(
     let Some((hash, status)) = selected else {
         return Ok(());
     };
-    if status == "ready" || status == "cancelled" {
+    if status == "cancelled" {
         return Ok(());
     }
+    if status == "ready" {
+        if store.asset_cache_current(previews, lib, id)? {
+            crate::browse_cache::process_asset(store, previews, lib, id)?;
+            return Ok(());
+        }
+        store.lock()?.execute("UPDATE media_cache SET status='processing',attempts=1,last_error=NULL WHERE library_id=? AND asset_id=?", params![lib,id])?;
+    }
     ensure!(
-        status == "pending",
+        status == "pending" || status == "ready",
         "photo media is {status}; retry pending processing before completing the photo"
     );
-    let mut result = (|| {
+    let result = (|| {
         ensure!(
             local_encoding_enabled()?,
             "local photo encoding is disabled"
@@ -474,75 +418,12 @@ pub fn process_asset(
         );
         generate(store, jobs, previews, lib, id, &hash)
     })();
-    if let Err(error) = &result
-        && !store.cache_failed(lib, id, &hash, &format!("{error:#}"))?
-    {
-        result = Ok(());
+    if let Err(error) = &result {
+        store.cache_failed(lib, id, &hash, &format!("{error:#}"))?;
     }
     store.lock()?.execute("UPDATE cache_runtime SET last_batch_count=1,last_batch_at=unixepoch(),next_batch_at=0 WHERE id=1",[])?;
-    result
-}
-
-/// Resume media from an explicitly initiated import after its client lease expires.
-pub fn process_import_media(store: &Store, jobs: &Jobs, previews: &PreviewStorage) -> Result<bool> {
-    let _directory_guard = jobs
-        .directory_mutation
-        .read()
-        .map_err(|_| anyhow::anyhow!("directory mutation lock poisoned"))?;
-    crate::directory_move::ensure_reconciled(jobs)?;
-    let Some((lib, id, hash)) = store.claim_import_cache()? else {
-        return Ok(false);
-    };
-    let result: Result<()> = (|| {
-        crate::tasks::begin(jobs, &lib, "import-media", Some(&id))?;
-        ensure!(
-            previews.free_bytes()? >= 2 * 1024 * 1024 * 1024,
-            "cache disk has less than 2 GiB free"
-        );
-        generate(store, jobs, previews, &lib, &id, &hash)
-    })();
-    let error = result.err().map(|e| format!("{e:#}"));
-    if let Some(error) = &error {
-        tracing::error!(library_id=%lib,asset_id=%id,error=%error,"NAS import media failed");
-        store.cache_failed(&lib, &id, &hash, error)?;
-    }
-    crate::tasks::finish(jobs, error.as_deref())?;
-    store.lock()?.execute("UPDATE cache_runtime SET last_batch_count=1,last_batch_at=unixepoch(),next_batch_at=0,last_error=? WHERE id=1",[error])?;
-    Ok(true)
-}
-
-pub fn maintain(
-    store: &Store,
-    jobs: &Jobs,
-    previews: &PreviewStorage,
-    stop: &AtomicBool,
-) -> Result<()> {
-    if stop.load(Ordering::Relaxed) {
-        return Ok(());
-    }
-    if let Some(folder) = jobs.folders()?.into_iter().find(|f| f.active) {
-        crate::tasks::begin(jobs, &folder.library_id, "maintenance", None)?;
-    }
-    let result: Result<()> = (|| {
-        store.lock()?.execute(
-            "UPDATE cache_runtime SET free_bytes=?,next_batch_at=0 WHERE id=1",
-            [previews.free_bytes()?],
-        )?;
-        store.recheck_failed_cache()?;
-        store.reconcile_cache()?;
-        store.audit_cache(previews)?;
-        if crate::cache_gc::enabled()? {
-            store.switch_ready_previews(previews)?;
-            store.collect_cache_garbage(previews, chrono::Utc::now().timestamp())?;
-        }
-        Ok(())
-    })();
-    let error = result.as_ref().err().map(|e| format!("{e:#}"));
-    store
-        .lock()?
-        .execute("UPDATE cache_runtime SET last_error=? WHERE id=1", [&error])?;
-    crate::tasks::finish(jobs, error.as_deref())?;
     result?;
+    crate::browse_cache::process_asset(store, previews, lib, id)?;
     Ok(())
 }
 
@@ -852,110 +733,26 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn import_takeover_is_scoped_exclusive_and_respects_retry_state() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Store::open(&dir.path().join("db"), true)?;
-        seed(&store, 5)?;
-        store.reconcile_cache()?;
-        for index in 0..5 {
-            let id = format!("00000000-0000-0000-0000-{index:012}");
-            let path = format!("/photos/{index}.jpg");
-            store.lock()?.execute(
-                "INSERT INTO catalog_paths VALUES('lib',?,?,?,'jpeg_original')",
-                params![path, id, format!("hash{index}")],
-            )?;
-            if index > 0 {
-                store.lock()?.execute(
-                    "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()-1)",
-                    [path],
-                )?;
-            }
-        }
-        store.lock()?.execute(
-            "UPDATE media_cache SET available_at=unixepoch()+100 WHERE source_hash='hash1'",
-            [],
-        )?;
-        store.lock()?.execute(
-            "UPDATE media_cache SET attempts=? WHERE source_hash='hash2'",
-            [MAX_ATTEMPTS],
-        )?;
-        store.lock()?.execute("INSERT INTO remote_cache_tasks VALUES('remote','lib','00000000-0000-0000-0000-000000000003','hash3','hash3','/photos/3.jpg','mac',unixepoch()+100,0)",[])?;
-        let (_, id, _) = store.claim_import_cache()?.unwrap();
-        assert!(id.ends_with('4'));
-        assert!(store.claim_import_cache()?.is_none());
-        store.lock()?.execute("UPDATE import_compute_leases SET expires_at=unixepoch()+100 WHERE path='/photos/1.jpg'",[])?;
-        store.lock()?.execute(
-            "UPDATE media_cache SET available_at=0 WHERE source_hash='hash1'",
-            [],
-        )?;
-        assert!(store.claim_import_cache()?.is_none());
-        store.lock()?.execute(
-            "UPDATE media_cache SET status='processing',attempts=1 WHERE source_hash='hash3'",
-            [],
-        )?;
-        store
-            .lock()?
-            .execute("UPDATE remote_cache_tasks SET expires_at=unixepoch()-1", [])?;
-        assert!(store.claim_import_cache()?.is_none());
-        let db = store.lock()?;
-        assert_eq!(
-            db.query_row("SELECT completed FROM remote_cache_tasks", [], |r| r
-                .get::<_, i64>(0))?,
-            -1
-        );
-        assert_eq!(
-            db.query_row(
-                "SELECT last_error FROM media_cache WHERE source_hash='hash3'",
-                [],
-                |r| r.get::<_, String>(0)
-            )?,
-            "remote worker lease expired"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn failed_import_media_does_not_block_next_photo_or_enqueue_scan() -> Result<()> {
+    fn obsolete_generation_error_still_fails_the_parent_task() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let jobs = Jobs::open(&dir.path().join("jobs"), dir.path())?;
+        seed(&store, 1)?;
         let previews = PreviewStorage::new(
             &dir.path().join("previews"),
             None,
             "http://localhost",
             "test-key",
         )?;
-        seed(&store, 2)?;
-        store.reconcile_cache()?;
-        for index in 0..2 {
-            let id = format!("00000000-0000-0000-0000-{index:012}");
-            let path = dir
-                .path()
-                .join(format!("missing{index}.jpg"))
-                .to_string_lossy()
-                .into_owned();
-            store.lock()?.execute(
-                "INSERT INTO catalog_paths VALUES('lib',?,?,?,'jpeg_original')",
-                params![path, id, format!("hash{index}")],
-            )?;
-            store.lock()?.execute(
-                "INSERT INTO import_compute_leases VALUES('lib','batch',?,'mac',unixepoch()-1)",
-                [path],
-            )?;
-        }
-        assert!(process_import_media(&store, &jobs, &previews)?);
-        assert!(process_import_media(&store, &jobs, &previews)?);
-        assert!(!process_import_media(&store, &jobs, &previews)?);
-        assert_eq!(
-            store.lock()?.query_row(
-                "SELECT count(*) FROM media_cache WHERE last_error IS NOT NULL AND attempts=1",
-                [],
-                |r| r.get::<_, i64>(0)
-            )?,
-            2
+        let result = process_asset(
+            &store,
+            &jobs,
+            &previews,
+            "lib",
+            "00000000-0000-0000-0000-000000000000",
         );
-        assert!(jobs.claim_class("manual")?.is_none());
-        assert!(jobs.claim_class("automatic")?.is_none());
+        assert!(result.is_err());
+        assert_eq!(store.cache_status("lib")?["counts"]["cancelled"], 1);
         Ok(())
     }
 
@@ -985,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_retargets_changed_source_without_charging_new_version() -> Result<()> {
+    fn failure_stops_changed_source_until_explicit_retry() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         seed(&store, 1)?;
@@ -1004,7 +801,17 @@ mod tests {
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-        assert_eq!(row, ("new".into(), "pending".into(), 0, None));
+        assert_eq!(
+            row,
+            (
+                "new".into(),
+                "failed".into(),
+                0,
+                Some("old generation failed".into())
+            )
+        );
+        assert!(store.claim_cache()?.is_none());
+        store.retry_cache(&lib)?;
         store.claim_cache()?.unwrap();
         assert!(!store.cache_failed(&lib, &id, &old, "late old failure")?);
         assert!(store.cache_failed(&lib, &id, "new", "permission denied: full cause chain")?);
@@ -1012,26 +819,6 @@ mod tests {
             store.cache_status(&lib)?["errors"][0]["error"],
             "permission denied: full cause chain"
         );
-        Ok(())
-    }
-
-    #[test]
-    fn idle_recheck_inspects_only_one_old_failure_without_retrying_encoder() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let store = Store::open(&dir.path().join("db"), true)?;
-        seed(&store, 2)?;
-        store.reconcile_cache()?;
-        store.lock()?.execute(
-            "UPDATE media_cache SET status='failed',attempts=4,last_error='old failure'",
-            [],
-        )?;
-        store.recheck_failed_cache()?;
-        let status = store.cache_status("lib")?;
-        assert_eq!(status["counts"]["cancelled"], 1);
-        assert_eq!(status["counts"]["failed"], 1);
-        assert_eq!(status["counts"]["pending"], 0);
-        store.recheck_failed_cache()?;
-        assert_eq!(store.cache_status("lib")?["counts"]["cancelled"], 2);
         Ok(())
     }
 
@@ -1101,52 +888,6 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn maintenance_reconciles_and_audits_without_encoding() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let originals = dir.path().join("originals");
-        fs::create_dir(&originals)?;
-        let store = Store::open(&dir.path().join("db"), true)?;
-        let jobs = Jobs::open(&dir.path().join("jobs"), &originals)?;
-        let previews = PreviewStorage::new(
-            &dir.path().join("keeps"),
-            Some(&originals),
-            "http://localhost",
-            "test-key",
-        )?;
-        seed(&store, 1)?;
-        store.reconcile_cache()?;
-        let source = originals.join("photo.jpg");
-        fs::write(&source, b"original")?;
-        let object = previews.put_generated_role("lib", "asset", "thumb", &source, "thumbnail")?;
-        store.lock()?.execute(
-            "UPDATE media_cache SET status='ready',thumbnail=?,standard=?",
-            params![
-                json!({"objectRef":object}).to_string(),
-                json!({"path":source,"sizeBytes":999,"mtimeNs":0}).to_string()
-            ],
-        )?;
-        store.lock()?.execute("INSERT INTO catalog_assets(library_id,id,snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed) VALUES('lib','new','{}','newhash','fingerprint','2024-01-01','photo.jpg',0,'picked',NULL,0)", [])?;
-        let stop = AtomicBool::new(false);
-        maintain(&store, &jobs, &previews, &stop)?;
-        assert!(jobs.claim_class("automatic")?.is_none());
-        assert!(jobs.claim_class("manual")?.is_none());
-        let status = store.cache_status("lib")?;
-        assert_eq!(status["pendingInventory"], 0);
-        assert_eq!(status["counts"]["pending"], 2);
-        assert_eq!(status["counts"]["processing"], 0);
-        assert_eq!(fs::read(&source)?, b"original");
-        assert_eq!(
-            store
-                .lock()?
-                .query_row("SELECT sum(attempts) FROM media_cache", [], |r| r
-                    .get::<_, i64>(0))?,
-            0
-        );
-        assert!(status["runtime"]["freeBytes"].as_u64().unwrap() > 0);
-        assert_eq!(status["runtime"]["nextBatchAt"], 0);
-        Ok(())
-    }
-    #[test]
     fn trashed_assets_preserve_cache_history_and_leave_inventory() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
@@ -1179,7 +920,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn recovery_limited_retries_and_source_change_invalidation() -> Result<()> {
+    fn recovery_and_first_failure_require_manual_retry() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("db");
         let store = Store::open(&db, true)?;
@@ -1193,14 +934,11 @@ mod tests {
         drop(store);
         let store = Store::open(&db, false)?;
         store.recover_cache()?;
-        assert_eq!(store.cache_status("lib")?["counts"]["pending"], 1);
-        for _ in 0..3 {
-            store
-                .lock()?
-                .execute("UPDATE media_cache SET available_at=0", [])?;
-            store.claim_cache()?.unwrap();
-            store.cache_failed(&lib, &id, &hash, "full error chain")?;
-        }
+        assert_eq!(store.cache_status("lib")?["counts"]["failed"], 1);
+        assert!(store.claim_cache()?.is_none());
+        assert_eq!(store.retry_cache("lib")?, 1);
+        store.claim_cache()?.unwrap();
+        store.cache_failed(&lib, &id, &hash, "full error chain")?;
         assert_eq!(store.cache_status("lib")?["counts"]["failed"], 1);
         assert!(store.claim_cache()?.is_none());
         assert_eq!(store.retry_cache("lib")?, 1);
@@ -1244,14 +982,8 @@ mod tests {
         let thumbnail =
             json!({"objectRef":new,"version":"spec:new","width":512,"height":384,"sizeBytes":9});
         store.cache_publish(&library, &id, &hash, &thumbnail, &json!({}))?;
-        let due = store
-            .lock()?
-            .query_row("SELECT not_before FROM media_cache_gc", [], |r| {
-                r.get::<_, i64>(0)
-            })?;
-        assert_eq!(store.collect_cache_garbage(&previews, due - 1)?, 0);
         assert!(previews.contains(&old)?);
-        assert_eq!(store.collect_cache_garbage(&previews, due)?, 1);
+        assert_eq!(store.collect_asset_cache_garbage(&previews, "lib", &id)?, 1);
         assert!(previews.contains(&new)?);
         Ok(())
     }
@@ -1314,7 +1046,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn audit_requeues_changed_stat_and_keeps_last_success_unchanged() -> Result<()> {
+    fn manual_cache_validation_detects_changed_stat_without_background_queueing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         seed(&store, 1)?;
@@ -1337,12 +1069,12 @@ mod tests {
                 standard.to_string()
             ],
         )?;
-        store.audit_cache(&previews)?;
+        assert!(store.asset_cache_current(&previews, "lib", &id)?);
         assert_eq!(store.cache_status("lib")?["lastSuccessAt"], 123);
         std::thread::sleep(std::time::Duration::from_millis(5));
         fs::write(&source, b"bytes")?;
-        store.audit_cache(&previews)?;
-        assert_eq!(store.cache_status("lib")?["counts"]["pending"], 1);
+        assert!(!store.asset_cache_current(&previews, "lib", &id)?);
+        assert_eq!(store.cache_status("lib")?["counts"]["ready"], 1);
         assert_eq!(fs::read(source)?, b"bytes");
         Ok(())
     }

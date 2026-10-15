@@ -282,6 +282,10 @@ fn submit(jobs: &Jobs, store: &Store, library: &str, id: &str, count: usize) -> 
         count > 0 && count == task.count,
         error(422, "输入的照片数量必须与确认窗口完全一致")
     );
+    if task.status == "failed" && task.phase != "failed" {
+        jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='pending',finished_at=NULL,updated_at=unixepoch() WHERE id=?1", [&task.id])?;
+        return Ok(load(jobs, library, &task.id)?.0);
+    }
     if task.status != "draft" {
         return Ok(task);
     }
@@ -305,7 +309,7 @@ fn transition(jobs: &Jobs, id: &str, phase: &str, message: Option<&str>) -> Resu
     jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status=?2,phase=?3,error=?4,updated_at=unixepoch(),finished_at=CASE WHEN ?2 IN ('completed','failed') THEN unixepoch() ELSE NULL END WHERE id=?1",params![id,status,phase,message])?;
     Ok(())
 }
-fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<()> {
+fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<Vec<String>> {
     if plan.keeps_trash {
         store.enqueue_recycled_asset_caches(library, &plan.assets)?;
     }
@@ -319,8 +323,8 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<(
         }
     }
     store.reconcile_cache()?;
+    let mut finished = Vec::new();
     if plan.keeps_trash {
-        let mut finished = Vec::new();
         for asset in &plan.assets {
             let files = plan
                 .asset_files
@@ -345,7 +349,7 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, plan: &Plan) -> Result<(
             )?;
         }
     }
-    Ok(())
+    Ok(finished)
 }
 fn recycle_plan(
     jobs: &Jobs,
@@ -413,6 +417,7 @@ fn recycle_plan(
 fn process(
     jobs: &Jobs,
     store: &Store,
+    previews: &crate::previews::PreviewStorage,
     library: &str,
     id: &str,
     config: impl FnOnce() -> Result<String>,
@@ -421,7 +426,9 @@ fn process(
     let _guard = jobs.directory_mutation.write().unwrap();
     let (task, plan, _) = load(jobs, library, id)?;
     if task.phase == "reconciling" {
-        reconcile(jobs, store, library, &plan)?;
+        for asset in reconcile(jobs, store, library, &plan)? {
+            store.collect_asset_cache_garbage(previews, library, &asset)?;
+        }
         return transition(
             jobs,
             id,
@@ -483,7 +490,9 @@ fn process(
         jobs.trash_db.lock().unwrap().execute("INSERT INTO trash_cleanup_checks VALUES(?1,?2) ON CONFLICT(library_id) DO UPDATE SET next_check=excluded.next_check",params![library,i64::MAX])?;
     }
     transition(jobs, id, "reconciling", message.as_deref())?;
-    reconcile(jobs, store, library, &plan)?;
+    for asset in reconcile(jobs, store, library, &plan)? {
+        store.collect_asset_cache_garbage(previews, library, &asset)?;
+    }
     transition(
         jobs,
         id,
@@ -495,7 +504,34 @@ fn process(
         message.as_deref(),
     )
 }
-pub(crate) fn process_next(jobs: &Jobs, store: &Store) -> Result<bool> {
+pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
+    let rows = jobs
+        .trash_db
+        .lock()
+        .unwrap()
+        .prepare(
+            "SELECT id,library_id FROM rejected_trash_tasks WHERE status IN ('pending','running')",
+        )?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, library) in rows {
+        let (task, plan, _) = load(jobs, &library, &id)?;
+        if task.phase != "waiting" && !plan.soft_delete {
+            reconcile(jobs, store, &library, &plan)?;
+        }
+        jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||'服务已重启，照片回收已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
+        if plan.cutoff.is_some() {
+            jobs.trash_db.lock().unwrap().execute("INSERT INTO trash_cleanup_checks VALUES(?1,?2) ON CONFLICT(library_id) DO UPDATE SET next_check=excluded.next_check", params![library,i64::MAX])?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn process_next(
+    jobs: &Jobs,
+    store: &Store,
+    previews: &crate::previews::PreviewStorage,
+) -> Result<bool> {
     let next=jobs.trash_db.lock().unwrap().query_row("SELECT id,library_id FROM rejected_trash_tasks WHERE status IN ('pending','running') ORDER BY created_at,id LIMIT 1",[],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()?;
     let Some((id, library)) = next else {
         return Ok(false);
@@ -503,13 +539,14 @@ pub(crate) fn process_next(jobs: &Jobs, store: &Store) -> Result<bool> {
     if let Err(e) = process(
         jobs,
         store,
+        previews,
         &library,
         &id,
         || fs::read_to_string("/etc/samba/smb.share.conf").context("无法读取 DSM 回收站配置"),
         directory_trash::recycle_file,
     ) {
-        tracing::error!(task=%id,error=%format!("{e:#}"),"Photo recycling reconciliation failed; task remains resumable");
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        tracing::error!(task=%id,error=%format!("{e:#}"),"Photo recycling reconciliation failed");
+        jobs.trash_db.lock().unwrap().execute("UPDATE rejected_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||?2,finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", params![id,format!("{e:#}。索引协调失败，请手动重试。")])?;
     }
     Ok(true)
 }
@@ -535,7 +572,7 @@ fn settings(store: &Store, library: &str) -> Result<TrashSettings> {
         )
         .optional()?
         .unwrap_or(TrashSettings {
-            enabled: true,
+            enabled: false,
             retention_days: 30,
         }))
 }
@@ -725,6 +762,14 @@ async fn status_api(
 mod tests {
     use super::*;
     use serde_json::json;
+    fn preview_storage(jobs: &Jobs) -> Result<crate::previews::PreviewStorage> {
+        crate::previews::PreviewStorage::new(
+            &jobs.root().parent().unwrap().join("keeps"),
+            Some(jobs.root()),
+            "http://localhost",
+            "test-key",
+        )
+    }
     fn setup() -> Result<(tempfile::TempDir, Jobs, Store, String)> {
         let tmp = tempfile::tempdir()?;
         fs::create_dir_all(tmp.path().join("photos/#recycle"))?;
@@ -756,6 +801,23 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn startup_stops_confirmed_recycling_without_touching_originals() -> Result<()> {
+        let (_tmp, jobs, store, _config) = setup()?;
+        let file = jobs.root().join("a.jpg");
+        photo(&store, &file, "a", None)?;
+        let task = preview(&jobs, &store, "lib")?;
+        submit(&jobs, &store, "lib", &task.id, 1)?;
+        interrupt_pending(&jobs, &store)?;
+        assert!(file.exists());
+        let stopped = load(&jobs, "lib", &task.id)?.0;
+        assert_eq!(stopped.status, "failed");
+        assert_eq!(stopped.phase, "waiting");
+        assert!(!process_next(&jobs, &store, &preview_storage(&jobs)?)?);
+        assert_eq!(submit(&jobs, &store, "lib", &task.id, 1)?.status, "pending");
+        Ok(())
+    }
+
+    #[test]
     fn rejected_delete_enters_keeps_without_touching_files_and_retries_after_restart() -> Result<()>
     {
         let (_tmp, jobs, store, _) = setup()?;
@@ -767,6 +829,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || panic!("no DSM call"),
@@ -787,6 +850,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || panic!("no DSM call"),
@@ -825,6 +889,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -855,6 +920,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -881,9 +947,18 @@ mod tests {
         assert_eq!(
             settings(&store, "lib")?,
             TrashSettings {
-                enabled: true,
+                enabled: false,
                 retention_days: 30
             }
+        );
+        schedule_expired(&jobs, &store, now)?;
+        assert_eq!(
+            jobs.trash_db.lock().unwrap().query_row(
+                "SELECT count(*) FROM rejected_trash_tasks",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            0
         );
         store
             .lock()?
@@ -914,6 +989,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &id,
             || Ok(config),
@@ -944,6 +1020,9 @@ mod tests {
             "UPDATE catalog_trash_entries SET trashed_at=? WHERE asset_id=?",
             params![now - 31 * 86400, &id],
         )?;
+        store
+            .lock()?
+            .execute("INSERT INTO trash_settings VALUES('lib',1,30)", [])?;
         schedule_expired(&jobs, &store, now)?;
         let task: String = jobs.trash_db.lock().unwrap().query_row(
             "SELECT id FROM rejected_trash_tasks",
@@ -955,6 +1034,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task,
             || Ok(config),
@@ -979,6 +1059,25 @@ mod tests {
         let (_tmp, jobs, store, config) = setup()?;
         let id = photo(&store, &jobs.root().join("cached.jpg"), "cached", None)?;
         let key = format!("libraries/lib/assets/{id}/derivatives/thumbnail/cache.heic");
+        let previews = preview_storage(&jobs)?;
+        let object = serde_json::json!({"bucket":"keeps-previews","key":key});
+        let cache_path = previews.object_path(&object)?;
+        fs::create_dir_all(cache_path.parent().unwrap())?;
+        fs::write(&cache_path, b"generated cache")?;
+        let other_id = uuid::Uuid::new_v4().to_string();
+        let other_object = serde_json::json!({"bucket":"keeps-previews","key":format!("libraries/lib/assets/{other_id}/derivatives/thumbnail/keep.heic")});
+        let other_path = previews.object_path(&other_object)?;
+        fs::create_dir_all(other_path.parent().unwrap())?;
+        fs::write(&other_path, b"unselected generated cache")?;
+        crate::cache_gc::enqueue(
+            &*store.lock()?,
+            "lib",
+            &other_id,
+            &other_object,
+            &serde_json::Value::Null,
+            0,
+        )?;
+
         store.lock()?.execute("INSERT INTO derivative_objects VALUES('lib',?1,'preview','{}','keeps-previews',?2,NULL,64,64,'now')",params![id,key])?;
         store.lock()?.execute(
             "INSERT INTO photo_edit_decisions VALUES('lib',?1,'{}')",
@@ -990,6 +1089,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -1013,10 +1113,49 @@ mod tests {
                 [key],
                 |r| r.get::<_, i64>(0)
             )?,
-            1
+            0
         );
+        assert!(!cache_path.exists());
+        assert_eq!(fs::read(&other_path)?, b"unselected generated cache");
         Ok(())
     }
+    #[test]
+    fn cache_cleanup_failure_stops_task_after_native_recycle_without_replaying_it() -> Result<()> {
+        let (_tmp, jobs, store, config) = setup()?;
+        let original = jobs.root().join("cached.jpg");
+        let id = photo(&store, &original, "cached", None)?;
+        let key = format!("libraries/lib/assets/{id}/derivatives/thumbnail/cache.heic");
+        let previews = preview_storage(&jobs)?;
+        let cache_path =
+            previews.object_path(&serde_json::json!({"bucket":"keeps-previews","key":key}))?;
+        fs::create_dir_all(&cache_path)?;
+        store.lock()?.execute("INSERT INTO derivative_objects VALUES('lib',?1,'preview','{}','keeps-previews',?2,NULL,64,64,'now')",params![id,key])?;
+        store.set_trashed("lib", &id, true)?;
+        let task = trash_preview(&jobs, &store, "lib")?;
+        submit(&jobs, &store, "lib", &task.id, 1)?;
+        assert!(
+            process(
+                &jobs,
+                &store,
+                &previews,
+                "lib",
+                &task.id,
+                || Ok(config),
+                |_, p| simulated_recycle(jobs.root(), p)
+            )
+            .is_err()
+        );
+        assert!(!original.exists());
+        assert_eq!(load(&jobs, "lib", &task.id)?.0.phase, "reconciling");
+        assert!(process_next(&jobs, &store, &previews)?);
+        let failed = load(&jobs, "lib", &task.id)?.0;
+        assert_eq!(failed.status, "failed");
+        assert!(failed.error.unwrap().contains("清理"));
+        assert!(!process_next(&jobs, &store, &previews)?);
+        assert!(cache_path.is_dir());
+        Ok(())
+    }
+
     #[test]
     fn partial_batch_purges_finished_photo_and_next_clear_handles_only_remaining_photo()
     -> Result<()> {
@@ -1032,6 +1171,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config.clone()),
@@ -1058,6 +1198,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &retry.id,
             || Ok(config),
@@ -1079,6 +1220,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config.clone()),
@@ -1098,6 +1240,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &retry.id,
             || Ok(config),
@@ -1167,6 +1310,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -1210,6 +1354,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -1229,6 +1374,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config.replace("=yes", "=no")),
@@ -1261,6 +1407,7 @@ mod tests {
             process(
                 &jobs,
                 &store,
+                &preview_storage(&jobs)?,
                 "lib",
                 &task.id,
                 || Ok(config),
@@ -1292,6 +1439,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -1337,6 +1485,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || Ok(config),
@@ -1358,6 +1507,7 @@ mod tests {
             process(
                 &jobs,
                 &store,
+                &preview_storage(&jobs)?,
                 "lib",
                 &task.id,
                 || Ok(config),
@@ -1371,6 +1521,7 @@ mod tests {
         process(
             &jobs,
             &store,
+            &preview_storage(&jobs)?,
             "lib",
             &task.id,
             || panic!("no config needed"),

@@ -229,13 +229,18 @@ fn enqueue(
 ) -> Result<Task> {
     validate(&request)?;
     request.id = Uuid::parse_str(&request.id)?.to_string();
-    if let Some(record) = load(jobs, &request.id)? {
+    if let Some(mut record) = load(jobs, &request.id)? {
         if record.library == library
             && record.task.asset_id == asset
             && record.task.content_hash == request.content_hash
             && record.task.start_seconds == request.start_seconds
             && record.task.end_seconds == request.end_seconds
         {
+            if record.task.status == "failed" {
+                record.task.status = "pending".into();
+                record.task.error = None;
+                save(jobs, &record)?;
+            }
             return Ok(record.task);
         }
         return Err(error(
@@ -532,21 +537,24 @@ fn indexed(store: &Store, jobs: &Jobs, record: &mut Record) -> Result<bool> {
             "trim indexing failed: {}",
             job.error.unwrap_or_default()
         );
-        if job.status == "completed" {
-            record.index_job = Some(
-                jobs.enqueue_operation_file(&record.folder_id, Path::new(output), 0)?
-                    .id,
-            );
-            save(jobs, record)?;
-        }
+        ensure!(
+            job.status != "completed",
+            "索引任务已结束但剪辑文件未正确入库，请手动重试"
+        );
     } else {
         anyhow::bail!("trim indexing job disappeared");
     }
     Ok(false)
 }
+pub fn interrupt_pending(jobs: &Jobs) -> Result<()> {
+    jobs.db.lock()?.execute("UPDATE video_trims SET status='failed',record=json_set(record,'$.task.status','failed','$.task.error','服务已重启，视频剪辑已中断；请手动重试。') WHERE status IN ('pending','processing','indexing')", [])?;
+    Ok(())
+}
+
 pub fn run(jobs: Arc<Jobs>, store: Arc<Store>, stop: Arc<AtomicBool>) -> Result<()> {
     while !stop.load(Ordering::Relaxed) {
         let records=jobs.db.lock()?.prepare("SELECT record FROM video_trims WHERE status IN ('pending','processing','indexing') ORDER BY created_at,rowid")?.query_map([],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let idle = records.is_empty();
         for text in records {
             if stop.load(Ordering::Relaxed) {
                 break;
@@ -602,7 +610,7 @@ pub fn run(jobs: Arc<Jobs>, store: Arc<Store>, stop: Arc<AtomicBool>) -> Result<
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(if idle { 5000 } else { 500 }));
     }
     Ok(())
 }
@@ -680,6 +688,60 @@ mod tests {
         bad.id = "../escape".into();
         assert!(validate(&bad).is_err());
     }
+    #[test]
+    fn startup_interrupts_trim_and_explicit_retry_preserves_output_checkpoint() -> Result<()> {
+        let (_dir, store, jobs) = fixture()?;
+        let request = request(&"a".repeat(64));
+        let record = Record {
+            task: Task {
+                id: request.id.clone(),
+                asset_id: Uuid::new_v4().to_string(),
+                content_hash: request.content_hash.clone(),
+                start_seconds: request.start_seconds,
+                end_seconds: request.end_seconds,
+                status: "indexing".into(),
+                error: None,
+                new_asset_id: None,
+                output_path: Some("/published.mp4".into()),
+            },
+            library: "photos".into(),
+            source: "/source.mp4".into(),
+            folder_id: "folder".into(),
+            output_hash: Some("verified-output".into()),
+            index_job: Some("prior-index".into()),
+            identity: Uuid::new_v4().to_string(),
+        };
+        jobs.db.lock()?.execute(
+            "INSERT INTO video_trims(id,library_id,asset_id,status,record) VALUES(?,?,?,?,?)",
+            params![
+                record.task.id,
+                record.library,
+                record.task.asset_id,
+                record.task.status,
+                serde_json::to_string(&record)?
+            ],
+        )?;
+        interrupt_pending(&jobs)?;
+        let stopped = load(&jobs, &request.id)?.unwrap();
+        assert_eq!(stopped.task.status, "failed");
+        assert!(stopped.task.error.unwrap().contains("手动"));
+        assert_eq!(
+            enqueue(
+                &store,
+                &jobs,
+                "photos",
+                &record.task.asset_id,
+                request.clone()
+            )?
+            .status,
+            "pending"
+        );
+        let retried = load(&jobs, &request.id)?.unwrap();
+        assert_eq!(retried.output_hash, record.output_hash);
+        assert_eq!(retried.task.output_path, record.task.output_path);
+        Ok(())
+    }
+
     #[test]
     fn completed_retry_precedes_source_validation_and_survives_restart() -> Result<()> {
         let (dir, store, jobs) = fixture()?;

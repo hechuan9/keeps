@@ -11,7 +11,7 @@ struct NASTasksView: View {
     @State private var expanded = false
 
     private var errors: String {
-        ([errorMessage, taskStatus?.automatic.error, taskStatus?.longTask.error]
+        ([errorMessage, taskStatus?.longTask.error]
             .compactMap { $0 }).joined(separator: "\n\n")
     }
 
@@ -21,9 +21,7 @@ struct NASTasksView: View {
 
     private var hasWork: Bool {
         let hasServerWork = taskStatus.map { status in
-            Self.isVisible(status.automatic.status)
-            || Self.isVisible(status.longTask.status)
-            || status.automatic.failedPhotos > 0
+            Self.isVisible(status.longTask.status)
             || (status.longTask.failed ?? 0) > 0
         } ?? false
         return library.isRefreshingDirectoryAfterTrash || hasServerWork
@@ -42,19 +40,17 @@ struct NASTasksView: View {
                         ProgressView().progressViewStyle(.linear).frame(width: 100)
                     }
                     if let status = taskStatus {
-                        if Self.isVisible(status.automatic.status) || status.automatic.failedPhotos > 0 {
-                            Text("自动更新 · \(Self.statusLabel(status.automatic.status)) · 待更新 \(status.automatic.remainingPhotos) 张")
-                            if status.automatic.failedPhotos > 0 {
-                                Text("失败 \(status.automatic.failedPhotos) 张").foregroundStyle(.red)
-                            }
-                        }
                         if Self.isVisible(status.longTask.status) {
                             Text("\(status.longTask.kind.map(Self.kindLabel) ?? "后台长任务") · \(Self.statusLabel(status.longTask.status))")
                         }
-                        if status.automatic.status == "running" || status.automatic.status == "pending"
-                            || status.longTask.status == "running" || status.longTask.status == "pending" {
+                        if status.longTask.status == "running" || status.longTask.status == "pending" {
                             ProgressView().progressViewStyle(.linear).frame(width: 100)
                         }
+                    }
+                    if let task = taskStatus?.longTask, task.status == "failed", let jobID = task.jobID {
+                        Button("重试") { Task { await retry(jobID: jobID) } }
+                            .disabled(isBusy)
+                            .accessibilityIdentifier("nas-task-retry")
                     }
                     Spacer(minLength: 0)
                     if !errors.isEmpty {
@@ -67,10 +63,8 @@ struct NASTasksView: View {
                 if expanded {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
-                            if let photo = taskStatus?.automatic.currentPhoto {
-                                Text("当前照片：\(photo)").textSelection(.enabled)
-                            }
                             if let task = taskStatus?.longTask, Self.isVisible(task.status) {
+                                if let phase = task.phase { Text("阶段：\(Self.phaseLabel(phase))") }
                                 if let path = task.path { Text("目录：\(path)").textSelection(.enabled) }
                                 if let photo = task.currentPhoto { Text("当前照片：\(photo)").textSelection(.enabled) }
                                 if let processed = task.processed { Text("已处理 \(processed) 个文件") }
@@ -107,13 +101,39 @@ struct NASTasksView: View {
         }
     }
 
+    static func phaseLabel(_ phase: String) -> String {
+        switch phase {
+        case "waiting": "等待执行"
+        case "scanning": "扫描目录"
+        case "indexing": "更新身份与索引"
+        case "media": "生成展示图"
+        case "cleanup": "清理旧缓存"
+        case "publishing": "发布目录状态"
+        case "completed": "已完成"
+        default: phase
+        }
+    }
+
     static func kindLabel(_ kind: String) -> String {
         switch kind {
-        case "manual": "手动一次性作业"
-        case "maintenance": "自动维护"
+        case "manual": "用户任务"
+        case "import-media": "导入处理"
         case "trash": "清理回收站"
-        case "reconcile": "全库补漏"
         default: kind
+        }
+    }
+
+    @MainActor private func retry(jobID: String) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            _ = try await client.retryJob(id: jobID)
+            taskStatus = try await client.taskStatus()
+            errorMessage = nil
+        } catch is CancellationError {
+        } catch {
+            errorMessage = String(reflecting: error) + "\n" + error.localizedDescription
         }
     }
 

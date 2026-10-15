@@ -362,6 +362,8 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
             if old != payload {
                 return Err(error(409, "requestID 已用于不同操作"));
             }
+            drop(db);
+            s.store.collect_asset_cache_garbage(&s.previews, lib, id)?;
             return Ok(serde_json::from_str(&response)?);
         }
         if state(&db, lib, id)?["revision"] != revision {
@@ -474,6 +476,7 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
             crate::cache_gc::enqueue(
                 &tx,
                 lib,
+                id,
                 &old["objectRef"],
                 &Value::Null,
                 chrono::Utc::now().timestamp(),
@@ -500,6 +503,8 @@ fn mutate(s: &AppState, lib: &str, id: &str, v: Value, action: &str) -> Result<V
     )?;
     crate::revisions::flush(&tx)?;
     tx.commit()?;
+    drop(db);
+    s.store.collect_asset_cache_garbage(&s.previews, lib, id)?;
     Ok(response)
 }
 fn confirm_original(s: &AppState, lib: &str, id: &str, v: Value) -> Result<Value> {
@@ -762,13 +767,6 @@ pub(crate) async fn upload(
             }
             Err(e) => Err(e.into()),
         }?;
-        crate::cache_gc::enqueue(
-            &*s.store.lock()?,
-            &s.library_id,
-            &object,
-            &Value::Null,
-            chrono::Utc::now().timestamp(),
-        )?;
         Ok(())
     })
     .await
@@ -1059,13 +1057,11 @@ mod tests {
         assert_eq!(result["revision"], 2);
         assert_eq!(result["negativeContentHash"], hash);
         assert_eq!(mutate(&s, "lib", &id, reset, "reset")?, result);
-        let due =
+        assert_eq!(
             s.store
-                .lock()?
-                .query_row("SELECT max(not_before) FROM media_cache_gc", [], |r| {
-                    r.get::<_, i64>(0)
-                })?;
-        assert_eq!(s.store.collect_cache_garbage(&s.previews, due)?, 3);
+                .collect_asset_cache_garbage(&s.previews, "lib", &id)?,
+            0
+        );
         assert_eq!(
             std::fs::read(s.jobs.root().join("photo.jpg"))?,
             b"unchanged original"
@@ -1114,7 +1110,7 @@ mod tests {
         assert_eq!(mutate(&s, "lib", &id, reset, "reset")?, result);
         assert_eq!(
             s.store
-                .collect_cache_garbage(&s.previews, chrono::Utc::now().timestamp() + 3600)?,
+                .collect_asset_cache_garbage(&s.previews, "lib", &id)?,
             0
         );
         assert_eq!(
@@ -1209,13 +1205,11 @@ mod tests {
                 .await?;
             assert_eq!(response.status(), status);
         }
-        let due =
+        assert_eq!(
             s.store
-                .lock()?
-                .query_row("SELECT max(not_before) FROM media_cache_gc", [], |r| {
-                    r.get::<_, i64>(0)
-                })?;
-        assert_eq!(s.store.collect_cache_garbage(&s.previews, due)?, 1);
+                .collect_asset_cache_garbage(&s.previews, "lib", &id)?,
+            0
+        );
         let restored = app
             .clone()
             .oneshot(

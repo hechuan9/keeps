@@ -38,3 +38,5 @@ mod database;
 pub mod background;
 
 pub mod video_trim;
+
+mod task_state;

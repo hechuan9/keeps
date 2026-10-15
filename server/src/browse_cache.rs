@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 pub const SPEC: &str = "browse-heic-64-q50-v1";
-const MAX_ATTEMPTS: i64 = 4;
+const MAX_ATTEMPTS: i64 = 1;
 
 pub fn migrate(db: &Connection) -> Result<()> {
     let columns: Vec<String> = db
@@ -45,10 +45,15 @@ impl Store {
     }
 }
 
-pub fn process_next(store: &Store, previews: &PreviewStorage) -> Result<bool> {
+pub fn process_asset(
+    store: &Store,
+    previews: &PreviewStorage,
+    library: &str,
+    asset: &str,
+) -> Result<bool> {
     let selected = {
         let db = store.lock()?;
-        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail FROM media_cache c INDEXED BY media_cache_browse_pending JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND (c.browse_thumbnail IS NULL OR json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion') IS NOT c.browse_source_version OR json_extract(c.browse_thumbnail,'$.spec') IS NOT c.browse_spec) AND c.browse_attempts<?2 AND c.browse_available_at<=unixepoch() AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,MAX_ATTEMPTS], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?
+        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail FROM media_cache c INDEXED BY media_cache_browse_pending JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?2 AND c.asset_id=?3 AND c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND (c.browse_thumbnail IS NULL OR json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion') IS NOT c.browse_source_version OR json_extract(c.browse_thumbnail,'$.spec') IS NOT c.browse_spec) AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,library,asset], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?
     };
     let Some((lib, id, hash, thumbnail)) = selected else {
         return Ok(false);
@@ -69,8 +74,9 @@ pub fn process_next(store: &Store, previews: &PreviewStorage) -> Result<bool> {
     })();
     if let Err(error) = result {
         let trace = format!("{error:#}");
-        store.lock()?.execute("UPDATE media_cache SET browse_last_error=?1,browse_available_at=unixepoch()+60*browse_attempts*browse_attempts WHERE library_id=?2 AND asset_id=?3 AND browse_source_version=?4",params![trace,lib,id,version])?;
+        store.lock()?.execute("UPDATE media_cache SET browse_last_error=?1,browse_available_at=0 WHERE library_id=?2 AND asset_id=?3 AND browse_source_version=?4",params![trace,lib,id,version])?;
         tracing::error!(library_id=%lib,asset_id=%id,error=%trace,"Browse thumbnail generation failed");
+        return Err(error);
     }
     Ok(true)
 }
@@ -100,6 +106,7 @@ pub(crate) fn publish(
             crate::cache_gc::enqueue(
                 &tx,
                 lib,
+                id,
                 &previous["objectRef"],
                 &descriptor["objectRef"],
                 chrono::Utc::now().timestamp(),
@@ -114,6 +121,7 @@ pub(crate) fn publish(
         crate::cache_gc::enqueue(
             &tx,
             lib,
+            id,
             &descriptor["objectRef"],
             &Value::Null,
             chrono::Utc::now().timestamp(),
@@ -153,7 +161,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn missing_preview_has_persistent_bounded_retries() -> Result<()> {
+    fn missing_preview_fails_and_preserves_error_without_background_retry() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("db");
         let previews = PreviewStorage::new(
@@ -164,15 +172,14 @@ mod tests {
         )?;
         let store = Store::open(&path, true)?;
         seed(&store)?;
-        for _ in 0..MAX_ATTEMPTS {
-            store
-                .lock()?
-                .execute("UPDATE media_cache SET browse_available_at=0", [])?;
-            assert!(process_next(&store, &previews)?);
-        }
+        assert!(process_asset(&store, &previews, "lib", "asset").is_err());
         drop(store);
         let store = Store::open(&path, false)?;
-        assert!(!process_next(&store, &previews)?);
+        let attempts: i64 =
+            store
+                .lock()?
+                .query_row("SELECT browse_attempts FROM media_cache", [], |r| r.get(0))?;
+        assert_eq!(attempts, 1);
         let error: String =
             store
                 .lock()?
@@ -244,7 +251,7 @@ mod tests {
             [thumbnail.to_string()],
         )?;
         let before = store.library_revision("lib")?;
-        assert!(process_next(&store, &previews)?);
+        assert!(process_asset(&store, &previews, "lib", "asset")?);
         let browse = store
             .browse_descriptor("lib", "asset")?
             .expect("generated browse descriptor");
@@ -272,7 +279,7 @@ mod tests {
         );
         assert_ne!(store.library_revision("lib")?, before);
         assert_eq!(crate::media::sha256_file(&source)?, source_hash);
-        assert!(!process_next(&store, &previews)?);
+        assert!(!process_asset(&store, &previews, "lib", "asset")?);
         Ok(())
     }
 }

@@ -27,7 +27,7 @@ python3 deploy/spk/pack.py --payload /tmp/keeps-native-payload --output /tmp/Kee
 
 `GET /libraries/{library}/tags` 返回 `{tags:[String]}` 标签库；`POST` 同路径接收 `{tags:[String]}` 添加并返回完整标签库，每次 1–100 个非空标签，每个不超过 128 字节。标签去除首尾空格并去重。schema 17 迁移回填已有照片标签，后续照片标签写入自动收录；从照片移除标签不删除库条目。沿用 Bearer 鉴权与已有备份、`keeps-server migrate` 升级流程。
 
-SQLite 使用 WAL。后台扫描只读原片，文件哈希或精确 JPEG 图像指纹可以自动归组；EXIF 匹配仅作为待视觉确认的候选。普通核对通过原片 size/mtime 与 XMP 状态签名跳过未变文件。扫描仅由用户显式触发；添加目录只登记配置，启动、文件变化和后台维护均不发起扫描。启动取消历史非人工扫描，保留人工任务断点；外部新增、修改、删除和重命名需手动扫描同步。显式导入、移动、默认版本切换与重试继续完成各自必需的索引和预览处理；详见 [架构文档](../docs/ARCHITECTURE.md)。日常媒体解码在 NAS 原生套件执行；Linux 远端 worker 仅用于显式启用的一次性批量处理（`KEEPS_REMOTE_WORKER_ENABLED=1`，默认关闭）。解码依赖 ExifTool、LibRaw、ImageMagick 与 libheif；每个外部进程有时限和内存限制。错误保留完整上下文，单文件失败不阻止处理其他文件。
+SQLite 使用 WAL。后台扫描只读原片，文件哈希或精确 JPEG 图像指纹可以自动归组；EXIF 匹配仅作为待视觉确认的候选。普通核对通过原片 size/mtime 与 XMP 状态签名跳过未变文件。扫描仅由用户显式触发；添加目录只登记配置，启动、文件变化和后台维护均不发起扫描。启动取消历史非人工扫描，将未完成的人工任务标记中断并保留断点供诊断；外部新增、修改、删除和重命名需手动扫描同步。显式导入、移动、默认版本切换与重试继续完成各自必需的索引和预览处理；详见 [架构文档](../docs/ARCHITECTURE.md)。日常媒体解码在 NAS 原生套件执行；Linux 远端 worker 仅用于显式启用的一次性批量处理（`KEEPS_REMOTE_WORKER_ENABLED=1`，默认关闭）。解码依赖 ExifTool、LibRaw、ImageMagick 与 libheif；每个外部进程有时限和内存限制。错误保留完整上下文，任一步失败停止当前任务，等待人工重试。
 
 SIGTERM 停止领取任务并等待当前处理阶段结束。未完成的运行任务在下次启动恢复；停止追踪仅修改数据库。数据库和文件 I/O 在阻塞线程执行，查询接口不会承担媒体解码。元数据读取使用独立 WAL 快照；交互短事务优先于排队的后台事务，照片身份写入不占数据库锁。NAS 接口保持正常 CPU/I/O 优先级；扫描、编码、导入发布、移动、回收与离线导出使用独立低优先级线程，避免把优先级带入 HTTP 线程池。
 
@@ -41,7 +41,7 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 `POST /libraries/{library}/directories/trash` 接收 `{path,confirmationName,requestID}`，`requestID` 必须为客户端持久化的 UUID，必须输入与目录名完全相同的确认文字。仅允许当前资料库追踪范围内的子目录；原片根、NAS 共享根、系统目录、符号链接和与其他资料库重叠的目录均拒绝。
 
-服务读取 DSM `/etc/samba/smb.share.conf`，按最长匹配的共享路径确认 `enable recycle bin=yes`，随后通过参数数组调用 NAS 原生 `/usr/syno/bin/synorecycle --rmdir share=<共享名> rpath=<相对目录>`。回收位置、重名处理和删除时间记录由 DSM 管理；Keeps 不手工移动到 `#recycle`、不生成恢复记录，也不以 `rm` 或文件系统删除兜底。配置不可读、回收站未启用或原生程序不可用时明确失败。立即返回 `202` 任务对象 `{id,path,status,phase,error,createdAt,updatedAt,finishedAt}`（时间为 Unix 秒），不等待文件回收。`GET /libraries/{library}/directories/trash/{requestID}` 查询任务；未提交为 404。相同 ID 与参数重复提交返回原任务，参数不同或同一资料库已有其他删除任务为 409；缺少 ID 的旧客户端收到 422 升级提示。任务存于 `jobs.sqlite`，由进程级独立 worker 执行；状态查询使用独立连接，不等待目录执行锁或扫描事务。`status` 为 `pending/running/completed/failed`，真实阶段 `phase` 为 `waiting/recycling/reconciling/completed/failed`，没有推测百分比。客户端断连不取消操作。重启后 waiting 可执行，reconciling 继续对账；recycling 中断只检查原路径是否消失，已消失则继续对账，仍存在则对账并明确失败、提醒检查部分回收，绝不盲目重放原生回收。恢复使用 File Station 的标准回收站操作，保留期限由 NAS 设置决定。
+服务读取 DSM `/etc/samba/smb.share.conf`，按最长匹配的共享路径确认 `enable recycle bin=yes`，随后通过参数数组调用 NAS 原生 `/usr/syno/bin/synorecycle --rmdir share=<共享名> rpath=<相对目录>`。回收位置、重名处理和删除时间记录由 DSM 管理；Keeps 不手工移动到 `#recycle`、不生成恢复记录，也不以 `rm` 或文件系统删除兜底。配置不可读、回收站未启用或原生程序不可用时明确失败。立即返回 `202` 任务对象 `{id,path,status,phase,error,createdAt,updatedAt,finishedAt}`（时间为 Unix 秒），不等待文件回收。`GET /libraries/{library}/directories/trash/{requestID}` 查询任务；未提交为 404。相同 ID 与参数重复提交返回原任务，参数不同或同一资料库已有其他删除任务为 409；缺少 ID 的旧客户端收到 422 升级提示。任务存于 `jobs.sqlite`，由进程级独立 worker 执行；状态查询使用独立连接，不等待目录执行锁或扫描事务。`status` 为 `pending/running/completed/failed`，真实阶段 `phase` 为 `waiting/recycling/reconciling/completed/failed`，没有推测百分比。客户端断连不取消操作。重启后未完成任务标记失败，waiting 等待用户明确重试，reconciling 仅协调已发生结果；recycling 中断只检查原路径是否消失，已消失则继续对账，仍存在则对账并明确失败、提醒检查部分回收，绝不盲目重放原生回收。恢复使用 File Station 的标准回收站操作，保留期限由 NAS 设置决定。
 
 扫描、身份核对与导入发布同目录移动互斥，原生删除后核对并移除已消失的原路径索引、更新修订并停用被移动的追踪根；没有其他可用原片路径的资产从普通列表和计数排除，按 ID 的资产历史保留，不加入 Keeps 软件回收站；仍有其他路径的资产保留。通过 File Station 恢复后重新扫描（若追踪根已停用则重新追踪）才恢复可用。原生程序失败也会核对已消失的路径，避免部分完成后索引不一致；错误提醒检查 NAS 回收站，不能将错误理解为文件均仍在原目录。此接口只支持可读取真实 DSM 共享配置的 NAS 原生部署；配置不可读时会明确失败。
 
@@ -51,7 +51,7 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 `POST /libraries/{library}/trash/preview` 预览 Keeps 回收站全量清单，`POST /libraries/{library}/trash/{id}` 以相同数量确认协议提交清空；`GET` 同路径查询。实际清空通过 DSM 原生 `/usr/syno/bin/synorecycle --unlink` 将所有有效原片版本和关联 XMP 移入 NAS 回收站，不永久删除、不使用文件操作兜底。提交和执行均复核照片状态、文件身份、追踪范围及共享文件归属；未进入 Keeps 回收站的照片共用文件会阻止回收。
 
-`GET` / `PUT /libraries/{library}/trash/settings` 读取或保存 `{enabled,retentionDays}`。默认启用，保留 30 天，可设为 1–3650 天或关闭；从进入 Keeps 回收站起计时，恢复即取消计时，再入站重新计时。schema 16 迁移时已有回收站照片从迁移当天起计时。NAS 后台每小时检查到期清单，客户端关闭不影响执行；任务开始前再次检查当前保留期限和启用状态。
+`GET` / `PUT /libraries/{library}/trash/settings` 读取或保存 `{enabled,retentionDays}`。默认关闭，用户启用后保留 30 天，可设为 1–3650 天或关闭；从进入 Keeps 回收站起计时，恢复即取消计时，再入站重新计时。schema 16 迁移时已有回收站照片从迁移当天起计时。NAS 后台每小时检查到期清单，客户端关闭不影响执行；任务开始前再次检查当前保留期限和启用状态。
 
 任务与逐文件断点保存在 `jobs.sqlite`，API 返回 `{id,count,status,phase,completedFiles,totalFiles,error,createdAt,updatedAt,finishedAt}`。回收与扫描、目录移动、照片状态修改及曝光提交互斥。中断原生调用不盲目重放；原文件消失则继续剩余清单。失败对账消失路径，未回收文件和照片资料保留；失败任务不重试，需核实 NAS 回收站后重新预览。全部文件确认回收后，清除照片图库资料及编辑记录，专属生成缓存进入现有安全 GC 队列；NAS 回收站恢复后需重新扫描索引。
 
@@ -59,7 +59,7 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 
 `POST /libraries/{library}/directories` 接收 `{parentPath,name}`，在当前资料库已追踪的父目录中创建单层子目录，返回 `201 {path}`。名称不能是隐藏或系统目录、多层路径或包含控制字符；重名返回 409，不覆盖现有文件或目录。
 
-`POST /libraries/{library}/imports` 接收 `{id,targetPath,deduplicate,preserveStructure,workerID?,files:[{id,relativePath,size,sha256?}]}`。提供 `workerID` 时为该批次目标文件保存一小时计算租约；`POST /libraries/{library}/imports/{batch}/heartbeat` 接收 `{workerID}` 续期。有效租约阻止 NAS 对关联照片编码，到期后 NAS 接管缺失媒体。`POST /libraries/{library}/worker/claim` 接收 `{workerID,importID}`，仅领取归属该批次且租约有效的任务，无需开启全库远端 worker。Mac 上传 thumbnail、browse 及必要 standard 后提交 complete，NAS 校验来源与任务状态。`deduplicate` 默认 false，此时不要求源文件 SHA256，不按内容跳过文件。批次和文件 ID 为 UUID；提供 SHA256 时使用小写十六进制。目标必须是活跃追踪范围内的已存在目录；来源路径仅用于识别同源配对，所有文件平铺在目标目录。每批最多 10000 项，单文件 1 字节至 8 GiB。允许 RAW、HEIF/HEIC/HIF 及关联 XMP；不接受独立 XMP。响应包含每项 `fileName`、`uploaded`，以及批次 `finished`、`jobId`。
+`POST /libraries/{library}/imports` 接收 `{id,targetPath,deduplicate,preserveStructure,workerID?,files:[{id,relativePath,size,sha256?}]}`。提供 `workerID` 时为该批次目标文件保存一小时计算租约；`POST /libraries/{library}/imports/{batch}/heartbeat` 接收 `{workerID}` 续期。有效租约阻止 NAS 对关联照片编码，到期后报告导入处理失败，由用户显式重试。`POST /libraries/{library}/worker/claim` 接收 `{workerID,importID}`，仅领取归属该批次且租约有效的任务，无需开启全库远端 worker。Mac 上传 thumbnail、browse 及必要 standard 后提交 complete，NAS 校验来源与任务状态。`deduplicate` 默认 false，此时不要求源文件 SHA256，不按内容跳过文件。批次和文件 ID 为 UUID；提供 SHA256 时使用小写十六进制。目标必须是活跃追踪范围内的已存在目录；来源路径仅用于识别同源配对，所有文件平铺在目标目录。每批最多 10000 项，单文件 1 字节至 8 GiB。允许 RAW、HEIF/HEIC/HIF 及关联 XMP；不接受独立 XMP。响应包含每项 `fileName`、`uploaded`，以及批次 `finished`、`jobId`。
 
 开启 `deduplicate` 后，创建批次仅登记清单和暂定名称，不读取整批源文件或目标文件摘要。客户端按来源照片组逐组调用 `POST /libraries/{library}/imports/{batch}/files/{file}/match`，请求 `{files:[{id,relativePath,size,sha256}]}` 必须包含该组全部文件和 SHA256；响应沿用批次结构，`files` 仅包含该组的最终名称、`matched`、`skipped` 和上传状态。匹配结果持久化，断线后恢复同一批次；随后上传该组，再匹配下一组。只比较该组实际目标目录这一层的文件，保留目录结构时不跨目标子目录或扫描全库；不比较画面相似度。以内容一致的 RAW/JPEG/HEIF 为配对依据；所有重叠配套文件都一致时跳过已有项并补齐缺失项，响应 `skipped:true`。已有 XMP 或其他配套文件冲突时整组另名。目标摘要计算不持有任务数据库锁，提交时再次验证跳过的文件。
 
@@ -81,3 +81,5 @@ NAS 唯一受支持的部署方式是原生 SPK；部署、升级、恢复和现
 `POST /libraries/{library}/assets/{asset}/video-trims` 接收 `{id,contentHash,startSeconds,endSeconds}`，返回 `202` 持久任务；同一 UUID 和参数幂等，参数冲突返回 409。同一原资产同时只能有一个活动裁剪。`GET .../video-trims/{id}` 查询 `{id,assetID,contentHash,startSeconds,endSeconds,status,error?,newAssetID?,outputPath?}`，状态依次为 `pending`、`processing`、`indexing`、`completed`，操作失败为 `failed`。客户端关闭不取消任务，NAS 重启后继续。
 
 NAS 先用 ffprobe 校验实际时长，再以单线程 FFmpeg 重编码 H.264/AAC MP4，保留音频、应用视频旋转及可传递的容器元数据。同目录的新文件使用独立身份和 UUID 文件名，无覆盖发布并复用索引队列。新视频确认作为独立资产入库后才把原资产标为 Keeps 回收站；原文件不移动、不删除、不覆盖。失败保留原资产；若发布后索引失败，已生成的新文件保留并在任务中返回路径。SPK 运行时必须包含 ffmpeg、ffprobe 和现有 exiftool。
+
+一次性任务使用 Statig 管理状态，失败停止且保留步骤和错误；重启后的未完成任务等待人工重试，不自动恢复或全库补漏。schema 18 增加生成缓存的照片归属，旧对象清理属于对应照片操作。部署前停服备份双库并显式 migrate，旧版服务器不能直接打开升级后的库。

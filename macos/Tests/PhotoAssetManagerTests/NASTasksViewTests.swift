@@ -16,8 +16,10 @@ struct NASTasksViewTests {
         #expect(NASTasksView.statusLabel("idle") == "空闲")
         #expect(NASTasksView.statusLabel("failed") == "失败")
         #expect(NASTasksView.statusLabel("completed") == "已完成")
-        #expect(NASTasksView.kindLabel("manual") == "手动一次性作业")
-        #expect(NASTasksView.kindLabel("maintenance") == "自动维护")
-        #expect(NASTasksView.kindLabel("reconcile") == "全库补漏")
+        #expect(NASTasksView.kindLabel("manual") == "用户任务")
+        #expect(NASTasksView.kindLabel("import-media") == "导入处理")
+        #expect(NASTasksView.kindLabel("trash") == "清理回收站")
+        #expect(NASTasksView.phaseLabel("media") == "生成展示图")
+        #expect(NASTasksView.phaseLabel("publishing") == "发布目录状态")
     }
 }

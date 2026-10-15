@@ -1226,7 +1226,7 @@ async fn cache_status(
 async fn cache_retry(State(state): State<Arc<AppState>>, Path(library): Path<String>) -> ApiResult {
     require_library(&state, &library)?;
     Ok(
-        Json(blocking(move || Ok(json!({"requeued":crate::cache_pipeline::queue_manual(&state.store,&state.jobs,&library,false)?,"gcRequeued":state.store.retry_cache_garbage(&library)?}))).await?)
+        Json(blocking(move || Ok(json!({"requeued":crate::cache_pipeline::queue_manual(&state.store,&state.jobs,&library,false)?,"gcRequeued":0}))).await?)
             .into_response(),
     )
 }

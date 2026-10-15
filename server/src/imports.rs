@@ -1159,6 +1159,13 @@ fn pipeline_status(state: &AppState, library: &str, id: &str) -> Result<Value> {
             }
         }
     }
+    let expired: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM import_compute_leases WHERE library_id=?1 AND batch_id=?2 AND expires_at<=unixepoch())", params![library,id], |r| r.get(0))?;
+    if expired
+        && (indexed < paths.len() || ready_assets.len() < assets.len())
+        && media_error.is_none()
+    {
+        media_error = Some("客户端计算已中断或超时，请在客户端手动继续导入。".into());
+    }
     drop(db);
     response["publicationComplete"] = json!(batch.finished);
     response["indexedFiles"] = json!(
@@ -1279,6 +1286,11 @@ async fn finish(
     ))
 }
 
+pub fn interrupt_pending(jobs: &Jobs) -> Result<()> {
+    jobs.db.lock().unwrap().execute("UPDATE imports SET manifest=json_set(manifest,'$.finishError','服务已重启，导入已中断；请在客户端手动继续导入。') WHERE json_extract(manifest,'$.finished')=0 AND json_extract(manifest,'$.finishError') IS NULL", [])?;
+    Ok(())
+}
+
 pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<()> {
     use std::sync::atomic::Ordering;
     while !stop.load(Ordering::Relaxed) {
@@ -1291,6 +1303,7 @@ pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
+        let idle = pending.is_empty();
         for (library, id) in pending {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
@@ -1304,7 +1317,11 @@ pub fn run(jobs: Arc<Jobs>, stop: Arc<std::sync::atomic::AtomicBool>) -> Result<
                 tracing::error!(batch = %id, error = %format!("{error:#}"), "Import publishing failed");
             }
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(if idle {
+            5000
+        } else {
+            250
+        }));
     }
     Ok(())
 }
@@ -1684,6 +1701,24 @@ mod tests {
     }
 
     #[test]
+    fn startup_interrupts_import_without_publishing_uploaded_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
+        jobs.add_folder("lib", ".").unwrap();
+        let batch = prepare(
+            &jobs,
+            "lib",
+            structure_input(jobs.root(), &["image.CR3"], false),
+        )
+        .unwrap();
+        interrupt_pending(&jobs).unwrap();
+        let interrupted = load(&jobs.db.lock().unwrap(), "lib", &batch.id).unwrap();
+        assert!(interrupted.finish_error.unwrap().contains("手动"));
+        assert!(!jobs.root().join("image.CR3").exists());
+        assert_eq!(status(&jobs, "lib", &batch.id).unwrap()["status"], "failed");
+    }
+
+    #[test]
     fn digest_receipt_invalidates_same_size_edit_with_preserved_mtime() {
         let dir = tempfile::tempdir().unwrap();
         let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), dir.path()).unwrap();
@@ -1928,6 +1963,20 @@ mod tests {
             pipeline_status(&state, "lib", &batch.id)?["status"],
             "thumbnails"
         );
+        state.store.lock()?.execute(
+            "INSERT INTO import_compute_leases VALUES('lib',?1,?2,'client',0)",
+            params![
+                batch.id,
+                state.jobs.root().join("photo.jpg").to_str().unwrap()
+            ],
+        )?;
+        let expired = pipeline_status(&state, "lib", &batch.id)?;
+        assert_eq!(expired["status"], "failed");
+        assert!(expired["error"].as_str().unwrap().contains("手动继续"));
+        state.store.lock()?.execute(
+            "UPDATE import_compute_leases SET expires_at=unixepoch()+3600",
+            [],
+        )?;
         state.store.lock()?.execute(
             "UPDATE media_cache SET status='ready',thumbnail=?",
             [json!({"version":"preview"}).to_string()],

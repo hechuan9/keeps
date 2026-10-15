@@ -195,6 +195,14 @@ pub(crate) fn ensure_reconciled(jobs: &Jobs) -> Result<()> {
     Ok(())
 }
 
+pub fn interrupt_pending(jobs: &Jobs) -> Result<()> {
+    let db = jobs.trash_db.lock().unwrap();
+    for table in ["directory_move_tasks", "asset_move_tasks"] {
+        db.execute(&format!("UPDATE {table} SET status='failed',error=coalesce(error||char(10),'')||'服务已重启，移动任务已中断；请手动重试。已移动文件保留原位置。',finished_at=unixepoch(),updated_at=unixepoch() WHERE status IN ('pending','running')"), [])?;
+    }
+    Ok(())
+}
+
 pub fn recover(jobs: &Jobs, store: &Store) -> Result<()> {
     let _guard = jobs.directory_mutation.write().unwrap();
     recover_locked(jobs, store)
@@ -467,6 +475,7 @@ pub(crate) fn submit(
         old_library == library && old_path == path && Path::new(&old_destination) == destination,
         error(409, "requestID belongs to another move request")
     );
+    db.execute("UPDATE directory_move_tasks SET status='pending',error=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1 AND status='failed'", [&id])?;
     drop(db);
     get(jobs, library, &id)
 }
@@ -521,7 +530,7 @@ pub fn run(
         if let Some((current, library)) = next {
             process(&jobs, &store, &library, &current)?;
         } else if !crate::asset_move::process_next(&jobs, &store)? {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     }
     Ok(())
@@ -543,6 +552,41 @@ mod tests {
         let store = Store::open(&tmp.path().join("catalog.sqlite"), true).unwrap();
         (tmp, jobs, store)
     }
+    #[test]
+    fn startup_stops_move_until_same_request_is_explicitly_submitted() -> Result<()> {
+        let (_tmp, jobs, _store) = setup();
+        let source = jobs.root().join("source");
+        let parent = jobs.root().join("target");
+        fs::create_dir(&source)?;
+        fs::create_dir(&parent)?;
+        let id = uuid::Uuid::new_v4().to_string();
+        submit(
+            &jobs,
+            "lib",
+            source.to_str().unwrap(),
+            parent.to_str().unwrap(),
+            &id,
+            None,
+        )?;
+        interrupt_pending(&jobs)?;
+        assert_eq!(get(&jobs, "lib", &id)?.status, "failed");
+        assert!(source.exists());
+        assert!(!parent.join("source").exists());
+        assert_eq!(
+            submit(
+                &jobs,
+                "lib",
+                source.to_str().unwrap(),
+                parent.to_str().unwrap(),
+                &id,
+                None
+            )?
+            .status,
+            "pending"
+        );
+        Ok(())
+    }
+
     #[test]
     fn rename_preserves_originals_and_retries_match_destination() -> Result<()> {
         let (_tmp, jobs, store) = setup();

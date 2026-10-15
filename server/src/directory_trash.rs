@@ -310,6 +310,7 @@ pub(crate) fn submit(
                     "requestID already belongs to a different deletion request"
                 )
             );
+            db.execute("UPDATE directory_trash_tasks SET status='pending',finished_at=NULL,updated_at=unixepoch() WHERE id=?1 AND status='failed' AND phase<>'failed'", [&id])?;
             drop(db);
             return get(jobs, library, &id);
         }
@@ -401,9 +402,21 @@ fn process(
     )
 }
 
+pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
+    let rows = jobs.trash_db.lock().unwrap().prepare("SELECT id,library_id,path,phase FROM directory_trash_tasks WHERE status IN ('pending','running')")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, library, path, phase) in rows {
+        if phase != "waiting" {
+            reconcile(jobs, store, &library, Path::new(&path))?;
+        }
+        jobs.trash_db.lock().unwrap().execute("UPDATE directory_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||'服务已重启，回收任务已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
+    }
+    Ok(())
+}
+
 pub fn run(
     jobs: std::sync::Arc<Jobs>,
     store: std::sync::Arc<Store>,
+    previews: std::sync::Arc<crate::previews::PreviewStorage>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use rusqlite::OptionalExtension;
@@ -440,8 +453,8 @@ pub fn run(
                 tracing::error!(id=%current.id,error=%format!("{failure:#}"),"Directory recycling task failed");
                 transition(&jobs, &current.id, "failed", Some(&format!("{failure:#}")))?;
             }
-        } else if !crate::rejected_trash::process_next(&jobs, &store)? {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+        } else if !crate::rejected_trash::process_next(&jobs, &store, &previews)? {
+            std::thread::sleep(std::time::Duration::from_secs(5));
         }
     }
     Ok(())

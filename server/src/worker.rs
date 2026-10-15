@@ -16,11 +16,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 
-/// Run on one dedicated blocking thread. A stopped in-flight job stays running so
-/// Jobs::open can recover it after restart without claiming a partial scan succeeded.
+/// User-submitted work runs on one low-priority thread; interrupted work needs an explicit retry.
 pub fn run(
     store: Arc<Store>,
     jobs: Arc<Jobs>,
@@ -30,33 +29,11 @@ pub fn run(
     MediaProcessor::new()
         .probe()
         .context("NAS media runtime unavailable")?;
-    crate::tasks::recover(&jobs)?;
-    store.recover_cache()?;
-    let mut next_maintenance = Instant::now();
     while !stop.load(Ordering::Relaxed) {
-        let mut worked = false;
         if let Some(job) = jobs.claim_class("manual")? {
             run_claimed(&store, &jobs, &previews, &job, &stop)?;
-            worked = true;
-        }
-        if !stop.load(Ordering::Relaxed) {
-            match crate::cache_pipeline::process_import_media(&store, &jobs, &previews) {
-                Ok(did_work) => worked |= did_work,
-                Err(error) => {
-                    tracing::error!(error=%format!("{error:#}"), "NAS import media queue failed")
-                }
-            }
-        }
-        if !stop.load(Ordering::Relaxed) {
-            worked |= crate::browse_cache::process_next(&store, &previews)?;
-        }
-        if !worked && !stop.load(Ordering::Relaxed) && Instant::now() >= next_maintenance {
-            crate::cache_pipeline::maintain(&store, &jobs, &previews, &stop)?;
-            next_maintenance = Instant::now() + Duration::from_secs(60);
-        }
-        maintain_revisions(&store, &jobs)?;
-        if !worked {
-            std::thread::sleep(Duration::from_millis(500));
+        } else {
+            jobs.wait_for_scan_work(jobs.scan_wait_duration()?);
         }
     }
     Ok(())
@@ -69,12 +46,21 @@ fn run_claimed(
     job: &Job,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let result = run_slice(store, jobs, previews, job, stop, 1);
+    jobs.set_phase(&job.id, "scanning")?;
+    let result = run_slice(store, jobs, previews, job, stop, 1).and_then(|done| {
+        if done && !stop.load(Ordering::Relaxed) {
+            jobs.set_phase(&job.id, "publishing")?;
+            store.finish_revision_batch(&job.id, false)?;
+        }
+        Ok(done)
+    });
     if stop.load(Ordering::Relaxed) {
         return Ok(());
     }
     match result {
-        Ok(true) => jobs.finish(&job.id, None)?,
+        Ok(true) => {
+            jobs.finish(&job.id, None)?;
+        }
         Ok(false) => {
             if jobs.job(&job.id)?.is_some_and(|j| j.status == "running") {
                 jobs.yield_job(&job.id)?;
@@ -86,20 +72,28 @@ fn run_claimed(
             jobs.finish(&job.id, Some(&trace))?;
         }
     }
+    if jobs
+        .job(&job.id)?
+        .is_some_and(|j| !matches!(j.status.as_str(), "pending" | "running"))
+    {
+        store.finish_revision_batch(&job.id, false)?;
+    }
     Ok(())
 }
 
-/// Read durable queue state, since finish may have scheduled a retry or another pass.
+/// Startup-only finalization of owners whose recorded tasks are no longer active.
 pub fn maintain_revisions(store: &Store, jobs: &Jobs) -> Result<()> {
     for id in store.revision_batch_ids()? {
         match jobs.job(&id)? {
             Some(job) if matches!(job.status.as_str(), "pending" | "running") => {}
-            Some(job) if job.status == "completed" => {
-                store.finish_revision_batch(&id, job.wait_for_quiet)?
-            }
-            _ => store.finish_revision_batch(&id, true)?,
+            Some(job) if job.status == "completed" => store.finish_revision_batch(&id, false)?,
+            _ => store.finish_revision_batch(&id, false)?,
         }
     }
+    store.lock()?.execute(
+        "UPDATE catalog_revision_updates SET last_changed_at=0 WHERE owner=''",
+        [],
+    )?;
     store.settle_revision_updates()?;
     Ok(())
 }
@@ -312,10 +306,13 @@ fn process_entry(
             tracing::error!(job_id = %job.id, error = %trace, "NAS photo processing failed");
             progress.failed += 1;
             progress.last_error = Some(trace);
-            if job.scope_kind != "file" {
-                let queued = jobs.enqueue_operation_file(&job.folder_id, path, 0)?;
-                store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
-            }
+            publish(
+                jobs,
+                job,
+                progress,
+                Some(path.to_str().context("photo path must be UTF-8")?),
+            )?;
+            return Err(error).with_context(|| format!("processing {}", path.display()));
         }
     }
     Ok(())
@@ -397,29 +394,13 @@ fn process_photo(
     // Metadata writers may replace inodes. Keep the whole photo group untouched
     // until import checkpoints make every published link independently recoverable.
     if crate::imports::group_pending_publication(jobs, &job.library_id, &paths)? {
-        let queued = jobs.enqueue_operation_file(&job.folder_id, path, 2)?;
-        store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
-        return Ok(false);
-    }
-    // Wait for the whole pair to finish copying before starting a non-preemptible unit.
-    for source in &paths {
-        let stamp = file_stamp(source)?;
-        let unchanged = jobs
-            .file_state(
-                &job.folder_id,
-                source.to_str().context("photo path must be UTF-8")?,
-            )?
-            .is_some_and(|f| (f.size, f.mtime_ns) == stamp);
-        if !unchanged && recently_modified(stamp.1) {
-            let queued = jobs.enqueue_operation_file(&job.folder_id, source, 2)?;
-            store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
-            return Ok(false);
-        }
+        bail!("照片组尚未完成发布，请完成导入后重试：{}", path.display());
     }
     crate::tasks::begin_photo(jobs, &job.library_id, &job.work_class, path, &paths)?;
     let uninterrupted = AtomicBool::new(false);
     let result = (|| {
         let mut changed = false;
+        jobs.set_phase(&job.id, "indexing")?;
         for source in &paths {
             changed |= process_file(store, jobs, previews, job, source, &uninterrupted)?;
         }
@@ -446,7 +427,10 @@ fn process_photo(
             if job.work_class == "manual" && (job.refresh_metadata || job.scope_kind == "file") {
                 store.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
             }
+            jobs.set_phase(&job.id, "media")?;
             crate::cache_pipeline::process_asset(store, jobs, previews, &job.library_id, &id)?;
+            jobs.set_phase(&job.id, "cleanup")?;
+            store.collect_asset_cache_garbage(previews, &job.library_id, &id)?;
         }
         Ok(changed)
     })();
@@ -481,19 +465,6 @@ fn process_file(
         .unwrap_or_default();
     let force = job.work_class == "manual" && job.refresh_metadata;
     if !force
-        && job.scope_kind != "file"
-        && let Some(previous) = &previous
-        && previous.size == size
-        && previous.mtime_ns == mtime
-        && previous.metadata_stamp == sidecars
-        && previous.error.is_some()
-    {
-        if let Some(queued) = jobs.ensure_file_retry(&job.folder_id, path)? {
-            store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
-        }
-        return Ok(false);
-    }
-    if !force
         && let Some(previous) = &previous
         && previous.size == size
         && previous.mtime_ns == mtime
@@ -502,13 +473,6 @@ fn process_file(
         && !previous.asset_id.is_empty()
         && store.original_is_online(&job.library_id, text, &previous.version)?
     {
-        return Ok(false);
-    }
-    // Debouncing is normally handled by the event queue; reconciliation can also
-    // discover a file during a copy, before the close/write notification arrives.
-    if recently_modified(mtime) {
-        let queued = jobs.enqueue_operation_file(&job.folder_id, path, 2)?;
-        store.note_revision_activity(&queued.library_id, &queued.id, &queued.path)?;
         return Ok(false);
     }
     let mut identity_checked = false;
@@ -613,17 +577,13 @@ fn process_file(
     result
 }
 
-fn recently_modified(mtime_ns: i64) -> bool {
-    let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
-    (0..2_000_000_000).contains(&now.saturating_sub(mtime_ns))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
-    fn import_uncheckpointed_pair_defers_photo_group_without_touching_metadata() -> Result<()> {
+    fn import_uncheckpointed_pair_fails_without_touching_metadata() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -646,7 +606,12 @@ mod tests {
             "INSERT INTO imports(id,library_id,manifest) VALUES(?,?,?)",
             rusqlite::params![batch_id, "library", manifest.to_string()],
         )?;
-        assert!(!process_photo(&store, &jobs, &previews, &job, &path)?);
+        assert!(
+            process_photo(&store, &jobs, &previews, &job, &path)
+                .unwrap_err()
+                .to_string()
+                .contains("尚未完成发布")
+        );
         assert_eq!(fs::read(&path)?, b"unchanged original");
         assert!(
             jobs.file_state(&folder.id, path.to_str().unwrap())?
@@ -676,7 +641,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_file_retries_are_exact_and_do_not_restart_parent_scan() -> Result<()> {
+    fn bad_file_fails_parent_without_automatic_child_retry() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -696,67 +661,31 @@ mod tests {
         let folder = jobs.add_folder("library", ".")?;
         let parent = jobs.enqueue_external_scan(&folder.id)?;
         let job = jobs.claim_next()?.unwrap();
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &job,
-            &AtomicBool::new(false)
-        )?);
-        jobs.finish(&job.id, None)?;
+        let error = run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false)).unwrap_err();
+        jobs.finish(&job.id, Some(&format!("{error:#}")))?;
         let parent = jobs.job(&parent.id)?.unwrap();
-        assert_eq!(parent.status, "completed");
-        assert_eq!(parent.failed, 1);
-        let mut failed_id = None;
-        for _ in 0..4 {
-            rusqlite::Connection::open(&jobs_path)?
-                .execute("UPDATE jobs SET available_at=0 WHERE status='pending'", [])?;
-            let exact = jobs.claim_next()?.expect("failed file has a bounded retry");
-            assert_eq!(exact.scope_kind, "file");
-            assert_eq!(Path::new(&exact.path), bad.canonicalize()?);
-            let error =
-                run_one(&store, &jobs, &previews, &exact, &AtomicBool::new(false)).unwrap_err();
-            jobs.finish(&exact.id, Some(&format!("{error:#}")))?;
-            failed_id = Some(exact.id);
-        }
-        let exact = jobs.job(&failed_id.unwrap())?.unwrap();
-        assert_eq!(exact.status, "failed");
+        assert_eq!(parent.status, "failed");
+        assert!(parent.error.as_deref().unwrap().contains("bad.jpg"));
         assert!(jobs.claim_next()?.is_none());
-        let error_before = jobs
-            .file_state(&folder.id, bad.canonicalize()?.to_str().unwrap())?
-            .unwrap()
-            .error;
-        jobs.enqueue_external_scan(&folder.id)?;
-        let next_parent = jobs.claim_next()?.unwrap();
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &next_parent,
-            &AtomicBool::new(false)
-        )?);
-        jobs.finish(&next_parent.id, None)?;
-        let completed = jobs.job(&next_parent.id)?.unwrap();
-        assert_eq!((completed.skipped, completed.failed), (1, 0));
-        assert!(jobs.claim_next()?.is_none());
-        assert_eq!(
-            jobs.jobs(100)?
-                .iter()
-                .filter(|job| job.scope_kind == "file")
-                .count(),
-            1
-        );
-        assert_eq!(
+        assert_eq!(jobs.jobs(100)?.len(), 1);
+        assert!(
             jobs.file_state(&folder.id, bad.canonicalize()?.to_str().unwrap())?
                 .unwrap()
-                .error,
-            error_before
+                .error
+                .is_some()
         );
+        jobs.retry(&parent.id)?;
+        let retry = jobs.claim_next()?.unwrap();
+        assert_eq!(retry.id, parent.id);
+        let error = run_one(&store, &jobs, &previews, &retry, &AtomicBool::new(false)).unwrap_err();
+        jobs.finish(&retry.id, Some(&format!("{error:#}")))?;
+        assert_eq!(jobs.job(&parent.id)?.unwrap().status, "failed");
+        assert!(jobs.claim_next()?.is_none());
         Ok(())
     }
 
     #[test]
-    fn historical_unchanged_error_gets_one_exact_retry_without_parent_failure() -> Result<()> {
+    fn historical_error_fails_explicit_scan_without_background_compensation() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -789,30 +718,17 @@ mod tests {
         )?;
         jobs.enqueue_external_scan(&folder.id)?;
         let parent = jobs.claim_next()?.unwrap();
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &parent,
-            &AtomicBool::new(false)
-        )?);
-        jobs.finish(&parent.id, None)?;
-        let complete = jobs.job(&parent.id)?.unwrap();
-        assert_eq!(
-            (complete.status.as_str(), complete.failed, complete.skipped),
-            ("completed", 0, 1)
-        );
-        let exact = jobs
-            .claim_next()?
-            .expect("historical error gets an exact retry");
-        assert_eq!(exact.scope_kind, "file");
-        assert_eq!(exact.path, bad.to_str().unwrap());
-        assert_eq!(
+        let error =
+            run_one(&store, &jobs, &previews, &parent, &AtomicBool::new(false)).unwrap_err();
+        jobs.finish(&parent.id, Some(&format!("{error:#}")))?;
+        assert_eq!(jobs.job(&parent.id)?.unwrap().status, "failed");
+        assert!(jobs.claim_next()?.is_none());
+        assert_eq!(jobs.jobs(100)?.len(), 1);
+        assert!(
             jobs.file_state(&folder.id, bad.to_str().unwrap())?
                 .unwrap()
                 .error
-                .as_deref(),
-            Some("external tool interrupted by SIGTERM")
+                .is_some()
         );
         Ok(())
     }
@@ -892,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_incremental_state_skips_unchanged_original_after_restart() -> Result<()> {
+    fn restart_keeps_indexed_file_state_but_does_not_resume_scan() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -931,21 +847,9 @@ mod tests {
         let claimed = jobs.claim_next()?.unwrap();
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        let mut recovered = jobs.claim_next()?.unwrap();
-        recovered.refresh_metadata = true;
-        assert_eq!(recovered.id, claimed.id);
-        run_one(
-            &store,
-            &jobs,
-            &previews,
-            &recovered,
-            &AtomicBool::new(false),
-        )?;
-        let progress = jobs.jobs(1)?.remove(0);
-        assert_eq!(
-            (progress.processed, progress.skipped, progress.failed),
-            (0, 1, 0)
-        );
+        assert!(jobs.claim_next()?.is_none());
+        assert_eq!(jobs.job(&claimed.id)?.unwrap().status, "failed");
+        assert_eq!(jobs.file_state(&folder.id, path)?.unwrap().version, hash);
         assert_eq!(media::sha256_file(&original)?, hash);
         Ok(())
     }
@@ -1006,6 +910,7 @@ mod tests {
         jobs.enqueue_manual_metadata_refresh(&folder.id, &jobs.root().join("selected"))?;
         let job = jobs.claim_class("manual")?.unwrap();
         run_one(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
+        assert!(store.browse_descriptor("library", &id)?.is_some());
         let refreshed = store.asset("library", &id)?;
         assert_eq!(refreshed["cameraMake"], "ActualCamera");
         assert_eq!(refreshed["cameraModel"], "ActualModel");
@@ -1020,7 +925,7 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_resumes_after_last_entry_and_preserves_progress() -> Result<()> {
+    fn restart_preserves_checkpoint_but_explicit_retry_starts_new_pass() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -1029,10 +934,10 @@ mod tests {
             b"invalid media must never be parsed",
         )?;
         fs::write(originals.join("z.txt"), b"ignored")?;
-        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
+        let _store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
         let jobs_path = directory.path().join("jobs.sqlite");
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        let previews = PreviewStorage::new(
+        let _previews = PreviewStorage::new(
             &directory.path().join("keeps"),
             Some(&originals),
             "http://localhost:2283",
@@ -1058,21 +963,15 @@ mod tests {
         )?;
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        let recovered = jobs.claim_next()?.unwrap();
-        assert!(run_one(
-            &store,
-            &jobs,
-            &previews,
-            &recovered,
-            &AtomicBool::new(false)
-        )?);
-        let finished = jobs.job(&job.id)?.unwrap();
-        assert_eq!(
-            (finished.processed, finished.skipped, finished.failed),
-            (7, 11, 0)
-        );
+        assert!(jobs.claim_next()?.is_none());
+        let interrupted = jobs.job(&job.id)?.unwrap();
+        assert_eq!(interrupted.status, "failed");
+        assert_eq!((interrupted.processed, interrupted.skipped), (7, 11));
         let cursor: ScanCursor = serde_json::from_str(&jobs.load_checkpoint(&job.id)?.unwrap())?;
-        assert!(cursor.current.is_none() && cursor.pending.is_empty());
+        assert_eq!(cursor.last_name.as_deref(), Some("already.jpg"));
+        jobs.retry(&job.id)?;
+        assert!(jobs.load_checkpoint(&job.id)?.is_none());
+        assert_eq!(jobs.claim_next()?.unwrap().id, job.id);
         Ok(())
     }
 
@@ -1110,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_keeps_pending_and_recovered_owners_until_terminal() -> Result<()> {
+    fn startup_settles_interrupted_owner_without_resuming_task() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -1130,20 +1029,13 @@ mod tests {
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
         maintain_revisions(&store, &jobs)?;
-        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "pending");
-        assert!(store.revision_batch_ids()?.contains(&queued.id));
-        jobs.claim_next()?.unwrap();
-        let changed = jobs.enqueue_change(&folder.id, Path::new(&folder.path), 0)?;
-        store.note_revision_activity("library", &changed.id, &folder.path)?;
-        jobs.finish(&queued.id, None)?;
-        maintain_revisions(&store, &jobs)?;
-        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "completed");
-        assert!(store.revision_batch_ids()?.contains(&changed.id));
-        let active = jobs.claim_next()?.unwrap();
-        assert_eq!(active.id, changed.id);
-        jobs.finish(&active.id, None)?;
-        maintain_revisions(&store, &jobs)?;
+        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "failed");
         assert!(!store.revision_batch_ids()?.contains(&queued.id));
+        assert!(jobs.claim_next()?.is_none());
+        assert_eq!(
+            store.catalog_revision("library", None, false)?["isUpdating"],
+            false
+        );
         Ok(())
     }
 
@@ -1173,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_retries_keep_owner_and_terminal_jobs_allow_quiet_settlement() -> Result<()> {
+    fn failed_and_cancelled_jobs_settle_immediately_without_retry() -> Result<()> {
         for cancel in [false, true] {
             let directory = tempfile::tempdir()?;
             let originals = directory.path().join("originals");
@@ -1187,26 +1079,14 @@ mod tests {
             store.note_revision_activity("library", &queued.id, &folder.path)?;
             rusqlite::Connection::open(&catalog_path)?
                 .execute("UPDATE catalog_revision_updates SET last_changed_at=0", [])?;
-            let queue_db = rusqlite::Connection::open(&jobs_path)?;
-            for attempt in 0..4 {
-                queue_db.execute("UPDATE jobs SET available_at=0", [])?;
-                assert_eq!(jobs.claim_next()?.unwrap().id, queued.id);
+            assert_eq!(jobs.claim_next()?.unwrap().id, queued.id);
+            if cancel {
+                jobs.remove_folder(&folder.id)?;
+            } else {
                 jobs.finish(&queued.id, Some("fixture scan failed"))?;
-                maintain_revisions(&store, &jobs)?;
-                if attempt < 3 {
-                    assert_eq!(jobs.job(&queued.id)?.unwrap().status, "pending");
-                    assert!(store.revision_batch_ids()?.contains(&queued.id));
-                    assert_eq!(
-                        store.catalog_revision("library", None, false)?["isUpdating"],
-                        true
-                    );
-                }
-                if cancel {
-                    jobs.remove_folder(&folder.id)?;
-                    maintain_revisions(&store, &jobs)?;
-                    break;
-                }
             }
+            maintain_revisions(&store, &jobs)?;
+            assert!(jobs.claim_next()?.is_none());
             assert_eq!(
                 jobs.job(&queued.id)?.unwrap().status,
                 if cancel { "cancelled" } else { "failed" }

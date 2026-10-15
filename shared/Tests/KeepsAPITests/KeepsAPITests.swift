@@ -200,8 +200,10 @@ struct KeepsAPITests {
 
     @Test func manualTaskStatusDecodesDirectoryRefreshProgress() throws {
         let status = try JSONDecoder().decode(KeepsTaskStatus.self, from: Data("""
-        {"automatic":{"status":"idle","remainingPhotos":0,"failedPhotos":0},"longTask":{"status":"running","kind":"manual","path":"/photos/旅行","currentPhoto":"/photos/旅行/nested/IMG.ARW","processed":7,"failed":2}}
+        {"automatic":{"status":"idle","remainingPhotos":0,"failedPhotos":0},"longTask":{"status":"running","kind":"manual","jobID":"scan-1","phase":"media","path":"/photos/旅行","currentPhoto":"/photos/旅行/nested/IMG.ARW","processed":7,"failed":2}}
         """.utf8))
+        #expect(status.longTask.jobID == "scan-1")
+        #expect(status.longTask.phase == "media")
         #expect(status.longTask.path == "/photos/旅行")
         #expect(status.longTask.currentPhoto == "/photos/旅行/nested/IMG.ARW")
         #expect(status.longTask.processed == 7)
@@ -215,6 +217,8 @@ struct KeepsAPITests {
         #expect(status.automatic.currentPhoto == nil)
         #expect(status.automatic.remainingPhotos == 0)
         #expect(status.longTask.kind == nil)
+        #expect(status.longTask.jobID == nil)
+        #expect(status.longTask.phase == nil)
     }
 
     @Test func createDirectoryUsesLibraryAndSeparateParentAndName() async throws {
