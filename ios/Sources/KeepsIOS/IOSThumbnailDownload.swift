@@ -19,22 +19,43 @@ final class IOSThumbnailDownload: ObservableObject {
     private var registered = false
     private var configuration: KeepsConfiguration?
     private var work: Task<Void, Never>?
+    private var transferPause: Task<Void, Never>?
     private var runID: UUID?
     private var systemTask: BGContinuedProcessingTask?
     @Published private(set) var systemProgress = IOSOfflineProgress()
     private var backgroundTask = UIBackgroundTaskIdentifier.invalid
+    private(set) var shouldResumeAutomatically = true
+    private(set) var isPausedByUser = false
+
+    func waitForInterruptedWork() async {
+        await transferPause?.value
+        if let work, work.isCancelled { await work.value }
+    }
 
     func prepare(configuration: KeepsConfiguration, refreshLocal: @escaping @MainActor () async -> Void,
                  synchronize: @escaping @MainActor (Bool, @escaping IOSOfflineProgress.Reporter) async throws -> Void) async {
         guard !isRunning else { return }
         configurationChanged(configuration)
+        await transferPause?.value
+        guard !Task.isCancelled, self.configuration == configuration else { return }
         start(configuration: configuration, refreshLocal: refreshLocal, synchronize: synchronize)
     }
 
     func pause() {
         guard isRunning else { return }
+        shouldResumeAutomatically = false
+        isPausedByUser = true
         work?.cancel()
+        pauseTransfer()
         status = "正在暂停，已完成的数据库和下载进度会保留…"
+    }
+
+    private func pauseTransfer() {
+        let previous = transferPause
+        transferPause = Task {
+            await previous?.value
+            await KeepsOfflineRebuild.pauseBackgroundDownloads()
+        }
     }
 
     private func start(configuration: KeepsConfiguration,
@@ -42,6 +63,8 @@ final class IOSThumbnailDownload: ObservableObject {
                        synchronize: @escaping @MainActor (Bool, @escaping IOSOfflineProgress.Reporter) async throws -> Void) {
         guard !isRunning else { return }
         error = nil
+        shouldResumeAutomatically = false
+        isPausedByUser = false
         self.configuration = configuration
         let id = UUID()
         runID = id
@@ -60,9 +83,12 @@ final class IOSThumbnailDownload: ObservableObject {
         }
         backgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Keeps library update") { [weak self] in
             Task { @MainActor in
-                guard let self, self.systemTask == nil else { return }
+                guard let self, self.runID == id, self.systemTask == nil,
+                      !self.isPausedByUser else { return }
+                self.shouldResumeAutomatically = true
                 self.work?.cancel()
                 self.endBackgroundTime()
+                ThumbnailBackgroundDelegate.schedule()
             }
         }
         let request = BGContinuedProcessingTaskRequest(identifier: Self.identifier,
@@ -94,11 +120,14 @@ final class IOSThumbnailDownload: ObservableObject {
         task.progress.totalUnitCount = systemProgress.totalUnitCount
         task.progress.completedUnitCount = systemProgress.completedUnitCount
         task.updateTitle("准备离线图库", subtitle: status)
+        let id = runID
         task.expirationHandler = { [weak self] in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.runID == id, !self.isPausedByUser else { return }
                 Self.logger.notice("Continued task expired at progress \(self.systemProgress.completedUnitCount)/\(self.systemProgress.totalUnitCount)")
+                self.shouldResumeAutomatically = true
                 self.work?.cancel()
+                ThumbnailBackgroundDelegate.schedule()
             }
         }
     }
@@ -147,7 +176,11 @@ final class IOSThumbnailDownload: ObservableObject {
         let cancelled = Task.isCancelled
         let succeeded = completed && !cancelled
         if succeeded { systemProgress.complete() }
-        if cancelled { status = "准备已暂停，已缓存的文件会保留；点击继续。" }
+        if cancelled {
+            status = shouldResumeAutomatically
+                ? "系统已暂停准备；回到前台后自动继续。"
+                : "准备已暂停，已缓存的文件会保留；点击继续。"
+        }
         else if completed { status = "图库已就绪，缩略图在后台补齐。" }
         else { status = "准备已暂停，已完成的数据库和下载进度会保留；点击继续。" }
         systemTask?.progress.completedUnitCount = systemProgress.completedUnitCount
@@ -192,7 +225,10 @@ final class IOSThumbnailDownload: ObservableObject {
 
     func configurationChanged(_ configuration: KeepsConfiguration?) {
         guard self.configuration != configuration else { return }
-        if self.configuration != nil { ThumbnailBackgroundDelegate.activeWork?.cancel() }
+        if self.configuration != nil {
+            ThumbnailBackgroundDelegate.activeWork?.cancel()
+            pauseTransfer()
+        }
         BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: Self.identifier)
         work?.cancel()
         systemTask?.setTaskCompleted(success: false)
@@ -202,6 +238,8 @@ final class IOSThumbnailDownload: ObservableObject {
         systemTask = nil
         isRunning = false
         isComplete = false
+        shouldResumeAutomatically = true
+        isPausedByUser = false
         systemProgress = IOSOfflineProgress()
         error = nil
         status = "正在准备离线图库。"

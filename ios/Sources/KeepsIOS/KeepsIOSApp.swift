@@ -91,19 +91,31 @@ struct IOSRootView: View {
         .confirmationDialog("将所选照片移入回收站？原片不会删除。", isPresented: $confirmTrash, titleVisibility: .visible) {
             Button("移入回收站", role: .destructive) { Task { await changeSelection(trash: true) } }
         }
-        .task(id: library.configuration) { await prepareLibrary() }
+        .task(id: library.configuration) {
+            if scenePhase == .active { await prepareLibrary() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSUbiquitousKeyValueStore.didChangeExternallyNotification)) { _ in
             restoreCloudConnection()
         }
-        .task(id: galleryReady && scenePhase == .active) {
-            if galleryReady, scenePhase == .active, let configuration = library.configuration {
-                await updateLibrarySilently(configuration: configuration)
+        .task(id: [galleryReady, scenePhase == .active]) {
+            guard scenePhase == .active else { return }
+            if galleryReady {
+                await ThumbnailBackgroundDelegate.startForegroundMaintenance(library: library)
+            } else {
+                await thumbnailDownload.waitForInterruptedWork()
+                if !thumbnailDownload.isPausedByUser { await prepareLibrary() }
+            }
+        }
+        .onChange(of: thumbnailDownload.isRunning) { _, running in
+            if !running, !galleryReady, scenePhase == .active, thumbnailDownload.shouldResumeAutomatically,
+               !thumbnailDownload.isPausedByUser {
+                Task { await prepareLibrary() }
             }
         }
         .onChange(of: thumbnailDownload.isComplete) { _, complete in
             if complete { galleryReady = true }
         }
-        .onChange(of: library.configuration, initial: true) { _, configuration in
+        .onChange(of: library.configuration, initial: true) { previous, configuration in
             collections = false
             galleryReady = false
             startupError = nil
@@ -115,6 +127,7 @@ struct IOSRootView: View {
             }
             cloud.synchronize()
             if configuration == nil { Task { restoreCloudConnection() } }
+            if previous != configuration { ThumbnailBackgroundDelegate.activeWork?.cancel() }
             thumbnailDownload.configurationChanged(configuration)
             directories.configure(configuration)
             directories.synchronize = { await library.synchronize() }
@@ -147,6 +160,7 @@ struct IOSRootView: View {
     private func prepareLibrary() async {
         guard let configuration = library.configuration else { return }
         await library.waitForLocalLoad()
+        await library.refresh()
         guard !Task.isCancelled else { return }
         if let error = library.lastError { startupError = error; return }
         if library.hasLocalCatalog { galleryReady = true; return }
@@ -155,22 +169,6 @@ struct IOSRootView: View {
         }
         guard !Task.isCancelled, library.configuration == configuration else { return }
         if thumbnailDownload.isComplete { galleryReady = true }
-    }
-
-    private func updateLibrarySilently(configuration: KeepsConfiguration) async {
-        await ThumbnailBackgroundDelegate.activeWork?.value
-        guard !Task.isCancelled, library.configuration == configuration else { return }
-        do {
-            try await library.synchronizeChecked()
-            try Task.checkCancellation()
-            _ = await ThumbnailPrefetch.shared.runLocal(configuration: configuration, downloadMissing: true)
-            try Task.checkCancellation()
-            try await KeepsCloudReplica.shared.backup(configuration: configuration)
-        } catch {
-            guard !Task.isCancelled else { return }
-            Logger(subsystem: "com.hechuan.Keeps", category: "library-maintenance")
-                .error("Silent library update failed: \(String(reflecting: error), privacy: .public)")
-        }
     }
 
     private var startupScreen: some View {
@@ -526,46 +524,109 @@ struct IOSSettingsView: View {
 @MainActor
 final class ThumbnailBackgroundDelegate: NSObject, UIApplicationDelegate {
     static var activeWork: Task<Void, Never>?
+    private static var backgroundTime = UIBackgroundTaskIdentifier.invalid
+    private static var maintenanceID: UUID?
     private static let identifier = "local.keeps.thumbnail-prefetch"
     private static let logger = Logger(subsystem: "local.keeps", category: "thumbnail-background")
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        KeepsOfflineRebuild.restoreBackgroundDownloads()
         let registered = BGTaskScheduler.shared.register(forTaskWithIdentifier: Self.identifier, using: .main) { task in
-            let work = Task { @MainActor in
+            MainActor.assumeIsolated {
                 Self.schedule()
-                guard !IOSThumbnailDownload.shared.isRunning else {
+                guard Self.activeWork == nil, !IOSThumbnailDownload.shared.isRunning,
+                      !IOSThumbnailDownload.shared.isPausedByUser else {
                     task.setTaskCompleted(success: true)
                     return
                 }
-                do {
-                    guard let configuration = try KeepsSettings.load() else {
-                        task.setTaskCompleted(success: true)
-                        return
+                let work = Task { @MainActor in
+                    defer { Self.activeWork = nil }
+                    do {
+                        guard let configuration = try KeepsSettings.load() else {
+                            task.setTaskCompleted(success: true)
+                            return
+                        }
+                        let library = IOSLibraryStore(configuration: configuration, loadSettings: false)
+                        let completed = await Self.maintain(library)
+                        task.setTaskCompleted(success: completed)
+                    } catch {
+                        Self.logger.error("Background sync failed: \(String(reflecting: error), privacy: .public)")
+                        task.setTaskCompleted(success: false)
                     }
-                    guard try await IOSCatalogReader().hasCatalog(configuration: configuration) else {
-                        task.setTaskCompleted(success: true)
-                        return
-                    }
-                    Self.logger.info("Background thumbnail task started")
-                    let library = IOSLibraryStore(configuration: configuration, loadSettings: false)
-                    try await library.synchronizeChecked()
-                    guard !Task.isCancelled else { task.setTaskCompleted(success: false); return }
-                    let completed = await ThumbnailPrefetch.shared.runLocal(configuration: configuration, downloadMissing: true)
-                    try Task.checkCancellation()
-                    try await KeepsCloudReplica.shared.backup(configuration: configuration)
-                    Self.logger.info("Background thumbnail task finished: success=\(completed), cancelled=\(Task.isCancelled)")
-                    task.setTaskCompleted(success: completed && !Task.isCancelled)
-                } catch {
-                    Self.logger.error("Background thumbnails failed: \(String(reflecting: error), privacy: .public)")
-                    task.setTaskCompleted(success: false)
                 }
+                Self.activeWork = work
+                task.expirationHandler = { work.cancel() }
             }
-            Self.activeWork = work
-            task.expirationHandler = { work.cancel() }
         }
         if !registered { Self.logger.error("Background thumbnail task registration failed") }
         return true
+    }
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        if !KeepsOfflineRebuild.handleBackgroundEvents(identifier: identifier, completionHandler: {
+            Self.schedule()
+            completionHandler()
+        }) {
+            completionHandler()
+        }
+    }
+
+    static func startForegroundMaintenance(library: IOSLibraryStore) async {
+        await IOSThumbnailDownload.shared.waitForInterruptedWork()
+        if let previous = activeWork {
+            // An expired task must release the database before its foreground replacement starts.
+            await previous.value
+            guard !Task.isCancelled else { return }
+            await library.refresh()
+            if !previous.isCancelled { return }
+        }
+        guard !Task.isCancelled, library.configuration != nil,
+              activeWork == nil, !IOSThumbnailDownload.shared.isRunning else { return }
+        let id = UUID()
+        maintenanceID = id
+        backgroundTime = UIApplication.shared.beginBackgroundTask(withName: "Keeps library sync") {
+            Task { @MainActor in
+                guard maintenanceID == id else { return }
+                let interrupted = activeWork
+                interrupted?.cancel()
+                endBackgroundTime()
+                schedule()
+                await interrupted?.value
+                if UIApplication.shared.applicationState == .active {
+                    await startForegroundMaintenance(library: library)
+                }
+            }
+        }
+        // This task belongs to the app, rather than the view's active scene phase.
+        activeWork = Task { @MainActor in
+            defer { activeWork = nil; maintenanceID = nil; endBackgroundTime() }
+            _ = await maintain(library)
+        }
+    }
+
+    private static func maintain(_ library: IOSLibraryStore) async -> Bool {
+        guard let configuration = library.configuration else { return true }
+        do {
+            try await library.synchronizeChecked(includeThumbnails: false)
+            try Task.checkCancellation()
+            let completed = await ThumbnailPrefetch.shared.runLocal(configuration: configuration, downloadMissing: true)
+            try Task.checkCancellation()
+            try await KeepsCloudReplica.shared.backup(configuration: configuration)
+            return completed && !Task.isCancelled
+        } catch {
+            if !Task.isCancelled {
+                logger.error("Library maintenance failed: \(String(reflecting: error), privacy: .public)")
+            }
+            return false
+        }
+    }
+
+    private static func endBackgroundTime() {
+        guard backgroundTime != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTime)
+        backgroundTime = .invalid
     }
 
     static func schedule() {
@@ -574,7 +635,6 @@ final class ThumbnailBackgroundDelegate: NSObject, UIApplicationDelegate {
             guard !pending.contains(where: { $0.identifier == identifier }) else { return }
             let request = BGProcessingTaskRequest(identifier: identifier)
             request.requiresNetworkConnectivity = true
-            request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60)
             do { try BGTaskScheduler.shared.submit(request) }
             catch { logger.error("Background thumbnail scheduling failed: \(String(reflecting: error), privacy: .public)") }
         }

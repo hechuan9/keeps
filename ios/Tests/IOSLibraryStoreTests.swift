@@ -408,6 +408,28 @@ struct IOSLibraryStoreTests {
         #expect(store.assets.map(\.originalFilename) == ["photo-1"])
     }
 
+    @Test func interruptedNASBuildResumesPersistedJobAfterAppRelaunch() async throws {
+        let fixture = ReplicaFixture()
+        fixture.building = true
+        let store = await fixture.store()
+        let sync = Task { await store.synchronize(includeThumbnails: false) }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(3))
+        while !fixture.requests.contains("POST /libraries/library/offline-rebuild"), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(fixture.requests.contains("POST /libraries/library/offline-rebuild"))
+        sync.cancel()
+        await sync.value
+        #expect(!store.hasLocalCatalog)
+        fixture.building = false
+        let reopened = await fixture.store()
+        await reopened.synchronize(includeThumbnails: false)
+        #expect(reopened.syncError == nil)
+        #expect(reopened.hasLocalCatalog)
+        #expect(fixture.requests.filter { $0 == "POST /libraries/library/offline-rebuild" }.count == 1)
+        #expect(fixture.requests.filter { $0.hasSuffix("/download") }.count == 1)
+    }
+
     @Test func repeatedForegroundSynchronizationCoalescesOneDownload() async throws {
         let fixture = ReplicaFixture()
         let store = await fixture.store()
@@ -559,6 +581,8 @@ private final class ReplicaFixture: @unchecked Sendable {
     private let lock = NSLock()
     private var recorded: [String] = []
     private var isOffline = false
+    private var isBuilding = false
+    var building: Bool { get { lock.withLock { isBuilding } } set { lock.withLock { isBuilding = newValue } } }
     private var isUpdating = false
     var syncGeneration: String?
     var ackStatus = 200
@@ -668,6 +692,9 @@ private final class ReplicaFixture: @unchecked Sendable {
                 return .text(200, "{\"revision\":\(serverRevision),\"isUpdating\":\(isUpdating)\(extra)}")
             }
             if isUnsupported { return .text(404, "unsupported") }
+            if isBuilding {
+                return .text(200, "{\"id\":\"\(jobID.uuidString)\",\"state\":\"building\",\"phase\":\"catalog\",\"completed\":0,\"total\":1}")
+            }
             do {
                 if archive == nil { archive = try makeArchive() }
                 let data = archive!

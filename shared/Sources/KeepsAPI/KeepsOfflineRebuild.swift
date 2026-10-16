@@ -18,6 +18,28 @@ public struct KeepsOfflineManifest: Codable, Sendable {
 
 public actor KeepsOfflineRebuild {
     public static let shared = KeepsOfflineRebuild()
+    @MainActor public static func handleBackgroundEvents(identifier: String, completionHandler: @escaping () -> Void) -> Bool {
+        #if os(iOS)
+        guard identifier == OfflineBackgroundDownload.identifier else { return false }
+        OfflineBackgroundDownload.shared.accept(.init(completionHandler))
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    public static func restoreBackgroundDownloads() {
+        #if os(iOS)
+        _ = OfflineBackgroundDownload.shared
+        #endif
+    }
+
+    public static func pauseBackgroundDownloads() async {
+        #if os(iOS)
+        await OfflineBackgroundDownload.shared.pause()
+        #endif
+    }
+
     public struct Progress: Sendable {
         public enum Phase: Sendable { case building, downloading, verifying, importing }
         public var step: String = ""
@@ -56,6 +78,9 @@ public actor KeepsOfflineRebuild {
             if legacy != root, FileManager.default.fileExists(atPath: legacy.path) { try FileManager.default.removeItem(at: legacy) }
         }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        #if os(iOS)
+        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: root.path)
+        #endif
         let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseRoot)
         let replica = try database.replicaID()
         let generation = try database.generation
@@ -65,12 +90,20 @@ public actor KeepsOfflineRebuild {
         let parametersFile = root.appendingPathComponent("request.json")
         if FileManager.default.fileExists(atPath: parametersFile.path),
            try JSONDecoder().decode(Parameters.self, from: Data(contentsOf: parametersFile)) != parameters {
-            try FileManager.default.removeItem(at: root)
+            try await discard(root)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            #if os(iOS)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: root.path)
+            #endif
         }
         try JSONEncoder().encode(parameters).write(to: parametersFile, options: .atomic)
         let jobFile = root.appendingPathComponent("job.json")
         let archive = root.appendingPathComponent("bundle.tar")
+        #if os(iOS)
+        if FileManager.default.fileExists(atPath: archive.path) {
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: archive.path)
+        }
+        #endif
         var job: Job
         if FileManager.default.fileExists(atPath: jobFile.path) {
             job = try JSONDecoder().decode(Job.self, from: Data(contentsOf: jobFile))
@@ -85,10 +118,11 @@ public actor KeepsOfflineRebuild {
             try await Task.sleep(for: .seconds(1))
             do { job = try await fetch(configuration, method: "GET", suffix: [job.id.uuidString]) }
             catch KeepsAPIError.http(let status, let body) {
-                if status == 404 || status == 410 { try FileManager.default.removeItem(at: root) }
+                if status == 404 || status == 410 { try await discard(root) }
                 throw KeepsAPIError.http(status, body)
             }
         }
+        try JSONEncoder().encode(job).write(to: jobFile, options: .atomic)
         guard let size = job.byteCount, size > 0, let digest = job.sha256, digest.count == 64 else { throw failure("离线包缺少长度或校验值") }
         let existing = (try? archive.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         guard existing <= size else { throw failure("离线包断点长度错误") }
@@ -96,10 +130,23 @@ public actor KeepsOfflineRebuild {
             var request = try request(configuration, method: "GET", suffix: [job.id.uuidString, "download"])
             if existing > 0 { request.setValue("bytes=\(existing)-", forHTTPHeaderField: "Range") }
             request.setValue("\"\(digest)\"", forHTTPHeaderField: "If-Match")
-            let download = OfflineFileDownload(file: archive, offset: existing, total: size, digest: digest, progress: progress)
-            do { try await download.run(request, configuration: session.configuration) }
+            do {
+                #if os(iOS)
+                if databaseRoot == nil {
+                    let receipt = try await OfflineBackgroundDownload.shared.download(request, root: root,
+                        receipt: .init(offset: existing, total: size, digest: digest), progress: progress)
+                    try Task.checkCancellation()
+                    try receipt.merge(in: root)
+                    try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: archive.path)
+                } else {
+                    try await OfflineFileDownload(file: archive, offset: existing, total: size, digest: digest, progress: progress).run(request, configuration: session.configuration)
+                }
+                #else
+                try await OfflineFileDownload(file: archive, offset: existing, total: size, digest: digest, progress: progress).run(request, configuration: session.configuration)
+                #endif
+            }
             catch KeepsAPIError.http(let status, let body) {
-                if status == 404 || status == 410 { try FileManager.default.removeItem(at: root) }
+                if status == 404 || status == 410 { try await discard(root) }
                 throw KeepsAPIError.http(status, body)
             }
         }
@@ -116,6 +163,13 @@ public actor KeepsOfflineRebuild {
             }
         }
         guard hash.finalize().map({ String(format: "%02x", $0) }).joined() == digest.lowercased() else {
+            #if os(iOS)
+            await OfflineBackgroundDownload.shared.discard(root: root)
+            for name in [OfflineDownloadReceipt.filename, "resume.data", "download.part"] {
+                let file = root.appendingPathComponent(name)
+                if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+            }
+            #endif
             try FileManager.default.removeItem(at: archive)
             throw failure("离线包 SHA256 校验失败，请重试传输")
         }
@@ -124,6 +178,13 @@ public actor KeepsOfflineRebuild {
         try await acknowledge(configuration: configuration, databaseRoot: databaseRoot)
         return manifest
     }
+    private func discard(_ root: URL) async throws {
+        #if os(iOS)
+        await OfflineBackgroundDownload.shared.discard(root: root)
+        #endif
+        try FileManager.default.removeItem(at: root)
+    }
+
     private struct Parameters: Codable, Equatable {
         var includeThumbnails: Bool
         var replicaID: String
@@ -373,3 +434,291 @@ private final class OfflineTarReader {
         }
     }
 }
+
+/// A completed system download is staged before any append, so interruption cannot duplicate bytes.
+struct OfflineDownloadReceipt: Codable, Equatable {
+    var offset: Int64
+    var total: Int64
+    var digest: String
+    var token = UUID().uuidString
+
+    static let filename = "background.json"
+    func validate(_ response: HTTPURLResponse, downloadedBytes: Int64) throws {
+        guard response.statusCode == 200 || response.statusCode == 206 else {
+            throw KeepsAPIError.http(response.statusCode, "离线包下载失败")
+        }
+        guard downloadedBytes == total - offset,
+              response.value(forHTTPHeaderField: "ETag")?.trimmingCharacters(in: CharacterSet(charactersIn: "\"")) == digest else {
+            throw URLError(.badServerResponse)
+        }
+        if response.statusCode == 200 {
+            guard offset == 0 else { throw URLError(.badServerResponse) }
+        } else {
+            let range = response.value(forHTTPHeaderField: "Content-Range") ?? ""
+            let prefix = "bytes "
+            let suffix = "-\(total - 1)/\(total)"
+            guard range.hasPrefix(prefix), range.hasSuffix(suffix),
+                  let start = Int64(range.dropFirst(prefix.count).dropLast(suffix.count)),
+                  start >= offset, start < total else { throw URLError(.badServerResponse) }
+        }
+    }
+
+    func merge(in root: URL) throws {
+        let archive = root.appendingPathComponent("bundle.tar")
+        let part = root.appendingPathComponent("download.part")
+        let bytes = Int64(try part.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1)
+        guard bytes == total - offset else { throw URLError(.dataLengthExceedsMaximum) }
+        if offset == 0 {
+            if FileManager.default.fileExists(atPath: archive.path) { try FileManager.default.removeItem(at: archive) }
+            try FileManager.default.moveItem(at: part, to: archive)
+            return
+        }
+        let existing = Int64(try archive.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1)
+        guard (offset...total).contains(existing) else { throw URLError(.dataLengthExceedsMaximum) }
+        let input = try FileHandle(forReadingFrom: part)
+        let output = try FileHandle(forWritingTo: archive)
+        defer { try? input.close(); try? output.close() }
+        try input.seek(toOffset: UInt64(existing - offset))
+        try output.seekToEnd()
+        while let data = try autoreleasepool(invoking: { try input.read(upToCount: 1024 * 1024) }), !data.isEmpty {
+            try Task.checkCancellation()
+            try output.write(contentsOf: data)
+        }
+        try output.synchronize()
+        try FileManager.default.removeItem(at: part)
+    }
+}
+
+#if os(iOS)
+private final class OfflineBackgroundDownload: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    static let shared = OfflineBackgroundDownload()
+    static let identifier = "local.keeps.offline-downloads.v1"
+    private let queue = DispatchQueue(label: "local.keeps.offline-downloads")
+    private var session: URLSession!
+    private var waiters: [String: Waiter] = [:]
+    private var active: [String: URLSessionDownloadTask] = [:]
+    private var failures: [Int: Error] = [:]
+    private var completion: Completion?
+    private var finishedEvents = false
+    private var discarded: Set<Int> = []
+    private let base = URL.applicationSupportDirectory.appendingPathComponent("Keeps/OfflineRebuild")
+
+    @MainActor final class Completion {
+        let body: () -> Void
+        init(_ body: @escaping () -> Void) { self.body = body }
+    }
+    private final class Waiter: @unchecked Sendable {
+        let progress: @Sendable (KeepsOfflineRebuild.Progress) async -> Void
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<OfflineDownloadReceipt, Error>?
+        private var cancelled = false
+        var lastProgress = Date.distantPast
+        init(progress: @escaping @Sendable (KeepsOfflineRebuild.Progress) async -> Void) { self.progress = progress }
+        func install(_ continuation: CheckedContinuation<OfflineDownloadReceipt, Error>) {
+            lock.lock(); defer { lock.unlock() }
+            if cancelled { continuation.resume(throwing: CancellationError()) }
+            else { self.continuation = continuation }
+        }
+        func finish(_ result: Result<OfflineDownloadReceipt, Error>) {
+            lock.lock(); let continuation = self.continuation; self.continuation = nil; lock.unlock()
+            continuation?.resume(with: result)
+        }
+        func cancel() {
+            lock.lock(); cancelled = true; let continuation = self.continuation; self.continuation = nil; lock.unlock()
+            continuation?.resume(throwing: CancellationError())
+        }
+        var isCancelled: Bool { lock.withLock { cancelled } }
+    }
+
+    private override init() {
+        super.init()
+        let configuration = URLSessionConfiguration.background(withIdentifier: Self.identifier)
+        configuration.isDiscretionary = false
+        configuration.sessionSendsLaunchEvents = true
+        configuration.waitsForConnectivity = true
+        configuration.timeoutIntervalForResource = 7 * 24 * 60 * 60
+        let callbacks = OperationQueue()
+        callbacks.maxConcurrentOperationCount = 1
+        callbacks.underlyingQueue = queue
+        session = URLSession(configuration: configuration, delegate: self, delegateQueue: callbacks)
+    }
+
+    func accept(_ completion: Completion) {
+        queue.async {
+            if self.finishedEvents {
+                self.finishedEvents = false
+                Task { @MainActor in completion.body() }
+            } else { self.completion = completion }
+        }
+    }
+
+    func download(_ request: URLRequest, root: URL, receipt: OfflineDownloadReceipt,
+                  progress: @escaping @Sendable (KeepsOfflineRebuild.Progress) async -> Void) async throws -> OfflineDownloadReceipt {
+        let waiter = Waiter(progress: progress)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                waiter.install(continuation)
+                queue.async {
+                    guard !waiter.isCancelled else { return }
+                    let key = root.lastPathComponent
+                    self.session.getAllTasks { tasks in
+                        self.queue.async {
+                            guard !waiter.isCancelled else { return }
+                            self.waiters.removeValue(forKey: key)?.cancel()
+                            self.waiters[key] = waiter
+                            do {
+                                let saved = try self.receipt(root)
+                                if let saved, saved.total == receipt.total, saved.digest == receipt.digest,
+                                   FileManager.default.fileExists(atPath: root.appendingPathComponent("download.part").path) {
+                                    self.waiters.removeValue(forKey: key)?.finish(.success(saved))
+                                    return
+                                }
+                                let current = saved ?? receipt
+                                guard current.total == receipt.total, current.digest == receipt.digest, current.offset == receipt.offset else {
+                                    throw KeepsLibraryDatabase.DatabaseError(message: "后台下载状态不匹配，请重试")
+                                }
+                                let description = key + ":" + current.token
+                                let currentTask = self.active[key].flatMap { $0.state == .running || $0.state == .suspended ? $0 : nil }
+                                let task = currentTask ?? tasks.compactMap { $0 as? URLSessionDownloadTask }.first { $0.taskDescription == description && ($0.state == .running || $0.state == .suspended) }
+                                if let task {
+                                    self.active[key] = task
+                                    task.resume()
+                                    return
+                                }
+                                try Self.write(try JSONEncoder().encode(current), to: root.appendingPathComponent(OfflineDownloadReceipt.filename))
+                                let resume = root.appendingPathComponent("resume.data")
+                                let created: URLSessionDownloadTask
+                                if FileManager.default.fileExists(atPath: resume.path) {
+                                    created = self.session.downloadTask(withResumeData: try Data(contentsOf: resume))
+                                    try FileManager.default.removeItem(at: resume)
+                                } else { created = self.session.downloadTask(with: request) }
+                                created.taskDescription = description
+                                created.countOfBytesClientExpectsToReceive = current.total - current.offset
+                                self.active[key] = created
+                                created.resume()
+                            } catch { self.waiters.removeValue(forKey: key)?.finish(.failure(error)) }
+                        }
+                    }
+                }
+            }
+        } onCancel: { waiter.cancel() }
+    }
+
+    func pause() async {
+        await withCheckedContinuation { continuation in
+            session.getAllTasks { tasks in
+                let group = DispatchGroup()
+                for task in tasks.compactMap({ $0 as? URLSessionDownloadTask }) {
+                    group.enter()
+                    task.cancel { data in
+                        self.queue.async {
+                            if let (root, _) = try? self.context(task) {
+                                let key = root.lastPathComponent
+                                if let newer = self.active[key], newer.taskIdentifier != task.taskIdentifier { group.leave(); return }
+                                if self.active[key]?.taskIdentifier == task.taskIdentifier {
+                                    self.active.removeValue(forKey: key)
+                                    self.waiters.removeValue(forKey: key)?.cancel()
+                                }
+                                do { if let data { try Self.write(data, to: root.appendingPathComponent("resume.data")) } }
+                                catch { Logger(subsystem: "local.keeps", category: "offline-rebuild").error("Save download resume data failed: \(String(reflecting: error), privacy: .public)") }
+                            }
+                            group.leave()
+                        }
+                    }
+                }
+                group.notify(queue: self.queue) { continuation.resume() }
+            }
+        }
+    }
+
+    func discard(root: URL) async {
+        await withCheckedContinuation { continuation in
+            session.getAllTasks { tasks in
+                self.queue.async {
+                    let key = root.lastPathComponent
+                    for task in tasks where task.taskDescription?.hasPrefix(key + ":") == true {
+                        self.discarded.insert(task.taskIdentifier)
+                        task.cancel()
+                    }
+                    self.active.removeValue(forKey: key)
+                    self.waiters.removeValue(forKey: key)?.cancel()
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private func receipt(_ root: URL) throws -> OfflineDownloadReceipt? {
+        let file = root.appendingPathComponent(OfflineDownloadReceipt.filename)
+        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        return try JSONDecoder().decode(OfflineDownloadReceipt.self, from: Data(contentsOf: file))
+    }
+    private func context(_ task: URLSessionTask) throws -> (URL, OfflineDownloadReceipt) {
+        guard let parts = task.taskDescription?.split(separator: ":"), parts.count == 2 else { throw KeepsLibraryDatabase.DatabaseError(message: "后台下载状态不匹配，请重试") }
+        let root = base.appendingPathComponent(String(parts[0]))
+        guard let receipt = try receipt(root), receipt.token == parts[1] else { throw KeepsLibraryDatabase.DatabaseError(message: "后台下载状态不匹配，请重试") }
+        return (root, receipt)
+    }
+    private static func write(_ data: Data, to file: URL) throws {
+        try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard !discarded.contains(downloadTask.taskIdentifier) else { return }
+        do {
+            let (root, receipt) = try context(downloadTask)
+            if let newer = active[root.lastPathComponent], newer.taskIdentifier != downloadTask.taskIdentifier { return }
+            guard let response = downloadTask.response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
+            try receipt.validate(response, downloadedBytes: Int64(try location.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? -1))
+            let part = root.appendingPathComponent("download.part")
+            if FileManager.default.fileExists(atPath: part.path) { try FileManager.default.removeItem(at: part) }
+            try FileManager.default.moveItem(at: location, to: part)
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: part.path)
+        } catch { failures[downloadTask.taskIdentifier] = error }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard discarded.remove(task.taskIdentifier) == nil else { failures.removeValue(forKey: task.taskIdentifier); return }
+        let context: (URL, OfflineDownloadReceipt)
+        do { context = try self.context(task) }
+        catch {
+            failures.removeValue(forKey: task.taskIdentifier)
+            if let key = task.taskDescription?.split(separator: ":").first.map(String.init),
+               active[key]?.taskIdentifier == task.taskIdentifier {
+                active.removeValue(forKey: key)
+                waiters.removeValue(forKey: key)?.finish(.failure(error))
+            }
+            return
+        }
+        let (root, receipt) = context
+        let key = root.lastPathComponent
+        if let newer = active[key], newer.taskIdentifier != task.taskIdentifier { failures.removeValue(forKey: task.taskIdentifier); return }
+        if active[key]?.taskIdentifier == task.taskIdentifier { active.removeValue(forKey: key) }
+        var failure = failures.removeValue(forKey: task.taskIdentifier) ?? error
+        if let data = (error as NSError?)?.userInfo[NSURLSessionDownloadTaskResumeData] as? Data {
+            do { try Self.write(data, to: root.appendingPathComponent("resume.data")) }
+            catch { failure = error }
+        }
+        let result: Result<OfflineDownloadReceipt, Error>
+        if let failure { result = .failure(failure) }
+        else { result = .success(receipt) }
+        waiters.removeValue(forKey: key)?.finish(result)
+    }
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        guard let (root, receipt) = try? context(downloadTask), let waiter = waiters[root.lastPathComponent], !waiter.isCancelled,
+              Date().timeIntervalSince(waiter.lastProgress) >= 1 else { return }
+        waiter.lastProgress = Date()
+        let progress = KeepsOfflineRebuild.Progress(phase: .downloading, completed: min(receipt.total, receipt.offset + totalBytesWritten), total: receipt.total, message: "下载离线包")
+        Task { await waiter.progress(progress) }
+    }
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        if let completion {
+            self.completion = nil
+            Task { @MainActor in completion.body() }
+        } else { finishedEvents = true }
+    }
+}
+#endif

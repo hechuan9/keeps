@@ -30,6 +30,56 @@ struct KeepsOfflineRebuildTests {
         let manifest = KeepsOfflineManifest(formatVersion: 1, libraryID: "main", revision: 42, assetCount: 0, thumbnailCount: 0, missingThumbnailCount: 0)
         return [("manifest.json", try JSONEncoder().encode(manifest)), ("catalog.sqlite", try Data(contentsOf: snapshot))]
     }
+    @Test func backgroundReceiptValidatesSystemResumedSuffixResponse() throws {
+        let receipt = OfflineDownloadReceipt(offset: 0, total: 100, digest: "digest")
+        func response(_ status: Int, _ range: String, etag: String = "digest") -> HTTPURLResponse {
+            HTTPURLResponse(url: configuration.baseURL, statusCode: status, httpVersion: nil,
+                            headerFields: ["ETag": "\"\(etag)\"", "Content-Range": range, "Content-Length": "40"])!
+        }
+        // URLSession's temporary file includes earlier received bytes even when its final response is a suffix.
+        try receipt.validate(response(206, "bytes 60-99/100"), downloadedBytes: 100)
+        #expect(throws: URLError.self) { try receipt.validate(response(206, "bytes 60-99/101"), downloadedBytes: 100) }
+        #expect(throws: URLError.self) { try receipt.validate(response(206, "bytes 60-99/100", etag: "other"), downloadedBytes: 100) }
+        #expect(throws: URLError.self) { try receipt.validate(response(206, "bytes 60-99/100"), downloadedBytes: 40) }
+        let prefix = OfflineDownloadReceipt(offset: 20, total: 100, digest: "digest")
+        try prefix.validate(response(206, "bytes 60-99/100"), downloadedBytes: 80)
+        #expect(throws: URLError.self) { try prefix.validate(response(200, ""), downloadedBytes: 80) }
+    }
+
+    @Test func backgroundFragmentMergeRecoversInterruptedAppendWithoutDuplicateBytes() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let archive = root.appendingPathComponent("bundle.tar")
+        let part = root.appendingPathComponent("download.part")
+        let receipt = OfflineDownloadReceipt(offset: 4, total: 10, digest: "unused")
+        try Data("0123456".utf8).write(to: archive)
+        try Data("456789".utf8).write(to: part)
+        try receipt.merge(in: root)
+        #expect(try Data(contentsOf: archive) == Data("0123456789".utf8))
+        #expect(!FileManager.default.fileExists(atPath: part.path))
+        // A crash after the append but before fragment removal is also recoverable.
+        try Data("456789".utf8).write(to: part)
+        try receipt.merge(in: root)
+        #expect(try Data(contentsOf: archive) == Data("0123456789".utf8))
+        try Data("123".utf8).write(to: part)
+        #expect(throws: URLError.self) { try receipt.merge(in: root) }
+        #expect(try Data(contentsOf: archive) == Data("0123456789".utf8))
+    }
+
+    @Test func completedBackgroundFileReplacesOnlyStagedArchive() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let archive = root.appendingPathComponent("bundle.tar")
+        let part = root.appendingPathComponent("download.part")
+        try Data("old".utf8).write(to: archive)
+        try Data("new data".utf8).write(to: part)
+        try OfflineDownloadReceipt(offset: 0, total: 8, digest: "unused").merge(in: root)
+        #expect(try Data(contentsOf: archive) == Data("new data".utf8))
+        #expect(!FileManager.default.fileExists(atPath: part.path))
+    }
+
     @Test func singleTransferResumesOnlyAfterInterruptionAndReusesServerJob() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
