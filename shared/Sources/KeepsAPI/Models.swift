@@ -304,6 +304,10 @@ public struct KeepsAssetVersions: Decodable, Sendable {
 public struct KeepsAssetVersion: Decodable, Identifiable, Sendable {
     public var versionID: String? = nil
     public var sourceVersionID: String? = nil
+    public var evidence: Evidence? = nil
+    public struct Evidence: Decodable, Sendable {
+        public var generatedFrom: String?
+    }
     public var contentHash: String
     public var width: Int
     public var height: Int

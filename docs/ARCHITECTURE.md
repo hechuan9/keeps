@@ -58,7 +58,7 @@ macOS 查询、两端修改及 iOS 修订号检查经过 `shared/Sources/KeepsAP
 
 ### macOS 无损曝光
 
-每张照片在 NAS 保存独立底片内容版本引用。默认 Sony ARW 使用 RAW，3FR 使用同照片非 Keeps 生成的 HEIF，其余选择像素数最大的有效版本；照片组完成索引后绑定，之后扫描不自动换底片。信息界面文件版本右键可更换。底片及原文件不改写；曝光记录和 standard、512px thumbnail、64px browse 保存为独立编辑结果，不占用 NAS 自动生成的原版媒体记录。
+每张照片在 NAS 保存独立底片内容版本引用。默认 Sony ARW 使用 RAW，3FR 优先使用同照片可用且非 Keeps 生成的 HEIF，没有此类 HEIF 时使用 3FR，其余选择像素数最大的有效版本；照片组完成索引后绑定，之后扫描不自动换底片。信息界面文件版本右键可更换。底片及原文件不改写；曝光记录和 standard、512px thumbnail、64px browse 保存为独立编辑结果，不占用 NAS 自动生成的原版媒体记录。
 
 Mac 使用 Core Image，仅调整曝光；下载、渲染、上传、提交阶段持久保存在 Application Support/Keeps/ExposureTasks，断网重试和重启均继续同一 requestID。服务端检查 expectedRevision，三个展示对象齐全后原子切换底片、曝光记录与图片描述，更新库及目录修订。已有调整的底片更换在 Mac 重新计算完成后一起提交；冲突保留旧展示，需用户核实后重新操作。还原只清除曝光记录，保留底片。在线图片与 iOS 离线包统一优先使用已提交编辑结果，NAS 不为曝光结果重新编码。任务完成后清理私有下载及渲染文件；跨任务底片缓存尚未实现，渲染器只接收本地文件 URL。
 

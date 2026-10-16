@@ -59,6 +59,8 @@ struct ContentView: View {
             if showsAIWorkspace {
                 AIEditingWorkspaceView(autoStart: startsAIWorkspace, returnToLibrary: { showsAIWorkspace = false })
                     .disabled(library.isCullingActive)
+            } else if showsCulling {
+                AICullingView(returnToLibrary: { showsCulling = false })
             } else {
                 libraryScreen
             }
@@ -66,7 +68,6 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             AIEditingBackgroundStatus(store: batch) { showsAIWorkspace = true }
         }
-        .sheet(isPresented: $showsCulling) { AICullingView() }
         .sheet(item: $assetToCrop) { asset in
             PhotoCropSheet(asset: asset)
         }

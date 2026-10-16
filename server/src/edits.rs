@@ -86,14 +86,17 @@ pub(crate) fn choose(db: &Connection, lib: &str, id: &str) -> Result<()> {
             .to_ascii_lowercase()
     };
     let arw = rows.iter().find(|r| extension(&r.1) == "arw");
-    let has_3fr = rows.iter().any(|r| extension(&r.1) == "3fr");
+    let raw_3fr = rows.iter().find(|r| extension(&r.1) == "3fr");
     let best = if arw.is_some() {
         arw
-    } else if has_3fr {
-        rows.iter().find(|r| {
-            ["heic", "heif", "hif"].contains(&extension(&r.1).as_str())
-                && serde_json::from_str::<Value>(&r.3).is_ok_and(|v| v["generatedFrom"].is_null())
-        })
+    } else if raw_3fr.is_some() {
+        rows.iter()
+            .find(|r| {
+                ["heic", "heif", "hif"].contains(&extension(&r.1).as_str())
+                    && serde_json::from_str::<Value>(&r.3)
+                        .is_ok_and(|v| v["generatedFrom"].is_null())
+            })
+            .or(raw_3fr)
     } else {
         rows.iter()
             .find(|r| !crate::media::is_video(std::path::Path::new(&r.1)))
@@ -1010,15 +1013,48 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn hasselblad_requires_non_generated_heif() -> Result<()> {
+    fn hasselblad_prefers_non_generated_heif() -> Result<()> {
         let (_dir, s, id) = setup()?;
-        add_version(&s, &id, "photo.3FR", 100, false)?;
-        add_version(&s, &id, "photo-generated.heic", 1000, true)?;
-        s.store.initialize_negative("lib", &id)?;
-        assert!(s.store.edit_state("lib", &id)?["negativeContentHash"].is_null());
+        add_version(&s, &id, "photo.3FR", 1000, false)?;
+        add_version(&s, &id, "photo-generated.heic", 2000, true)?;
         let heif = add_version(&s, &id, "photo.HIF", 200, false)?;
         s.store.initialize_negative("lib", &id)?;
         assert_eq!(s.store.edit_state("lib", &id)?["negativeContentHash"], heif);
+        Ok(())
+    }
+    #[test]
+    fn hasselblad_unbound_negative_uses_raw_without_available_external_heif() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let raw = add_version(&s, &id, "photo.3FR", 100, false)?;
+        add_version(&s, &id, "photo-generated.heic", 1000, true)?;
+        let missing = add_version(&s, &id, "photo-missing.HIF", 200, false)?;
+        s.store.lock()?.execute(
+            "UPDATE catalog_version_paths SET available=0 WHERE content_hash=?",
+            params![missing],
+        )?;
+        // Old selection left RAW-only Hasselblad groups unbound; normal indexing repairs them.
+        assert!(s.store.edit_state("lib", &id)?["negativeContentHash"].is_null());
+        s.store.initialize_negative("lib", &id)?;
+        assert_eq!(s.store.edit_state("lib", &id)?["negativeContentHash"], raw);
+        add_version(&s, &id, "photo-new.HIF", 200, false)?;
+        s.store.initialize_negative("lib", &id)?;
+        assert_eq!(s.store.edit_state("lib", &id)?["negativeContentHash"], raw);
+        Ok(())
+    }
+    #[test]
+    fn hasselblad_does_not_rebind_user_selected_negative() -> Result<()> {
+        let (_dir, s, id) = setup()?;
+        let raw = add_version(&s, &id, "photo.3FR", 100, false)?;
+        add_version(&s, &id, "photo.HIF", 200, false)?;
+        mutate(
+            &s,
+            "lib",
+            &id,
+            json!({"requestID":uuid::Uuid::new_v4().to_string(),"expectedRevision":0,"contentHash":raw}),
+            "negative",
+        )?;
+        s.store.initialize_negative("lib", &id)?;
+        assert_eq!(s.store.edit_state("lib", &id)?["negativeContentHash"], raw);
         Ok(())
     }
     #[test]
