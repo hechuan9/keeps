@@ -530,7 +530,8 @@ impl Manager {
         let lib = &self.app.library_id;
         let tx = target.transaction()?;
         let mut paths = source.prepare(
-            "SELECT path FROM catalog_paths WHERE library_id=? AND asset_id=? ORDER BY path",
+            // ORDER BY otherwise makes SQLite scan every path in the library for each asset.
+            "SELECT path FROM catalog_paths INDEXED BY catalog_paths_asset WHERE library_id=? AND asset_id=? ORDER BY path",
         )?;
         let mut thumbnails = Vec::new();
         let selection = if status.from_revision.is_some() {
