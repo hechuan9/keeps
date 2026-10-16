@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import uuid
 
 VAR = Path('/var/packages/KeepsNativeProbe/var')
 CONTROLLER = '/usr/syno/bin/synopkg'
@@ -135,6 +136,19 @@ def validate_backup(temp):
     return source, manifest
 
 
+def reset_replica_generation(path):
+    with closing(sqlite3.connect(str(path))) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='catalog_sync_state'").fetchone():
+            return
+        # A restored revision can equal a phone's cursor while describing different data.
+        with db:
+            libraries = db.execute('SELECT library_id FROM catalog_sync_state').fetchall()
+            for (library,) in libraries:
+                db.execute("UPDATE catalog_sync_state SET generation=?, floor=coalesce((SELECT revision FROM catalog_version_revision WHERE library_id=?),0) WHERE library_id=?",
+                           (str(uuid.uuid4()), library, library))
+            db.execute('DELETE FROM catalog_replicas')
+
+
 def inherit_owner(path, reference):
     owner = reference.stat()
     os.chown(str(path), owner.st_uid, owner.st_gid)
@@ -166,6 +180,8 @@ def import_state(temp):
             inherit_owner(target.parent, root)
         staged = target.with_suffix('.restore')
         backup_db(source / name, staged)
+        if name == DATABASES[0]:
+            reset_replica_generation(staged)
         staged.chmod(0o600)
         inherit_owner(staged, target if target.exists() else target.parent)
         for suffix in ('-wal', '-shm'):

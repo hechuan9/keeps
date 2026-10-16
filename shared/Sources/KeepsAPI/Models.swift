@@ -98,12 +98,14 @@ public struct KeepsAssetPage: Codable, Sendable {
 }
 
 public struct KeepsCatalogRevision: Decodable, Equatable, Sendable {
+    public var generation: String? = nil
     public var revision: Int64
     public var isUpdating: Bool
     public var path: String?
     public var children: [KeepsDirectoryRevision]?
 
-    public init(revision: Int64, isUpdating: Bool, path: String? = nil, children: [KeepsDirectoryRevision]? = nil) {
+    public init(revision: Int64, isUpdating: Bool, path: String? = nil, children: [KeepsDirectoryRevision]? = nil, generation: String? = nil) {
+        self.generation = generation
         self.revision = revision
         self.isUpdating = isUpdating
         self.path = path

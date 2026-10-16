@@ -215,6 +215,14 @@ struct IOSRootView: View {
 
     private func galleryPage(route: IOSCollectionRoute? = nil) -> some View {
         return VStack(spacing: 0) {
+            if let error = library.syncError {
+                HStack {
+                    Text("同步失败，正在显示本地图库").font(.caption)
+                        .accessibilityHint(error)
+                    Spacer()
+                    Button("重试") { Task { await library.synchronize() } }
+                }.padding(8).background(.thinMaterial)
+            }
             ZStack {
                 if library.configuration == nil {
                     ContentUnavailableView("连接 NAS 图库", systemImage: "externaldrive", description: Text("在连接设置中填写服务地址和访问令牌。"))

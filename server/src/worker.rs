@@ -47,15 +47,32 @@ fn run_claimed(
     stop: &AtomicBool,
 ) -> Result<()> {
     jobs.set_phase(&job.id, "scanning")?;
-    let result = run_slice(store, jobs, previews, job, stop, 1).and_then(|done| {
-        if done && !stop.load(Ordering::Relaxed) {
-            jobs.set_phase(&job.id, "publishing")?;
-            store.finish_revision_batch(&job.id, false)?;
+    let mut result = run_slice(store, jobs, previews, job, stop, 1);
+    let terminal = !matches!(result, Ok(false))
+        || stop.load(Ordering::Relaxed)
+        || jobs
+            .job(&job.id)?
+            .is_some_and(|job| !matches!(job.status.as_str(), "pending" | "running"));
+    if terminal {
+        let publication = (|| -> Result<()> {
+            if matches!(result, Ok(true)) && !stop.load(Ordering::Relaxed) {
+                jobs.set_phase(&job.id, "publishing")?;
+            }
+            let _directory_guard = jobs.directory_mutation.write().unwrap();
+            crate::sync_navigation::refresh(store, jobs, &job.library_id)?;
+            store.finish_revision_batch(&job.id, false)
+        })();
+        if let Err(error) = publication {
+            result = Err(match result {
+                Err(original) => {
+                    original.context(format!("publish directory projection: {error:#}"))
+                }
+                Ok(_) => error,
+            });
         }
-        Ok(done)
-    });
+    }
     if stop.load(Ordering::Relaxed) {
-        return Ok(());
+        return result.map(|_| ());
     }
     match result {
         Ok(true) => {
@@ -425,7 +442,11 @@ fn process_photo(
         for id in assets {
             store.initialize_negative(&job.library_id, &id)?;
             if job.work_class == "manual" && (job.refresh_metadata || job.scope_kind == "file") {
-                store.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
+                let mut db = store.lock()?;
+                let tx = db.transaction()?;
+                tx.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
+                crate::revisions::flush(&tx)?;
+                tx.commit()?;
             }
             jobs.set_phase(&job.id, "media")?;
             crate::cache_pipeline::process_asset(store, jobs, previews, &job.library_id, &id)?;
@@ -1096,6 +1117,55 @@ mod tests {
                 store.catalog_revision("library", None, false)?["isUpdating"],
                 false
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_scan_publishes_new_directories_after_failure_cancel_or_shutdown() -> Result<()> {
+        for outcome in ["failed", "cancelled", "shutdown"] {
+            let fixture = tempfile::tempdir()?;
+            let originals = fixture.path().join("originals");
+            fs::create_dir(&originals)?;
+            let jobs = Jobs::open(&fixture.path().join("jobs.sqlite"), &originals)?;
+            let store = Store::open(&fixture.path().join("catalog.sqlite"), true)?;
+            let previews = PreviewStorage::new(
+                &fixture.path().join("keeps"),
+                Some(&originals),
+                "http://localhost:2283",
+                "test-key",
+            )?;
+            let folder = jobs.add_folder("library", ".")?;
+            crate::sync_navigation::refresh(&store, &jobs, "library")?;
+            let child = jobs.root().join("discovered");
+            fs::create_dir(&child)?;
+            jobs.enqueue_scan(&folder.id)?;
+            let job = jobs.claim_next()?.unwrap();
+            if outcome == "cancelled" {
+                jobs.db
+                    .lock()
+                    .unwrap()
+                    .execute("UPDATE jobs SET status='cancelled' WHERE id=?", [&job.id])?;
+            } else if outcome == "failed" {
+                jobs.db.lock().unwrap().execute(
+                    "UPDATE jobs SET scope_path=?1 WHERE id=?2",
+                    rusqlite::params![fixture.path().join("outside").to_str(), job.id],
+                )?;
+            }
+            run_claimed(
+                &store,
+                &jobs,
+                &previews,
+                &job,
+                &AtomicBool::new(outcome == "shutdown"),
+            )?;
+            assert!(
+                crate::sync_navigation::pages(&store.read()?, "library")?
+                    .contains_key(child.to_str().unwrap())
+            );
+            if outcome != "shutdown" {
+                assert_eq!(jobs.job(&job.id)?.unwrap().status, outcome);
+            }
         }
         Ok(())
     }

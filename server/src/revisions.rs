@@ -230,6 +230,11 @@ fn flush_at(db: &Connection, batch: Option<&str>, now: i64) -> Result<()> {
                 assets.insert((lib, key));
             }
             "path" => file_ancestors(paths, &key),
+            "navigation" => {
+                if !key.is_empty() {
+                    ancestors(paths, &key);
+                }
+            }
             "hidden" => {
                 ancestors(paths, &key);
                 let root = key.trim_end_matches('/');
@@ -247,18 +252,19 @@ fn flush_at(db: &Connection, batch: Option<&str>, now: i64) -> Result<()> {
         }
     }
     let mut statement = db.prepare_cached("SELECT path FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 UNION SELECT path FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2")?;
-    for (lib, id) in assets {
-        let paths = libraries.get_mut(&lib).context("missing changed library")?;
+    for (lib, id) in &assets {
+        let paths = libraries.get_mut(lib).context("missing changed library")?;
         for path in statement.query_map(params![lib, id], |r| r.get::<_, String>(0))? {
             file_ancestors(paths, &path?);
         }
     }
     for (lib, mut paths) in libraries {
         paths.insert(String::new()); // The empty scope is the library, separate from filesystem /.
+        publish(db, &lib, &paths)?;
+        crate::replicas::record_changes(db, &lib, &assets, now)?;
         if let Some(batch) = batch {
             record_activity(db, &lib, &paths, batch, now)?;
         } else {
-            publish(db, &lib, &paths)?;
             let mut statement = db.prepare_cached("UPDATE catalog_revision_updates SET last_changed_at=max(last_changed_at,?) WHERE library_id=? AND path=?")?;
             for path in paths {
                 statement.execute(params![now, lib, path])?;
@@ -273,7 +279,7 @@ fn publish(db: &Connection, lib: &str, paths: &BTreeSet<String>) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
     }
-    // The allocator must advance for a new child even while its parent's visible version is held.
+    // All changed scopes share the same transaction publication.
     let revision: i64 = db.query_row("INSERT INTO catalog_revision_sequence VALUES(?1,coalesce((SELECT revision FROM catalog_version_revision WHERE library_id=?1),0)+1)
         ON CONFLICT(library_id) DO UPDATE SET value=max(value,excluded.value-1)+1 RETURNING value", [lib], |r| r.get(0))?;
     if paths.contains("") {
@@ -301,19 +307,15 @@ fn record_activity(
     now: i64,
 ) -> Result<()> {
     ensure!(!owner.is_empty(), "revision batch ID must not be empty");
-    let mut newly_updating = BTreeSet::new();
-    let mut check = db.prepare_cached(UPDATING)?;
+
     let mut touch = db.prepare_cached("INSERT INTO catalog_revision_updates VALUES(?,?,?,?) ON CONFLICT(library_id,path,owner) DO UPDATE SET last_changed_at=max(last_changed_at,excluded.last_changed_at)")?;
     for path in paths {
-        if !check.query_row(params![lib, path], |r| r.get::<_, bool>(0))? {
-            newly_updating.insert(path.clone());
-        }
         touch.execute(params![lib, path, owner, now])?;
     }
-    publish(db, lib, &newly_updating)
+    Ok(())
 }
 
-fn publish_stable(
+fn stable_scope_count(
     db: &Connection,
     candidates: BTreeMap<String, BTreeSet<String>>,
 ) -> Result<usize> {
@@ -327,7 +329,6 @@ fn publish_stable(
             }
         }
         count += stable.len();
-        publish(db, &lib, &stable)?;
     }
     Ok(count)
 }
@@ -359,7 +360,7 @@ fn finish_batch(db: &Connection, owner: &str, wait_for_quiet: bool) -> Result<()
             candidates.entry(lib).or_default().insert(path);
         }
     }
-    publish_stable(db, candidates)?;
+    stable_scope_count(db, candidates)?;
     Ok(())
 }
 
@@ -376,7 +377,7 @@ fn settle_at(db: &Connection, now: i64) -> Result<usize> {
     for (lib, path) in rows {
         candidates.entry(lib).or_default().insert(path);
     }
-    publish_stable(db, candidates)
+    stable_scope_count(db, candidates)
 }
 
 pub(crate) fn read(db: &Connection, lib: &str, path: Option<&str>) -> Result<i64> {
@@ -445,8 +446,8 @@ impl Store {
         let path = path.map(normalize_directory).transpose()?;
         let mut connection = self.read()?;
         let db = connection.transaction()?;
-        let mut result =
-            json!({"revision":read(&db, lib, path)?, "isUpdating":is_updating(&db, lib, path)?});
+        let generation = crate::replicas::state(&db, lib)?.map(|s| s.0);
+        let mut result = json!({"revision":read(&db, lib, path)?, "generation":generation, "isUpdating":is_updating(&db, lib, path)?});
         if let Some(path) = path {
             result["path"] = json!(path);
         }
@@ -467,7 +468,7 @@ impl Store {
 
 #[cfg(test)]
 pub(crate) fn remove_schema(db: &Connection) -> Result<()> {
-    let triggers = db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'catalog_revision_%'")?
+    let triggers = db.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND (name LIKE 'catalog_revision_%' OR name LIKE 'catalog_sync_%')")?
         .query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for trigger in triggers {
         db.execute_batch(&format!("DROP TRIGGER {trigger}"))?;
@@ -519,8 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_changes_hold_versions_until_fifteen_minutes_after_last_real_change() -> Result<()>
-    {
+    fn continuous_changes_publish_precise_versions_while_activity_is_independent() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let id = seed(&store, "lib", "/photos/summer/a.jpg")?;
@@ -529,7 +529,7 @@ mod tests {
         let sibling = revision(&store, "lib", Some("/photos/winter"))?;
         note_at(&store, "external", "/photos/summer", 100)?;
         let started = revision(&store, "lib", None)?;
-        assert_eq!(started, initial + 1);
+        assert_eq!(started, initial);
         note_at(&store, "external", "/photos/summer", 200)?;
         {
             let mut connection = store.lock()?;
@@ -538,7 +538,7 @@ mod tests {
             flush_at(&db, Some("external"), 250)?;
             db.commit()?;
         }
-        assert_eq!(revision(&store, "lib", None)?, started);
+        assert_eq!(revision(&store, "lib", None)?, started + 1);
         let page = store.query_assets(
             "lib",
             &AssetQuery {
@@ -546,7 +546,7 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        assert_eq!(page["revision"], started);
+        assert_eq!(page["revision"], started + 1);
         assert_eq!(page["isUpdating"], true);
         assert_eq!(page["items"][0]["rating"], 3);
         store.finish_revision_batch("external", true)?;
@@ -566,7 +566,7 @@ mod tests {
         assert_eq!(revision(&store, "lib", Some("/photos/winter"))?, sibling);
         assert_eq!(settle(&store, 2000)?, 0);
         note_at(&store, "next-burst", "/photos/summer", 2001)?;
-        assert_eq!(revision(&store, "lib", None)?, started + 2);
+        assert_eq!(revision(&store, "lib", None)?, started + 1);
         assert_eq!(store.library_revision("lib")?["isUpdating"], true);
         Ok(())
     }
@@ -582,7 +582,7 @@ mod tests {
         let root = revision(&store, "lib", None)?;
         note_at(&store, "job-b", "/photos/b", 200)?;
         assert_eq!(revision(&store, "lib", None)?, root);
-        assert!(revision(&store, "lib", Some("/photos/b"))? > root);
+        assert_eq!(revision(&store, "lib", Some("/photos/b"))?, root);
         store.finish_revision_batch("job-b", false)?;
         let stable_b = revision(&store, "lib", Some("/photos/b"))?;
         assert_eq!(
@@ -597,11 +597,11 @@ mod tests {
         assert_eq!(store.library_revision("lib")?["isUpdating"], true);
         assert_eq!(revision(&store, "lib", Some("/photos/b"))?, stable_b);
         store.finish_revision_batch("job-a", false)?;
-        assert_eq!(revision(&store, "lib", None)?, foreground + 1);
+        assert_eq!(revision(&store, "lib", None)?, foreground);
         assert_eq!(store.library_revision("lib")?["isUpdating"], false);
         assert_eq!(revision(&store, "lib", Some("/photos/b"))?, stable_b);
         store.finish_revision_batch("job-a", false)?;
-        assert_eq!(revision(&store, "lib", None)?, foreground + 1);
+        assert_eq!(revision(&store, "lib", None)?, foreground);
         Ok(())
     }
 
@@ -629,7 +629,7 @@ mod tests {
         assert_eq!(settle(&store, 1099)?, 0);
         assert_eq!(settle(&store, 1100)?, 4);
         assert_eq!(store.library_revision("lib")?["isUpdating"], false);
-        assert_eq!(revision(&store, "lib", None)?, started + 1);
+        assert_eq!(revision(&store, "lib", None)?, started);
         Ok(())
     }
 
@@ -654,9 +654,9 @@ mod tests {
         let preview = json!({"assetID":id,"role":"preview","fileObject":{"contentHash":"preview-hash","sizeBytes":100,"role":"preview"},"objectRef":{"bucket":"previews","key":"a.jpg"},"pixelSize":{"width":100,"height":100}});
         store.declare_preview_with_revision("lib", &id, Some("hash"), &preview, Some("scan"))?;
         store.mark_missing_under_with_revision("lib", directory.to_str().unwrap(), Some("scan"))?;
-        assert_eq!(revision(&store, "lib", None)?, started);
+        assert_eq!(revision(&store, "lib", None)?, started + 2);
         store.finish_revision_batch("scan", false)?;
-        assert_eq!(revision(&store, "lib", None)?, started + 1);
+        assert_eq!(revision(&store, "lib", None)?, started + 2);
         assert_eq!(store.library_revision("lib")?["isUpdating"], false);
         Ok(())
     }
@@ -692,7 +692,7 @@ mod tests {
             false
         );
         note_at(&store, "after-upgrade", "/photos", 200)?;
-        assert_eq!(revision(&store, "lib", None)?, old + 2);
+        assert_eq!(revision(&store, "lib", None)?, old + 1);
         Ok(())
     }
 
@@ -737,7 +737,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                18
+                19
             );
             assert_eq!(
                 db.query_row(

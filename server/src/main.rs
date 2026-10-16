@@ -84,6 +84,15 @@ async fn main() -> Result<()> {
             jobs.add_folder(&library, ".")?;
         }
     }
+    for library in jobs
+        .folders()?
+        .into_iter()
+        .map(|folder| folder.library_id)
+        .chain(std::iter::once(library_id.clone()))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        keeps_server::sync_navigation::refresh(&store, &jobs, &library)?;
+    }
     MediaProcessor::new().probe().context("NAS media runtime")?;
     let address = env::var("KEEPS_LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:2283".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;

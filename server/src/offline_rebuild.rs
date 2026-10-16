@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
     fs,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path as FsPath, PathBuf},
@@ -50,15 +49,31 @@ struct Status {
     created_at: i64,
     #[serde(default = "yes")]
     include_thumbnails: bool,
+    #[serde(default)]
+    request: SyncRequest,
+    #[serde(default)]
+    from_revision: Option<i64>,
+    #[serde(default)]
+    generation: Option<String>,
     #[serde(skip)]
     last_progress_save: Option<Instant>,
 }
 fn yes() -> bool {
     true
 }
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncRequest {
+    #[serde(rename = "replicaID")]
+    replica_id: Option<Uuid>,
+    generation: Option<Uuid>,
+    since_revision: Option<i64>,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BuildRequest {
+    #[serde(flatten)]
+    sync: SyncRequest,
     #[serde(default = "yes")]
     include_thumbnails: bool,
 }
@@ -79,6 +94,7 @@ pub fn router(app: Arc<AppState>) -> Router<Arc<AppState>> {
         initialized: Mutex::new(false),
     });
     Router::new()
+        .route("/libraries/{library}/replicas/{replica}/ack", post(ack))
         .route("/libraries/{library}/offline-rebuild", post(start))
         .route("/libraries/{library}/offline-rebuild/{id}", get(status))
         .route(
@@ -142,17 +158,38 @@ impl Manager {
                         .into(),
                 );
                 self.save(&status)?;
+                for artifact in fs::read_dir(entry.path())? {
+                    let artifact = artifact?;
+                    if artifact.file_name() == "status.json" {
+                        continue;
+                    }
+                    if artifact.file_type()?.is_dir() {
+                        fs::remove_dir_all(artifact.path())?;
+                    } else {
+                        fs::remove_file(artifact.path())?;
+                    }
+                }
             }
         }
         *initialized = true;
         Ok(())
     }
+    #[cfg(test)]
     fn begin(self: &Arc<Self>, include_thumbnails: bool) -> Result<Status> {
+        self.begin_request(include_thumbnails, SyncRequest::default())
+    }
+    fn begin_request(
+        self: &Arc<Self>,
+        include_thumbnails: bool,
+        request: SyncRequest,
+    ) -> Result<Status> {
         let mut initialized = self
             .initialized
             .lock()
             .map_err(|_| anyhow::anyhow!("offline rebuild mutex poisoned"))?;
         self.initialize(&mut initialized)?;
+        let mut previous = Vec::new();
+        let mut building = 0;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -164,14 +201,38 @@ impl Manager {
             }
             let status = self.load(&name)?;
             if status.state == "building" {
-                if status.include_thumbnails == include_thumbnails {
+                building += 1;
+                if status.include_thumbnails == include_thumbnails && status.request == request {
                     return Ok(status);
+                }
+                if request.replica_id.is_some() && status.request.replica_id == request.replica_id {
+                    return Err(StoreError {
+                        status: 409,
+                        code: "replica_sync_in_progress".into(),
+                        message: "replica already has an unfinished sync package".into(),
+                    }
+                    .into());
                 }
                 continue;
             }
             if chrono::Utc::now().timestamp() - status.created_at > RETENTION_SECONDS {
                 fs::remove_dir_all(entry.path()).context("remove expired offline export")?;
+            } else if status.request.replica_id == request.replica_id {
+                previous.push((status.created_at, entry.path()));
             }
+        }
+        previous.sort();
+        let obsolete = previous.len().saturating_sub(1);
+        for (_, path) in previous.into_iter().take(obsolete) {
+            fs::remove_dir_all(path).context("remove superseded offline export")?;
+        }
+        if building >= 4 {
+            return Err(StoreError {
+                status: 409,
+                code: "sync_capacity_busy".into(),
+                message: "four sync packages are already building".into(),
+            }
+            .into());
         }
         let status = Status {
             id: Uuid::new_v4().to_string(),
@@ -185,6 +246,9 @@ impl Manager {
             error: None,
             created_at: chrono::Utc::now().timestamp(),
             include_thumbnails,
+            request,
+            from_revision: None,
+            generation: None,
             last_progress_save: None,
         };
         self.save(&status)?;
@@ -203,13 +267,53 @@ impl Manager {
         })?;
         Ok(status)
     }
+    fn remove_acknowledged_packages(&self, replica: Uuid, revision: i64) -> Result<()> {
+        let _guard = self
+            .initialized
+            .lock()
+            .map_err(|_| anyhow::anyhow!("offline rebuild mutex poisoned"))?;
+        if !self.root.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if Uuid::parse_str(&name).is_err() {
+                continue;
+            }
+            let status = self.load(&name)?;
+            if status.request.replica_id == Some(replica)
+                && status.state != "building"
+                && status.revision.is_some_and(|r| r <= revision)
+            {
+                fs::remove_dir_all(entry.path()).context("remove acknowledged sync package")?;
+            }
+        }
+        Ok(())
+    }
     fn read_status(&self, id: &str) -> Result<Status> {
         let mut initialized = self
             .initialized
             .lock()
             .map_err(|_| anyhow::anyhow!("offline rebuild mutex poisoned"))?;
         self.initialize(&mut initialized)?;
-        self.load(id)
+        let status = self.load(id)?;
+        if status.request.replica_id.is_some() && status.state == "ready" {
+            let db = self.app.store.read()?;
+            let current = crate::replicas::state(&db, &self.app.library_id)?.map(|s| s.0);
+            if current != status.generation {
+                return Err(StoreError {
+                    status: 410,
+                    code: "replica_rebuild_required".into(),
+                    message: "sync package belongs to an obsolete library generation".into(),
+                }
+                .into());
+            }
+        }
+        Ok(status)
     }
     fn progress(&self, status: &mut Status, phase: &str, completed: i64, total: i64) -> Result<()> {
         let phase_changed = status.phase != phase;
@@ -231,15 +335,58 @@ impl Manager {
         let dir = self.directory(&status.id)?;
         let work = tempfile::tempdir_in(&dir)?;
         let source_path = {
-            let db = self.app.store.lock()?;
+            let mut db = self.app.store.lock()?;
+            let tx = db.transaction()?;
+            crate::replicas::initialize(&tx, &self.app.library_id)?;
+            crate::replicas::prune(&tx, &self.app.library_id, chrono::Utc::now().timestamp())?;
+            tx.commit()?;
             PathBuf::from(db.path().context("catalog must be a file")?)
         };
         let source = Connection::open_with_flags(source_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         source.busy_timeout(Duration::from_secs(30))?;
+        let navigation_guard = self
+            .app
+            .jobs
+            .directory_mutation
+            .read()
+            .map_err(|_| anyhow::anyhow!("directory mutation lock poisoned"))?;
+        crate::directory_move::ensure_reconciled(&self.app.jobs)?;
+        crate::directory_trash::ensure_reconciled(&self.app.jobs)?;
         let revision = pin_read_snapshot(&source, &self.app.library_id)?;
-        let mut frozen = Connection::open(work.path().join("source.sqlite"))?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut frozen)?;
+        drop(navigation_guard);
+        let generation = crate::replicas::state(&source, &self.app.library_id)?
+            .context("sync state")?
+            .0;
+        status.generation = Some(generation.clone());
+        status.from_revision = match (
+            &status.request.replica_id,
+            &status.request.generation,
+            status.request.since_revision,
+        ) {
+            (Some(replica), Some(generation), Some(since))
+                if crate::replicas::can_delta(
+                    &source,
+                    &self.app.library_id,
+                    &replica.to_string(),
+                    &generation.to_string(),
+                    since,
+                    chrono::Utc::now().timestamp(),
+                )? =>
+            {
+                Some(since)
+            }
+            _ => None,
+        };
+        if status.from_revision.is_some() {
+            status.include_thumbnails = false;
+        }
+        let mut frozen = if status.from_revision.is_none() {
+            Some(Connection::open(work.path().join("source.sqlite"))?)
+        } else {
+            None
+        };
+        if let Some(frozen) = frozen.as_mut() {
+            let backup = rusqlite::backup::Backup::new(&source, frozen)?;
             loop {
                 let step = backup.step(2048)?;
                 let progress = backup.progress();
@@ -256,18 +403,34 @@ impl Manager {
                 }
             }
         }
-        source.execute_batch("ROLLBACK")?;
-        drop(source);
+        if frozen.is_some() {
+            source.execute_batch("ROLLBACK")?;
+        }
+        let export = frozen.as_ref().unwrap_or(&source);
         let lib = &self.app.library_id;
         status.revision = Some(revision);
-        let total:i64=frozen.query_row("SELECT count(*) FROM catalog_assets a WHERE library_id=? AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id)",[lib],|r|r.get(0))?;
+        let total:i64=export.query_row("SELECT count(*) FROM catalog_assets a WHERE library_id=? AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id)",[lib],|r|r.get(0))?;
         self.progress(status, "catalog", 0, total)?;
         let mut target = Connection::open(work.path().join("catalog.sqlite"))?;
         target.execute_batch(CLIENT_SCHEMA)?;
-        let thumbnails = self.catalog(&frozen, &mut target, status)?;
+        let thumbnails = self.catalog(export, &mut target, status)?;
         let mut manifest = json!({"formatVersion":1,"libraryID":lib,"revision":revision,"assetCount":total,"thumbnailCount":total,"missingThumbnailCount":total,"browseThumbnailCount":total,"missingBrowseThumbnailCount":total});
+        if status.request.replica_id.is_some() {
+            manifest["formatVersion"] = json!(2);
+            manifest["mode"] = json!(if status.from_revision.is_some() {
+                "delta"
+            } else {
+                "snapshot"
+            });
+            manifest["generation"] = json!(generation);
+            manifest["fromRevision"] = json!(status.from_revision);
+        }
         drop(target);
         drop(frozen);
+        if !source.is_autocommit() {
+            source.execute_batch("ROLLBACK")?;
+        }
+        drop(source);
         let archive_total = fs::metadata(work.path().join("catalog.sqlite"))?.len()
             + thumbnails
                 .iter()
@@ -341,6 +504,19 @@ impl Manager {
         status.sha256 = Some(format!("{:x}", hash.finalize()));
         status.byte_count = Some(length as i64);
         fs::rename(work.path().join("library.tar"), dir.join("library.tar"))?;
+        if let Some(replica) = &status.request.replica_id {
+            let mut db = self.app.store.lock()?;
+            let tx = db.transaction()?;
+            crate::replicas::delivered(
+                &tx,
+                lib,
+                &replica.to_string(),
+                &generation,
+                revision,
+                chrono::Utc::now().timestamp(),
+            )?;
+            tx.commit()?;
+        }
         status.state = "ready".into();
         self.progress(status, "ready", length as i64, length as i64)?;
         Ok(())
@@ -353,23 +529,22 @@ impl Manager {
     ) -> Result<Vec<(&'static str, String, PathBuf)>> {
         let lib = &self.app.library_id;
         let tx = target.transaction()?;
-        let mut paths = BTreeMap::<String, Vec<String>>::new();
-        let mut statement = source.prepare(
-            "SELECT asset_id,path FROM catalog_paths WHERE library_id=? ORDER BY asset_id,path",
+        let mut paths = source.prepare(
+            "SELECT path FROM catalog_paths WHERE library_id=? AND asset_id=? ORDER BY path",
         )?;
-        for row in statement.query_map([lib], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })? {
-            let (id, path) = row?;
-            paths.entry(id).or_default().push(path);
-        }
         let mut thumbnails = Vec::new();
-        let mut statement=source.prepare("SELECT a.id,a.snapshot,coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) ORDER BY a.id")?;
+        let selection = if status.from_revision.is_some() {
+            "a.id IN (SELECT asset_id FROM catalog_sync_assets WHERE library_id=?1 AND revision>?4 AND deleted=0)"
+        } else {
+            "?4 IS NULL"
+        };
+        let mut statement=source.prepare(&format!("SELECT a.id,a.snapshot,coalesce(e.thumbnail,c.thumbnail),coalesce(e.standard,c.standard),coalesce(e.browse,CASE WHEN c.browse_source_version=json_extract(c.thumbnail,'$.version') AND c.browse_spec=?3 AND json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion')=c.browse_source_version AND json_extract(c.browse_thumbnail,'$.spec')=c.browse_spec THEN c.browse_thumbnail END),a.negative_hash FROM catalog_assets a LEFT JOIN photo_edits e ON e.library_id=a.library_id AND e.asset_id=a.id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id LEFT JOIN media_cache c ON c.library_id=a.library_id AND c.asset_id=a.id AND c.status='ready' AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.spec=?2 WHERE a.library_id=?1 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id) AND {selection} ORDER BY a.id"))?;
         let rows = statement.query_map(
             params![
                 lib,
                 crate::cache_pipeline::spec()?,
-                crate::browse_cache::SPEC
+                crate::browse_cache::SPEC,
+                status.from_revision
             ],
             |r| {
                 Ok((
@@ -386,7 +561,9 @@ impl Manager {
             let (id, snapshot, thumbnail, standard, browse, negative) = row?;
             let mut asset: Value = serde_json::from_str(&snapshot)?;
             let upper = Uuid::parse_str(&id)?.to_string().to_uppercase();
-            let asset_paths = paths.remove(&id).unwrap_or_default();
+            let asset_paths = paths
+                .query_map(params![lib, id], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             asset["id"] = json!(upper);
             asset["paths"] = json!(asset_paths);
             asset["negativeContentHash"] = json!(negative);
@@ -450,59 +627,56 @@ impl Manager {
             tx.execute("INSERT INTO hidden VALUES(?)", [path?])?;
         }
         self.progress(status, "navigation", 0, 1)?;
-        let mut pending = vec![None];
-        let mut visited = BTreeSet::new();
-        let mut completed = 0;
-        while let Some(path) = pending.pop() {
-            if !visited.insert(path.clone()) {
-                continue;
-            }
-            let mut navigation = crate::navigation::navigation(
-                &self.app.jobs,
-                lib,
-                path.as_deref(),
-                &self.app.original_root_names,
-            )?;
+        let mut pages = source.prepare(
+            "SELECT path,page_json FROM catalog_sync_navigation WHERE library_id=? ORDER BY path",
+        )?;
+        let mut root_seen = false;
+        for page in pages.query_map([lib], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })? {
+            let (path, page) = page?;
+            root_seen |= path.is_empty();
+            let mut navigation: Value = serde_json::from_str(&page)?;
             for child in navigation["directories"]
                 .as_array_mut()
                 .context("navigation directories")?
             {
-                let path = child["path"].as_str().context("directory path")?.to_owned();
-                let root = path.trim_end_matches('/');
-                let (direct, count):(i64,i64)=source.query_row("SELECT count(DISTINCT CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN p.asset_id END), count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0",params![lib,format!("{root}/"),format!("{root}0")],|r|Ok((r.get(0)?,r.get(1)?)))?;
+                let child_path = child["path"].as_str().context("directory path")?.to_owned();
+                if let Some(name) = self.app.original_root_names.get(FsPath::new(&child_path)) {
+                    child["name"] = json!(name);
+                }
+                let root = child_path.trim_end_matches('/');
+                let (direct,count):(i64,i64)=source.query_row("SELECT count(DISTINCT CASE WHEN instr(substr(p.path,length(?2)+1),'/')=0 THEN p.asset_id END),count(DISTINCT p.asset_id) FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND a.trashed=0",params![lib,format!("{root}/"),format!("{root}0")],|r|Ok((r.get(0)?,r.get(1)?)))?;
                 child["directPhotoCount"] = json!(direct);
                 child["photoCount"] = json!(count);
-                if child["hasChildren"].as_bool() == Some(true) {
-                    pending.push(Some(path));
-                } else {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO navigation VALUES(?,?)",
-                        params![
-                            path,
-                            serde_json::to_string(&json!({"path":path,"directories":[]}))?
-                        ],
-                    )?;
-                }
             }
             tx.execute(
-                "INSERT OR REPLACE INTO navigation VALUES(?,?)",
-                params![
-                    path.unwrap_or_default(),
-                    serde_json::to_string(&navigation)?
-                ],
-            )?;
-            completed += 1;
-            self.progress(
-                status,
-                "navigation",
-                completed,
-                completed + pending.len() as i64,
+                "INSERT INTO navigation VALUES(?,?)",
+                params![path, navigation.to_string()],
             )?;
         }
+        ensure!(root_seen, "mobile navigation projection is not initialized");
         tx.execute(
             "INSERT INTO metadata VALUES('revision',?)",
             [status.revision.context("snapshot revision")?.to_string()],
         )?;
+        if let Some(generation) = &status.generation {
+            tx.execute("INSERT INTO metadata VALUES('generation',?)", [generation])?;
+        }
+        if let Some(since) = status.from_revision {
+            tx.execute(
+                "INSERT INTO metadata VALUES('from_revision',?)",
+                [since.to_string()],
+            )?;
+            tx.execute_batch("CREATE TABLE deleted_assets(id TEXT PRIMARY KEY)")?;
+            let mut deleted=source.prepare("SELECT asset_id FROM catalog_sync_assets WHERE library_id=? AND revision>? AND deleted=1")?;
+            for id in deleted.query_map(params![lib, since], |r| r.get::<_, String>(0))? {
+                tx.execute(
+                    "INSERT INTO deleted_assets VALUES(?)",
+                    [Uuid::parse_str(&id?)?.to_string().to_uppercase()],
+                )?;
+            }
+        }
         tx.commit()?;
         Ok(thumbnails)
     }
@@ -572,14 +746,46 @@ fn append_file<W: Write, F: FnMut(usize) -> std::io::Result<()>>(
     tar.append_data(&mut header, name, ProgressReader { file, report })?;
     Ok(())
 }
+#[derive(Deserialize)]
+struct Acknowledgement {
+    generation: Uuid,
+    revision: i64,
+}
+async fn ack(
+    State(manager): State<Arc<Manager>>,
+    Path((_library, replica)): Path<(String, Uuid)>,
+    Json(request): Json<Acknowledgement>,
+) -> Result<Response, ApiError> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut db = manager.app.store.lock()?;
+        let tx = db.transaction()?;
+        crate::replicas::acknowledge(
+            &tx,
+            &manager.app.library_id,
+            &replica.to_string(),
+            &request.generation.to_string(),
+            request.revision,
+            chrono::Utc::now().timestamp(),
+        )?;
+        tx.commit()?;
+        drop(db);
+        manager.remove_acknowledged_packages(replica, request.revision)?;
+        Ok(())
+    })
+    .await
+    .map_err(anyhow::Error::from)??;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
 async fn start(
     State(manager): State<Arc<Manager>>,
     Json(request): Json<BuildRequest>,
 ) -> Result<Response, ApiError> {
     Ok(Json(
-        tokio::task::spawn_blocking(move || manager.begin(request.include_thumbnails))
-            .await
-            .map_err(anyhow::Error::from)??,
+        tokio::task::spawn_blocking(move || {
+            manager.begin_request(request.include_thumbnails, request.sync)
+        })
+        .await
+        .map_err(anyhow::Error::from)??,
     )
     .into_response())
 }
@@ -737,6 +943,7 @@ mod tests {
         app.store.ingest_original("photos",path.to_str().unwrap(),&json!({"contentHash":name,"sizeBytes":20,"role":"jpeg_original"}),&json!({"captureTime":"2024-01-01T00:00:00Z","cameraMake":"Canon","cameraModel":"R3","lensModel":"50mm","originalFilename":name,"contentFingerprint":name,"metadataFingerprint":name,"rating":2,"flagState":"picked","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})).unwrap()
     }
     fn manager(app: Arc<AppState>) -> Manager {
+        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id).unwrap();
         Manager {
             root: app
                 .previews
@@ -760,9 +967,281 @@ mod tests {
             error: None,
             created_at: chrono::Utc::now().timestamp(),
             include_thumbnails: true,
+            request: SyncRequest::default(),
+            from_revision: None,
+            generation: None,
             last_progress_save: None,
         }
     }
+    fn unpack_catalog(
+        manager: &Manager,
+        status: &Status,
+        target: &FsPath,
+    ) -> Result<(Value, Connection)> {
+        fs::create_dir_all(target)?;
+        tar::Archive::new(fs::File::open(
+            manager.directory(&status.id)?.join("library.tar"),
+        )?)
+        .unpack(target)?;
+        let manifest = serde_json::from_reader(fs::File::open(target.join("manifest.json"))?)?;
+        Ok((manifest, Connection::open(target.join("catalog.sqlite"))?))
+    }
+
+    #[test]
+    fn delta_replaces_merged_assets_paths_and_rules_and_matches_full_snapshot() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = fixture(root.path());
+        app.jobs.add_folder(
+            "photos",
+            root.path()
+                .join("originals")
+                .canonicalize()?
+                .to_str()
+                .unwrap(),
+        )?;
+        let retained = seed(&app, root.path(), "B0014325.HEIC");
+        let removed = seed(&app, root.path(), "other.3FR");
+        let unchanged = seed(&app, root.path(), "unchanged.jpg");
+        let manager = manager(app.clone());
+        let replica = Uuid::new_v4();
+        let mut initial = fresh();
+        initial.request.replica_id = Some(replica);
+        initial.include_thumbnails = false;
+        manager.save(&initial)?;
+        manager.build(&mut initial)?;
+        let (first, mut local) = unpack_catalog(&manager, &initial, &root.path().join("initial"))?;
+        assert_eq!(first["mode"], "snapshot");
+        let generation = initial.generation.clone().unwrap();
+        let since = initial.revision.unwrap();
+        {
+            let mut db = app.store.lock()?;
+            let tx = db.transaction()?;
+            crate::replicas::acknowledge(
+                &tx,
+                "photos",
+                &replica.to_string(),
+                &generation,
+                since,
+                chrono::Utc::now().timestamp(),
+            )?;
+            tx.execute(
+                "UPDATE catalog_paths SET asset_id=? WHERE asset_id=?",
+                params![retained, removed],
+            )?;
+            tx.execute("DELETE FROM catalog_assets WHERE id=?", [&removed])?;
+            crate::revisions::flush(&tx)?;
+            tx.commit()?;
+        }
+        app.store
+            .patch_asset("photos", &retained, &json!({"rating":5}))?;
+        app.store.set_hidden_directory(
+            "photos",
+            root.path()
+                .join("originals")
+                .canonicalize()?
+                .to_str()
+                .unwrap(),
+            true,
+        )?;
+        let mut delta = fresh();
+        delta.request = SyncRequest {
+            replica_id: Some(replica),
+            generation: Some(Uuid::parse_str(&generation)?),
+            since_revision: Some(since),
+        };
+        manager.save(&delta)?;
+        manager.build(&mut delta)?;
+        let (manifest, delta_db) = unpack_catalog(&manager, &delta, &root.path().join("delta"))?;
+        assert_eq!(manifest["mode"], "delta");
+        assert_eq!(manifest["assetCount"], 2);
+        assert_eq!(manifest["thumbnailCount"], 0);
+        assert_eq!(manifest["missingThumbnailCount"], 2);
+        assert_eq!(manifest["fromRevision"], since);
+        assert_eq!(
+            delta_db.query_row("SELECT id FROM deleted_assets", [], |r| r
+                .get::<_, String>(0))?,
+            removed.to_uppercase()
+        );
+        // Hiding a directory updates all affected assets, including the previously unchanged one.
+        assert_eq!(
+            delta_db.query_row(
+                "SELECT count(*) FROM assets WHERE id=?",
+                [unchanged.to_uppercase()],
+                |r| r.get::<_, i64>(0)
+            )?,
+            1
+        );
+        local.execute(
+            "ATTACH DATABASE ? AS delta",
+            [root.path().join("delta/catalog.sqlite").to_str().unwrap()],
+        )?;
+        {
+            let tx = local.transaction()?;
+            tx.execute_batch("DELETE FROM paths WHERE asset_id IN (SELECT id FROM delta.assets UNION SELECT id FROM delta.deleted_assets); DELETE FROM assets WHERE id IN (SELECT id FROM delta.deleted_assets); INSERT OR REPLACE INTO assets SELECT * FROM delta.assets; INSERT INTO paths SELECT * FROM delta.paths; DELETE FROM hidden; INSERT INTO hidden SELECT * FROM delta.hidden; DELETE FROM navigation; INSERT INTO navigation SELECT * FROM delta.navigation; INSERT OR REPLACE INTO metadata SELECT * FROM delta.metadata WHERE key<>'from_revision';")?;
+            tx.commit()?;
+        }
+        let mut full = fresh();
+        full.request.replica_id = Some(Uuid::new_v4());
+        full.include_thumbnails = false;
+        manager.save(&full)?;
+        manager.build(&mut full)?;
+        let (_, full_db) = unpack_catalog(&manager, &full, &root.path().join("full"))?;
+        if let Ok(output) = std::env::var("KEEPS_SYNC_TEST_EXPORT") {
+            fs::create_dir_all(&output)?;
+            for (name, status) in [("initial", &initial), ("delta", &delta), ("full", &full)] {
+                fs::copy(
+                    manager.directory(&status.id)?.join("library.tar"),
+                    FsPath::new(&output).join(format!("{name}.tar")),
+                )?;
+            }
+        }
+        for (table, columns, order) in [
+            (
+                "assets",
+                "id,snapshot,sort_time,filename,camera,rating,flag,color,trashed",
+                "id",
+            ),
+            ("paths", "asset_id,path", "asset_id,path"),
+            ("hidden", "path", "path"),
+            ("navigation", "path,snapshot", "path"),
+            ("metadata", "key,value", "key"),
+        ] {
+            let query = format!(
+                "SELECT json_group_array(json_array({columns})) FROM (SELECT * FROM {table} ORDER BY {order})"
+            );
+            let expected: String = full_db.query_row(&query, [], |r| r.get(0))?;
+            let actual: String = local.query_row(&query, [], |r| r.get(0))?;
+            assert_eq!(actual, expected, "table {table}");
+        }
+        assert_eq!(
+            local.query_row(
+                "SELECT count(*) FROM paths WHERE asset_id=?",
+                [retained.to_uppercase()],
+                |r| r.get::<_, i64>(0)
+            )?,
+            2
+        );
+        let mut db = app.store.lock()?;
+        let tx = db.transaction()?;
+        crate::replicas::acknowledge(
+            &tx,
+            "photos",
+            &replica.to_string(),
+            &generation,
+            delta.revision.unwrap(),
+            chrono::Utc::now().timestamp(),
+        )?;
+        tx.commit()?;
+        drop(db);
+        manager.remove_acknowledged_packages(replica, delta.revision.unwrap())?;
+        assert!(!manager.directory(&initial.id)?.exists());
+        assert!(!manager.directory(&delta.id)?.exists());
+        assert!(manager.directory(&full.id)?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn superseded_packages_are_bounded_and_parallel_builds_have_a_limit() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = fixture(root.path());
+        let manager = Arc::new(manager(app));
+        {
+            let mut initialized = manager.initialized.lock().unwrap();
+            manager.initialize(&mut initialized)?;
+        }
+        let replica = Uuid::new_v4();
+        let mut previous = Vec::new();
+        for i in 0..3 {
+            let mut status = fresh();
+            status.request.replica_id = Some(replica);
+            status.state = "ready".into();
+            status.created_at += i;
+            manager.save(&status)?;
+            previous.push(status);
+        }
+        for _ in 0..4 {
+            let mut status = fresh();
+            status.request.replica_id = Some(Uuid::new_v4());
+            manager.save(&status)?;
+        }
+        let error = manager
+            .begin_request(
+                false,
+                SyncRequest {
+                    replica_id: Some(replica),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<StoreError>().unwrap().code,
+            "sync_capacity_busy"
+        );
+        assert_eq!(
+            previous
+                .iter()
+                .filter(|s| manager.directory(&s.id).unwrap().exists())
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_are_idempotent_and_invalid_progress_requires_rebuild() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let app = fixture(root.path());
+        seed(&app, root.path(), "photo.jpg");
+        let manager = manager(app.clone());
+        let replica = Uuid::new_v4();
+        let mut status = fresh();
+        status.request.replica_id = Some(replica);
+        status.include_thumbnails = false;
+        manager.save(&status)?;
+        manager.build(&mut status)?;
+        let generation = status.generation.clone().unwrap();
+        let revision = status.revision.unwrap();
+        let router = crate::api::router(app.clone());
+        for (target, value, expected) in [
+            (replica, revision + 1, StatusCode::CONFLICT),
+            (Uuid::new_v4(), revision, StatusCode::CONFLICT),
+            (replica, revision, StatusCode::NO_CONTENT),
+            (replica, revision, StatusCode::NO_CONTENT),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/libraries/photos/replicas/{target}/ack"))
+                        .header("Authorization", "Bearer test-token")
+                        .header("Content-Type", "application/json")
+                        .body(Body::from(
+                            json!({"generation":generation,"revision":value}).to_string(),
+                        ))?,
+                )
+                .await?;
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::CONFLICT {
+                let body: Value =
+                    serde_json::from_slice(&response.into_body().collect().await?.to_bytes())?;
+                assert_eq!(body["detail"]["code"], "replica_rebuild_required");
+            }
+        }
+        assert!(!manager.directory(&status.id)?.exists());
+        let mut old = fresh();
+        old.request.replica_id = Some(replica);
+        manager.save(&old)?;
+        manager.build(&mut old)?;
+        app.store.lock()?.execute(
+            "UPDATE catalog_sync_state SET generation=?",
+            [Uuid::new_v4().to_string()],
+        )?;
+        let error = manager.read_status(&old.id).unwrap_err();
+        assert_eq!(error.downcast_ref::<StoreError>().unwrap().status, 410);
+        Ok(())
+    }
+
     #[test]
     fn unavailable_optional_thumbnails_do_not_leave_partial_tar_entries() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -908,10 +1387,10 @@ mod tests {
                 db.execute("UPDATE media_cache SET browse_thumbnail=?,browse_source_version='image-v1',browse_spec=? WHERE asset_id=?",params![browse_descriptor.to_string(),crate::browse_cache::SPEC,id])?;
             }
         }
+        let manager = manager(app.clone());
         let expected = app.store.library_revision("photos")?["revision"]
             .as_i64()
             .unwrap();
-        let manager = manager(app.clone());
         let mut status = fresh();
         manager.save(&status)?;
         manager.build(&mut status)?;
@@ -1171,6 +1650,7 @@ mod tests {
         let mut state = fresh();
         manager.save(&state)?;
         manager.build(&mut state)?;
+        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id)?;
         let app = crate::api::router(app);
         let path = format!("/libraries/photos/offline-rebuild/{}/download", state.id);
         let response = app
@@ -1235,6 +1715,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let app = fixture(root.path());
         seed(&app, root.path(), "photo.jpg");
+        crate::sync_navigation::refresh(&app.store, &app.jobs, &app.library_id)?;
         let app = crate::api::router(app);
         let response = app
             .clone()

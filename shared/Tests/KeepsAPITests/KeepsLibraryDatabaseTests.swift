@@ -11,6 +11,98 @@ struct KeepsLibraryDatabaseTests {
         KeepsAsset(id: UUID(uuidString: String(format: "00000000-0000-0000-0000-%012d", n))!, captureTime: "2026-01-01", cameraMake: "", cameraModel: "Camera", lensModel: "", originalFilename: "photo\(n).jpg", contentFingerprint: "hash", metadataFingerprint: "meta", rating: 3, flagState: "picked", colorLabel: nil, tags: ["travel"], createdAt: "2026-01-01", updatedAt: "2026-01-01", trashed: false, preview: nil, paths: paths)
     }
 
+    private func sql(_ url: URL, _ sql: String) throws {
+        var db: OpaquePointer?
+        #expect(sqlite3_open(url.path, &db) == SQLITE_OK)
+        defer { sqlite3_close(db) }
+        let code = sqlite3_exec(db, sql, nil, nil, nil)
+        guard code == SQLITE_OK else { throw KeepsLibraryDatabase.DatabaseError(message: String(cString: sqlite3_errmsg(db))) }
+    }
+
+    @Test func deltaMergeMatchesFullSnapshotAndRejectsMismatchesAtomically() throws {
+        let root = root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let generation = UUID().uuidString
+        let local = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("local"))
+        let reader = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("local"))
+        try local.ingest([asset(1, paths: ["/old/B0014325.HEIC"]), asset(2, paths: ["/old/B0014325.3FR"]), asset(3)])
+        try local.completeSync(revision: 10, isStable: true)
+        try sql(local.fileURL, "INSERT INTO metadata VALUES('generation','\(generation)')")
+        let delta = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("delta"))
+        let merged = asset(1, paths: ["/new/B0014325.HEIC", "/new/B0014325.3FR"])
+        try delta.ingest([merged])
+        try delta.completeSync(revision: 12, isStable: true)
+        try delta.replaceHiddenDirectories(["/hidden"])
+        let navigation = KeepsNavigation(path: nil, directories: [KeepsNavigationDirectory(path: "/new", name: "new", photoCount: 1, hasChildren: false)])
+        try delta.saveNavigation(navigation)
+        try local.saveNavigation(KeepsNavigation(path: nil, directories: []))
+        try sql(delta.fileURL, "INSERT INTO metadata VALUES('generation','\(generation)'),('from_revision','10'); CREATE TABLE deleted_assets(id TEXT PRIMARY KEY); INSERT INTO deleted_assets VALUES('\(asset(2).id.uuidString)')")
+        let package = root.appendingPathComponent("delta.sqlite")
+        try delta.exportSnapshot(to: package)
+        #expect(throws: KeepsLibraryDatabase.DatabaseError.self) {
+            try local.applyDelta(from: package, generation: UUID().uuidString, fromRevision: 10, revision: 12, assetCount: 2)
+        }
+        #expect(throws: KeepsLibraryDatabase.DatabaseError.self) {
+            try local.applyDelta(from: package, generation: generation, fromRevision: 10, revision: 12, assetCount: 99)
+        }
+        #expect(try reader.revision == 10)
+        #expect(try reader.assets(ids: [asset(2).id]).count == 1)
+        try local.applyDelta(from: package, generation: generation, fromRevision: 10, revision: 12, assetCount: 2)
+        #expect(try reader.revision == 12)
+        #expect(try reader.assets(ids: [asset(2).id]).isEmpty)
+        #expect(try reader.assets(ids: [merged.id]).first?.paths == merged.paths)
+        #expect(try reader.hiddenDirectories() == ["/hidden"])
+        #expect(try reader.navigation()?.directories.first?.path == "/new")
+        try local.applyDelta(from: package, generation: generation, fromRevision: 10, revision: 12, assetCount: 2)
+        let full = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("full"))
+        try full.ingest([merged, asset(3)])
+        try full.completeSync(revision: 12, isStable: true)
+        #expect(try reader.timeline(query: .init()) == full.timeline(query: .init()))
+        var old = KeepsAssetQuery(); old.directory = "/old"
+        #expect(try reader.assets(query: old).total == 0)
+        var edited = merged; edited.rating = 5
+        try reader.update(edited)
+        #expect(try reader.revision == 12)
+    }
+
+    @Test func repeatedSnapshotReplacementReopensAllReadersWithoutGrowingWAL() throws {
+        let root = root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("source"))
+        try source.ingest((1...300).map { asset($0) })
+        try source.completeSync(revision: 20, isStable: true)
+        try source.saveNavigation(KeepsNavigation(path: nil, directories: [KeepsNavigationDirectory(path: "/photos", name: "photos", photoCount: 300, hasChildren: false)]))
+        let snapshot = root.appendingPathComponent("snapshot.sqlite")
+        try source.exportSnapshot(to: snapshot)
+        let local = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("local"))
+        let other = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("local"))
+        try local.ingest([asset(999)])
+        try local.completeSync(revision: 1, isStable: true)
+        for _ in 0..<5 {
+            try local.replaceSnapshot(from: snapshot, revision: 20, assetCount: 300)
+            #expect(try other.revision == 20)
+            #expect(try other.assets(query: .init()).total == 300)
+            #expect(try other.navigation()?.directories.first?.photoCount == 300)
+            let wal = URL(fileURLWithPath: local.fileURL.path + "-wal")
+            #expect(((try? wal.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) < 65_536)
+        }
+    }
+
+    @Test func replicaIdentityIsLocalAndSurvivesSnapshotReplacement() throws {
+        let root = root()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let first = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("first"))
+        let id = try first.replicaID()
+        try first.completeSync(revision: 1, isStable: true)
+        let snapshot = root.appendingPathComponent("snapshot.sqlite")
+        try first.exportSnapshot(to: snapshot)
+        let second = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root.appendingPathComponent("second"))
+        #expect(try second.restoreSnapshot(from: snapshot))
+        #expect(try second.replicaID() != id)
+        try first.replaceSnapshot(from: snapshot, revision: 1, assetCount: 0)
+        #expect(try first.replicaID() == id)
+    }
+
     @Test func timelineMatchesEveryFilterAndIgnoresPagination() throws {
         let root = root()
         defer { try? FileManager.default.removeItem(at: root) }

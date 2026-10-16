@@ -591,7 +591,7 @@ import KeepsAPI
         #expect(LibraryStubProtocol.treeRequests.count(for: "cache-assets") == requests + 2)
     }
 
-    @Test func updatingWindowRefreshesOnceAndFinalVersionRefreshesImmediately() async throws {
+    @Test func preciseCommitsThrottleDuringUpdatesAndCompletionRefreshesWithoutAnotherVersion() async throws {
         let store = LibraryStore(configuration: KeepsConfiguration(baseURL: URL(string: "https://updating.invalid")!, libraryID: "test"), session: stubSession(), loadSavedSettings: false, preferences: UserDefaults(suiteName: UUID().uuidString)!)
         store.showLibrary(directory: "A")
         try await waitUntil { !store.isLoading }
@@ -760,7 +760,7 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
                 Self.treeRequests.record("updating-poll")
                 let poll = Self.treeRequests.count(for: "updating-poll")
                 let updating = poll == 2 || poll == 3
-                let revision = poll == 1 ? 1 : updating ? 2 : 3
+                let revision = min(poll, 3)
                 deliver(body: "{\"revision\":\(revision),\"isUpdating\":\(updating)}", status: 200)
                 return
             }
@@ -845,7 +845,7 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
             if request.url?.host == "updating.invalid" {
                 let poll = Self.treeRequests.count(for: "updating-poll")
                 let updating = poll == 2 || poll == 3
-                let revision = poll == 1 ? 1 : updating ? 2 : 3
+                let revision = min(poll, 3)
                 response = String(body.dropLast()) + ",\"revision\":\(revision),\"isUpdating\":\(updating)}"
                 deliver(body: response, status: status)
                 return

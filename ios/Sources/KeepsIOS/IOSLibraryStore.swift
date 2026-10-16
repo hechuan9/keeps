@@ -14,7 +14,7 @@ final class IOSLibraryStore: ObservableObject {
     @Published private(set) var databaseRevision = 0
     @Published private(set) var isSyncing = false
     @Published private(set) var isLoadingLocal = false
-    private(set) var syncError: String?
+    @Published private(set) var syncError: String?
     @Published private(set) var configuration: KeepsConfiguration?
     @Published var lastError: String?
     @Published var showingTrashCleanup = false
@@ -380,6 +380,10 @@ final class IOSLibraryStore: ObservableObject {
                     session: session, forceRebuild: forceRebuild, includeThumbnails: includeThumbnails) { stage, completed, total in
                         guard self.generation == currentGeneration else { return }
                         for observer in Array(self.syncObservers.values) { await observer(stage, completed, total) }
+                        if stage == .importing && completed == total {
+                            self.databaseRevision += 1
+                            await self.readLocal()
+                        }
                     }
             } catch {
                 guard generation == currentGeneration, !Task.isCancelled else { return }
@@ -432,11 +436,26 @@ private actor IOSCatalogSynchronizer {
              forceRebuild: Bool, includeThumbnails: Bool?, progress: IOSOfflineProgress.Reporter?) async throws {
         try Task.checkCancellation()
         let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: root)
-        let remote = try await KeepsClient(configuration: configuration, session: session).revision()
-        if !forceRebuild, try database.syncCheckpoint == nil, try database.revision == remote.revision { return }
+        let client = KeepsClient(configuration: configuration, session: session)
         let rebuild = KeepsOfflineRebuild(session: session)
-        _ = try await rebuild.run(configuration: configuration, databaseRoot: root,
-                                  includeThumbnails: includeThumbnails ?? (forceRebuild || (try database.revision) == nil || (try database.syncCheckpoint) != nil)) { update in
+        var force = forceRebuild
+        // A continuously scanning NAS must not prevent the UI from publishing committed data.
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            let remote = try await client.revision()
+            if !force, try database.syncCheckpoint == nil, try database.revision == remote.revision,
+               try database.generation == remote.generation {
+                do {
+                    try await rebuild.acknowledge(configuration: configuration, databaseRoot: root)
+                    return
+                } catch KeepsAPIError.http(let status, _) where status == 409 || status == 410 {
+                    force = true
+                }
+            }
+            let previous = try database.revision
+            let previousGeneration = try database.generation
+            let manifest = try await rebuild.run(configuration: configuration, databaseRoot: root,
+                                  includeThumbnails: includeThumbnails ?? (force || previous == nil || (try database.syncCheckpoint) != nil), forceRebuild: force) { update in
             let stage: IOSOfflineProgress.Stage
             switch update.phase {
             case .building:
@@ -452,6 +471,14 @@ private actor IOSCatalogSynchronizer {
             case .importing: stage = .importing
             }
             await progress?(stage, update.completed, update.total)
+            }
+            force = false
+            let latest = try await client.revision()
+            if latest.revision == manifest.revision && latest.generation == manifest.generation { return }
+            guard previous != manifest.revision || previousGeneration != manifest.generation else {
+                throw NSError(domain: "KeepsSync", code: 1, userInfo: [NSLocalizedDescriptionKey: "NAS 同步包未推进图库版本，请重试"])
+            }
+            if attempt < 2 { try await Task.sleep(for: .seconds(1)) }
         }
     }
 

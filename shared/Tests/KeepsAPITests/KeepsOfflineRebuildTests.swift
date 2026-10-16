@@ -271,6 +271,36 @@ struct KeepsOfflineRebuildTests {
         print("BULK IMPORT PASS assets=\(count) imageBytes=\(count * 2 * image.count) repeatedPasses=3 cancellation=verified")
     }
 
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["KEEPS_SYNC_TEST_EXPORT"] != nil))
+    func rustIncrementalContractMatchesFreshFullSnapshot() async throws {
+        let source = URL(fileURLWithPath: ProcessInfo.processInfo.environment["KEEPS_SYNC_TEST_EXPORT"]!)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let initialReader = try OfflineContractManifest.read(source.appendingPathComponent("initial.tar"))
+        let config = KeepsConfiguration(baseURL: URL(string: "https://fixture.invalid")!, libraryID: initialReader.libraryID)
+        let service = KeepsOfflineRebuild()
+        let incrementalRoot = root.appendingPathComponent("incremental")
+        let fullRoot = root.appendingPathComponent("full")
+        let initial = try await service.unpack(source.appendingPathComponent("initial.tar"), root: root, configuration: config, databaseRoot: incrementalRoot, progress: { _ in })
+        let held = try KeepsLibraryDatabase(configuration: config, rootDirectory: incrementalRoot)
+        let delta = try await service.unpack(source.appendingPathComponent("delta.tar"), root: root, configuration: config, databaseRoot: incrementalRoot, progress: { _ in })
+        let full = try await service.unpack(source.appendingPathComponent("full.tar"), root: root, configuration: config, databaseRoot: fullRoot, progress: { _ in })
+        let fresh = try KeepsLibraryDatabase(configuration: config, rootDirectory: fullRoot)
+        #expect(initial.mode == "snapshot" && delta.mode == "delta" && full.mode == "snapshot")
+        #expect(delta.fromRevision == initial.revision)
+        #expect(try held.revision == fresh.revision)
+        #expect(try held.generation == fresh.generation)
+        for trashed in [false, true] {
+            var query = KeepsAssetQuery(); query.showHidden = true; query.trashed = trashed; query.limit = 1000
+            #expect(try held.assets(query: query).items == fresh.assets(query: query).items)
+        }
+        #expect(try held.hiddenDirectories() == fresh.hiddenDirectories())
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        #expect(try held.navigation().map { try encoder.encode($0) } == fresh.navigation().map { try encoder.encode($0) })
+        #expect(initial.assetCount == 3 && delta.assetCount == 2 && full.assetCount == 2)
+    }
+
     @Test(.enabled(if: ProcessInfo.processInfo.environment["KEEPS_OFFLINE_BUNDLE_FIXTURE"] != nil))
     func importsRustGeneratedContractFixture() async throws {
         let archive = URL(fileURLWithPath: ProcessInfo.processInfo.environment["KEEPS_OFFLINE_BUNDLE_FIXTURE"]!)
@@ -360,5 +390,15 @@ private final class OfflineBundleProtocol: URLProtocol {
             client?.urlProtocol(self, didLoad: archive.dropFirst(offset))
             client?.urlProtocolDidFinishLoading(self)
         }
+    }
+}
+
+private enum OfflineContractManifest {
+    static func read(_ archive: URL) throws -> KeepsOfflineManifest {
+        let handle = try FileHandle(forReadingFrom: archive)
+        defer { try? handle.close() }
+        let header = try handle.read(upToCount: 512)!
+        let size = Int(String(decoding: header[124..<136].prefix(while: { $0 != 0 }), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines), radix: 8)!
+        return try JSONDecoder().decode(KeepsOfflineManifest.self, from: handle.read(upToCount: size)!)
     }
 }

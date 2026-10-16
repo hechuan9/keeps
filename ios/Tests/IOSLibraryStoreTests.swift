@@ -1,11 +1,79 @@
 import Foundation
 import CryptoKit
+import SQLite3
 import Testing
 import KeepsAPI
 @testable import KeepsIOSState
 
 @MainActor
 struct IOSLibraryStoreTests {
+    @Test func continuousNASChangesPublishEachPackageAndBoundCatchup() async throws {
+        let fixture = ReplicaFixture()
+        fixture.continuouslyChanging = true
+        let store = await fixture.store()
+        var published: [Int64] = []
+        await store.synchronize { stage, completed, total in
+            if stage == .importing && completed == total {
+                published.append((try? fixture.database().revision) ?? -1)
+            }
+        }
+        #expect(store.syncError == nil)
+        #expect(published == [1, 2, 3])
+        #expect(try fixture.database().revision == 3)
+        #expect(store.hasLocalCatalog && !store.timeline.isEmpty)
+        #expect(fixture.requests.filter { $0 == "POST /libraries/library/offline-rebuild" }.count == 3)
+    }
+
+    @Test func committedSnapshotSurvivesAckFailureAndRetriesWithoutRedownload() async throws {
+        let fixture = ReplicaFixture()
+        fixture.syncGeneration = UUID().uuidString
+        fixture.ackStatus = 503
+        let store = await fixture.store()
+        await store.synchronize()
+        #expect(store.syncError != nil)
+        #expect(try fixture.database().revision == 1)
+        #expect(try fixture.database().generation == fixture.syncGeneration)
+        #expect(store.hasLocalCatalog)
+        let before = fixture.requests.count
+        fixture.ackStatus = 200
+        await store.synchronize()
+        #expect(store.syncError == nil)
+        let retry = Array(fixture.requests.dropFirst(before))
+        #expect(retry.count == 2)
+        #expect(retry[0].hasSuffix("revision"))
+        #expect(retry[1].hasSuffix("ack"))
+        #expect(!retry.contains { $0.contains("download") || $0.contains("offline-rebuild") })
+    }
+
+    @Test func generationMismatchBootstrapsEvenWhenRevisionMatches() async throws {
+        let fixture = ReplicaFixture()
+        fixture.syncGeneration = UUID().uuidString
+        let local = try fixture.database()
+        try local.completeSync(revision: 1, isStable: true)
+        var db: OpaquePointer?
+        #expect(sqlite3_open(local.fileURL.path, &db) == SQLITE_OK)
+        #expect(sqlite3_exec(db, "INSERT INTO metadata VALUES('generation','\(UUID().uuidString)')", nil, nil, nil) == SQLITE_OK)
+        sqlite3_close(db)
+        let store = await fixture.store()
+        await store.synchronize()
+        #expect(store.syncError == nil)
+        #expect(fixture.requests.contains("POST /libraries/library/offline-rebuild"))
+        #expect(try local.generation == fixture.syncGeneration)
+    }
+
+    @Test func expiredReplicaTriggersFullBootstrapEvenWhenRevisionMatches() async throws {
+        let fixture = ReplicaFixture()
+        fixture.syncGeneration = UUID().uuidString
+        let store = await fixture.store()
+        await store.synchronize()
+        #expect(store.syncError == nil)
+        fixture.ackStatus = 409
+        let before = fixture.requests.count
+        await store.synchronize()
+        #expect(fixture.requests.dropFirst(before).contains("POST /libraries/library/offline-rebuild"))
+        #expect(try fixture.database().revision == 1)
+    }
+
     @Test func startupReturnsBeforeDatabaseIOAndReportsFailureAsynchronously() async throws {
         let root = URL.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data("not a directory".utf8).write(to: root)
@@ -286,7 +354,7 @@ struct IOSLibraryStoreTests {
         #expect(store.syncError == nil)
         #expect(store.assets.map(\.originalFilename) == ["photo-1"])
         #expect(try fixture.database().revision == 1)
-        #expect(fixture.requests.count == 3)
+        #expect(fixture.requests.count == 4)
         #expect(fixture.requests[0].contains("revision"))
         #expect(fixture.requests[1] == "POST /libraries/library/offline-rebuild")
         #expect(fixture.requests[2].hasSuffix("/download"))
@@ -492,6 +560,10 @@ private final class ReplicaFixture: @unchecked Sendable {
     private var recorded: [String] = []
     private var isOffline = false
     private var isUpdating = false
+    var syncGeneration: String?
+    var ackStatus = 200
+    var continuouslyChanging = false
+    private var serverRevision: Int64 = 1
     private var modes: [Bool] = []
     var thumbnailModes: [Bool] { lock.withLock { modes } }
     private var downloadFails = false
@@ -541,10 +613,18 @@ private final class ReplicaFixture: @unchecked Sendable {
         try database.ingest([asset(1), trash])
         try database.replaceHiddenDirectories(["/private"])
         try database.saveNavigation(JSONDecoder().decode(KeepsNavigation.self, from: Data("{\"directories\":[]}".utf8)))
-        try database.completeSync(revision: 1, isStable: true)
+        try database.completeSync(revision: serverRevision, isStable: true)
         let snapshot = root.appendingPathComponent("server.sqlite")
         try database.exportSnapshot(to: snapshot)
-        let manifest = Data("{\"formatVersion\":1,\"libraryID\":\"library\",\"revision\":1,\"assetCount\":2,\"thumbnailCount\":0,\"missingThumbnailCount\":2}".utf8)
+        if let generation = syncGeneration {
+            var db: OpaquePointer?
+            guard sqlite3_open(snapshot.path, &db) == SQLITE_OK else { throw URLError(.cannotOpenFile) }
+            defer { sqlite3_close(db) }
+            guard sqlite3_exec(db, "INSERT OR REPLACE INTO metadata VALUES('generation','\(generation)')", nil, nil, nil) == SQLITE_OK else { throw URLError(.cannotWriteToFile) }
+        }
+        let extra = syncGeneration.map { ",\"mode\":\"snapshot\",\"generation\":\"\($0)\"" } ?? ""
+        let format = syncGeneration == nil ? 1 : 2
+        let manifest = Data("{\"formatVersion\":\(format)\(extra),\"libraryID\":\"library\",\"revision\":\(serverRevision),\"assetCount\":2,\"thumbnailCount\":0,\"missingThumbnailCount\":2}".utf8)
         var result = Data()
         for (name, body) in [("manifest.json", manifest), ("catalog.sqlite", try Data(contentsOf: snapshot))] {
             var header = Data(repeating: 0, count: 512)
@@ -579,16 +659,21 @@ private final class ReplicaFixture: @unchecked Sendable {
                         body.append(contentsOf: bytes.prefix(count))
                     }
                 }
-                if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Bool], let mode = json["includeThumbnails"] { modes.append(mode) }
+                if let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any], let mode = json["includeThumbnails"] as? Bool { modes.append(mode) }
             }
             if isOffline { return .text(503, "offline") }
-            if url.path.hasSuffix("revision") { return .text(200, "{\"revision\":1,\"isUpdating\":\(isUpdating)}") }
+            if url.path.hasSuffix("ack") { return .text(ackStatus, "{}") }
+            if url.path.hasSuffix("revision") {
+                let extra = syncGeneration.map { ",\"generation\":\"\($0)\"" } ?? ""
+                return .text(200, "{\"revision\":\(serverRevision),\"isUpdating\":\(isUpdating)\(extra)}")
+            }
             if isUnsupported { return .text(404, "unsupported") }
             do {
                 if archive == nil { archive = try makeArchive() }
                 let data = archive!
                 let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
                 if url.path.hasSuffix("download") {
+                    if continuouslyChanging { serverRevision += 1; archive = nil }
                     if downloadFails { return .text(503, "download unavailable") }
                     if let range = request.value(forHTTPHeaderField: "Range"),
                        let offset = Int(range.replacingOccurrences(of: "bytes=", with: "").dropLast()),

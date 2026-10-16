@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 18;
+const VERSION: i64 = 19;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -43,6 +43,10 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         "database schema {version} is newer than this server supports ({VERSION})"
     );
     if version == VERSION {
+        db.prepare("SELECT library_id,generation,floor FROM catalog_sync_state LIMIT 0")?;
+        db.prepare("SELECT library_id,path,page_json FROM catalog_sync_navigation LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,revision,deleted,changed_at FROM catalog_sync_assets LIMIT 0")?;
+        db.prepare("SELECT library_id,replica_id,generation,ack_revision,delivered_revision,expires_at FROM catalog_replicas LIMIT 0")?;
         db.prepare("SELECT library_id,name FROM catalog_tags LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,trashed_at FROM catalog_trash_entries LIMIT 0")?;
         db.prepare("SELECT library_id,enabled,retention_days FROM trash_settings LIMIT 0")?;
@@ -179,6 +183,9 @@ CREATE TRIGGER IF NOT EXISTS catalog_tags_update AFTER UPDATE OF snapshot ON cat
     }
     if version < 18 {
         crate::cache_gc::migrate_asset_ownership(&tx)?;
+    }
+    if version < 19 {
+        crate::replicas::migrate(&tx)?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;

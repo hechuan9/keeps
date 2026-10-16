@@ -149,8 +149,13 @@ pub(crate) fn reconcile(
     let mut db = jobs.db.lock().unwrap();
     let tx = db.transaction()?;
     tracking(&tx, library, source, destination)?;
-    tx.execute("UPDATE directory_moves SET completed=1 WHERE id=?1", [id])?;
     tx.commit()?;
+    drop(db);
+    crate::sync_navigation::refresh(store, jobs, library)?;
+    jobs.db
+        .lock()
+        .unwrap()
+        .execute("UPDATE directory_moves SET completed=1 WHERE id=?1", [id])?;
     Ok(())
 }
 
@@ -977,6 +982,33 @@ mod tests {
             );
             assert!(dest.exists());
         }
+        Ok(())
+    }
+    #[test]
+    fn failed_navigation_publication_remains_recoverable() -> Result<()> {
+        let (_tmp, jobs, store) = setup();
+        let source = jobs.root().join("source");
+        let dest = jobs.root().join("dest");
+        fs::create_dir(&source)?;
+        crate::sync_navigation::refresh(&store, &jobs, "lib")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        jobs.db.lock().unwrap().execute(
+            "INSERT INTO directory_moves(id,library_id,source,destination) VALUES(?1,'lib',?2,?3)",
+            params![id, source.to_str(), dest.to_str()],
+        )?;
+        rename_exclusive(&source, &dest)?;
+        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE INSERT ON catalog_sync_navigation BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
+        let error = recover(&jobs, &store).unwrap_err();
+        assert!(format!("{error:#}").contains("fixture projection failure"));
+        assert!(ensure_reconciled(&jobs).is_err());
+        store
+            .lock()?
+            .execute_batch("DROP TRIGGER fail_navigation")?;
+        recover(&jobs, &store)?;
+        ensure_reconciled(&jobs)?;
+        let pages = crate::sync_navigation::pages(&store.read()?, "lib")?;
+        assert!(pages.contains_key(dest.to_str().unwrap()));
+        assert!(!pages.contains_key(source.to_str().unwrap()));
         Ok(())
     }
 }

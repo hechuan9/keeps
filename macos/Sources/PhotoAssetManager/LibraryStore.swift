@@ -626,7 +626,7 @@ final class LibraryStore: ObservableObject {
                     try Task.checkCancellation()
                     guard requestGeneration == loadGeneration else { return }
                     needsFetch = displayedPage.map { !$0.isCurrent(at: revision) } ?? true
-                    if !changedQuery, let current = displayedPage, revision.isUpdating && current.isUpdating && revision.revision == current.revision
+                    if !changedQuery, let current = displayedPage, revision.isUpdating && current.isUpdating
                         && Date().timeIntervalSince(lastAssetFetch) < 30 { needsFetch = false }
                 }
                 isCheckingRevision = false

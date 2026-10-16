@@ -100,6 +100,29 @@ class BackupTests(unittest.TestCase):
         self.assertEqual((self.root / 'previews/cache.jpg').read_bytes(), b'cache')
         self.assertEqual((self.root / 'maintenance/operation.json').read_text(), '{"complete":true}')
 
+    def test_restore_changes_sync_generation_without_changing_catalog_revision(self):
+        path = self.root / hook.DATABASES[0]
+        with database(path) as db:
+            db.executescript("""
+                CREATE TABLE catalog_sync_state(library_id TEXT PRIMARY KEY, generation TEXT, floor INTEGER);
+                CREATE TABLE catalog_version_revision(library_id TEXT PRIMARY KEY, revision INTEGER);
+                CREATE TABLE catalog_replicas(replica_id TEXT);
+                INSERT INTO catalog_sync_state VALUES('lib','old-generation',10);
+                INSERT INTO catalog_version_revision VALUES('lib',42);
+                INSERT INTO catalog_replicas VALUES('phone');
+            """)
+        self.export()
+        hook.import_state(self.backup)
+        with database(path) as db:
+            generation, floor = db.execute('SELECT generation,floor FROM catalog_sync_state').fetchone()
+            self.assertNotEqual(generation, 'old-generation')
+            self.assertEqual(str(hook.uuid.UUID(generation)), generation)
+            self.assertEqual(floor, 42)
+            self.assertEqual(db.execute('SELECT revision FROM catalog_version_revision').fetchone()[0], 42)
+            self.assertEqual(db.execute('SELECT count(*) FROM catalog_replicas').fetchone()[0], 0)
+        with database(self.backup / 'keeps' / hook.DATABASES[0]) as db:
+            self.assertEqual(db.execute('SELECT generation FROM catalog_sync_state').fetchone()[0], 'old-generation')
+
     def test_corrupt_second_database_rejected_before_any_live_write(self):
         self.export()
         first = (self.root / hook.DATABASES[0]).read_bytes()

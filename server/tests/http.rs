@@ -906,7 +906,7 @@ async fn catalog_revision_api_tracks_changed_branches_and_preserves_default_cont
         assert_eq!(status, StatusCode::OK, "{branch}");
         assert_eq!(
             branch,
-            json!({"path":path,"revision":after["revision"],"isUpdating":false})
+            json!({"path":path,"revision":after["revision"],"generation":after["generation"],"isUpdating":false})
         );
     }
     assert_eq!(
@@ -1008,7 +1008,7 @@ async fn catalog_revision_api_exposes_batch_activity_by_scope_until_completion()
         .await
         .1;
     assert_eq!(active["isUpdating"], true);
-    assert!(active["revision"].as_i64() > before["revision"].as_i64());
+    assert_eq!(active["revision"], before["revision"]);
     assert_eq!(active["children"][0]["path"], json!(first));
     assert_eq!(active["children"][0]["isUpdating"], true);
     assert_eq!(active["children"][1]["path"], json!(second));
@@ -1037,8 +1037,9 @@ async fn catalog_revision_api_exposes_batch_activity_by_scope_until_completion()
     assert_eq!(expanded["revision"], active["revision"]);
     assert_eq!(expanded["children"][0], active["children"][0]);
     assert_eq!(expanded["children"][1]["isUpdating"], true);
-    assert!(
-        expanded["children"][1]["revision"].as_i64() > active["children"][1]["revision"].as_i64()
+    assert_eq!(
+        expanded["children"][1]["revision"],
+        active["children"][1]["revision"]
     );
     assert_eq!(
         call(
@@ -1056,12 +1057,12 @@ async fn catalog_revision_api_exposes_batch_activity_by_scope_until_completion()
         .await
         .1;
     assert_eq!(stable["isUpdating"], false);
-    assert!(stable["revision"].as_i64() > expanded["revision"].as_i64());
+    assert_eq!(stable["revision"], expanded["revision"]);
     for (index, path) in [&first, &second].iter().enumerate() {
         assert_eq!(stable["children"][index]["isUpdating"], false);
-        assert!(
-            stable["children"][index]["revision"].as_i64()
-                > expanded["children"][index]["revision"].as_i64()
+        assert_eq!(
+            stable["children"][index]["revision"],
+            expanded["children"][index]["revision"]
         );
         assert_eq!(
             call(app.clone(), "GET", &route("directory", path), Value::Null)
@@ -1074,7 +1075,7 @@ async fn catalog_revision_api_exposes_batch_activity_by_scope_until_completion()
         .await
         .1;
     assert_eq!(library_stable["isUpdating"], false);
-    assert!(library_stable["revision"].as_i64() > library_active["revision"].as_i64());
+    assert_eq!(library_stable["revision"], library_active["revision"]);
 }
 
 #[tokio::test]

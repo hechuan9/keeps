@@ -208,6 +208,7 @@ fn claim_pending_scoped(
     expire(&tx)?;
     let row = tx.query_row("SELECT asset_id,source_hash FROM media_cache WHERE library_id=? AND (status='pending' OR (?2 IS NOT NULL AND status='ready' AND (browse_thumbnail IS NULL OR json_extract(browse_thumbnail,'$.sourceThumbnailVersion') IS NOT json_extract(thumbnail,'$.version') OR json_extract(browse_thumbnail,'$.spec') IS NOT 'browse-heic-64-q50-v1'))) AND available_at<=unixepoch() AND EXISTS(SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0) AND (?2 IS NULL OR EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.batch_id=?2 AND l.worker_id=?3 AND l.expires_at>unixepoch())) AND (?2 IS NOT NULL OR NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=media_cache.library_id AND p.asset_id=media_cache.asset_id AND l.expires_at>unixepoch())) LIMIT 1", params![lib,batch,worker], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).optional()?;
     let Some((asset, hash)) = row else {
+        crate::revisions::flush(&tx)?;
         tx.commit()?;
         return Ok(None);
     };
@@ -225,6 +226,7 @@ fn claim_pending_scoped(
             if batch.is_some() { IMPORT_LEASE } else { LEASE }
         ],
     )?;
+    crate::revisions::flush(&tx)?;
     tx.commit()?;
     Ok(Some((id, asset, hash)))
 }
@@ -662,6 +664,7 @@ fn fail_task(store: &Store, lib: &str, id: &str, error: &str) -> Result<()> {
         "UPDATE remote_cache_tasks SET completed=-1 WHERE id=?",
         [id],
     )?;
+    crate::revisions::flush(&tx)?;
     tx.commit()?;
     Ok(())
 }
@@ -685,7 +688,6 @@ async fn fail(
     })
     .await
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,7 +869,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                18
+                19
             );
             let edited: (f64, Option<String>) = db.query_row(
                 "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",

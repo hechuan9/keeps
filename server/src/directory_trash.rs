@@ -194,6 +194,7 @@ fn reconcile(jobs: &Jobs, store: &Store, library: &str, source: &Path) -> Result
             jobs.db.lock().unwrap().execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE folder_id IN (SELECT id FROM folders WHERE library_id=?1) AND (scope_path=?2 OR (scope_path>=?3 AND scope_path<?4)) AND status IN ('pending','running')", rusqlite::params![library, text, format!("{text}/"), format!("{text}0")])?;
         }
         store.reconcile_cache()?;
+        crate::sync_navigation::refresh(store, jobs, library)?;
         Ok(())
     })()?;
     Ok(())
@@ -353,6 +354,27 @@ fn transition(jobs: &Jobs, id: &str, phase: &str, message: Option<&str>) -> Resu
     Ok(())
 }
 
+pub(crate) fn ensure_reconciled(jobs: &Jobs) -> Result<()> {
+    let pending: bool = jobs.trash_db.lock().unwrap().query_row(
+        "SELECT EXISTS(SELECT 1 FROM directory_trash_tasks WHERE phase IN ('recycling','reconciling'))",
+        [], |row| row.get(0))?;
+    ensure!(
+        !pending,
+        error(
+            503,
+            "A NAS folder deletion needs reconciliation; retry the deletion or restart the server"
+        )
+    );
+    Ok(())
+}
+
+fn fail(jobs: &Jobs, id: &str, failure: &anyhow::Error) -> Result<()> {
+    jobs.trash_db.lock().unwrap().execute(
+        "UPDATE directory_trash_tasks SET status='failed',phase=CASE WHEN phase IN ('recycling','reconciling') THEN phase ELSE 'failed' END,error=coalesce(error||char(10),'')||?2,finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1",
+        rusqlite::params![id,format!("{failure:#}")])?;
+    Ok(())
+}
+
 fn process(
     jobs: &Jobs,
     store: &Store,
@@ -403,12 +425,12 @@ fn process(
 }
 
 pub fn interrupt_pending(jobs: &Jobs, store: &Store) -> Result<()> {
-    let rows = jobs.trash_db.lock().unwrap().prepare("SELECT id,library_id,path,phase FROM directory_trash_tasks WHERE status IN ('pending','running')")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = jobs.trash_db.lock().unwrap().prepare("SELECT id,library_id,path,phase FROM directory_trash_tasks WHERE status IN ('pending','running') OR phase IN ('recycling','reconciling')")?.query_map([], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, library, path, phase) in rows {
         if phase != "waiting" {
             reconcile(jobs, store, &library, Path::new(&path))?;
         }
-        jobs.trash_db.lock().unwrap().execute("UPDATE directory_trash_tasks SET status='failed',error=coalesce(error||char(10),'')||'服务已重启，回收任务已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
+        jobs.trash_db.lock().unwrap().execute("UPDATE directory_trash_tasks SET status='failed',phase=CASE WHEN phase='waiting' THEN 'waiting' ELSE 'failed' END,error=coalesce(error||char(10),'')||'服务已重启，回收任务已中断；请检查原目录与 NAS 回收站后手动重试。',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&id])?;
     }
     Ok(())
 }
@@ -451,7 +473,7 @@ pub fn run(
             );
             if let Err(failure) = result {
                 tracing::error!(id=%current.id,error=%format!("{failure:#}"),"Directory recycling task failed");
-                transition(&jobs, &current.id, "failed", Some(&format!("{failure:#}")))?;
+                fail(&jobs, &current.id, &failure)?;
             }
         } else if !crate::rejected_trash::process_next(&jobs, &store, &previews)? {
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -837,6 +859,55 @@ mod tests {
             .is_err()
         );
         assert!(source.exists());
+        Ok(())
+    }
+    #[test]
+    fn failed_projection_blocks_export_and_retry_only_reconciles() -> Result<()> {
+        let (_tmp, jobs, store, config) = setup();
+        let source = jobs.root().join("folder");
+        fs::create_dir(&source)?;
+        crate::sync_navigation::refresh(&store, &jobs, "lib")?;
+        let id = uuid::Uuid::new_v4().to_string();
+        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+        store.lock()?.execute_batch("CREATE TRIGGER fail_navigation BEFORE INSERT ON catalog_sync_navigation BEGIN SELECT RAISE(ABORT,'fixture projection failure'); END;")?;
+        let failure = process(
+            &jobs,
+            &store,
+            "lib",
+            &get(&jobs, "lib", &id)?,
+            "folder",
+            || Ok(config),
+            simulate_removal,
+        )
+        .unwrap_err();
+        fail(&jobs, &id, &failure)?;
+        assert_eq!(get(&jobs, "lib", &id)?.phase, "reconciling");
+        assert!(ensure_reconciled(&jobs).is_err());
+        assert!(!source.exists());
+        store
+            .lock()?
+            .execute_batch("DROP TRIGGER fail_navigation")?;
+        submit(&jobs, "lib", source.to_str().unwrap(), "folder", &id)?;
+        process(
+            &jobs,
+            &store,
+            "lib",
+            &get(&jobs, "lib", &id)?,
+            "folder",
+            || panic!("must not reload native config"),
+            |_, _| panic!("must not repeat native deletion"),
+        )?;
+        ensure_reconciled(&jobs)?;
+        assert!(
+            !crate::sync_navigation::pages(&store.read()?, "lib")?
+                .contains_key(source.to_str().unwrap())
+        );
+        assert!(
+            get(&jobs, "lib", &id)?
+                .error
+                .unwrap()
+                .contains("fixture projection failure")
+        );
         Ok(())
     }
 }

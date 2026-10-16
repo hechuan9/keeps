@@ -474,7 +474,7 @@ async fn create_directory(
     Json(body): Json<CreateDirectoryRequest>,
 ) -> ApiResult {
     let result = blocking(move || {
-        let _directory_guard = state.jobs.directory_mutation.read().unwrap();
+        let _directory_guard = state.jobs.directory_mutation.write().unwrap();
         crate::directory_move::ensure_reconciled(&state.jobs)?;
         let name = &body.name;
         if name.trim().is_empty()
@@ -510,6 +510,7 @@ async fn create_directory(
                 anyhow::Error::from(error).context(format!("create directory {}", path.display()))
             }
         })?;
+        crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
         Ok(json!({"path":path}))
     })
     .await?;
@@ -626,13 +627,14 @@ async fn add_folder(
         StatusCode::CREATED,
         Json(
             blocking(move || {
-                let _directory_guard = state.jobs.directory_mutation.read().unwrap();
+                let _directory_guard = state.jobs.directory_mutation.write().unwrap();
                 crate::directory_move::ensure_reconciled(&state.jobs)?;
                 state
                     .jobs
                     .validate_path(std::path::Path::new(&body.path))
                     .map_err(|e| resource_error(422, format!("{e:#}")))?;
                 let folder = state.jobs.add_folder(&library, &body.path)?;
+                crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
                 Ok(serde_json::to_value(folder)?)
             })
             .await?,
@@ -645,8 +647,10 @@ async fn remove_folder(
     Path((library, id)): Path<(String, String)>,
 ) -> ApiResult {
     blocking(move || {
+        let _directory_guard = state.jobs.directory_mutation.write().unwrap();
         folder_for(&state, &library, &id)?;
         state.jobs.remove_folder(&id)?;
+        crate::sync_navigation::refresh(&state.store, &state.jobs, &library)?;
         Ok(Value::Null)
     })
     .await?;

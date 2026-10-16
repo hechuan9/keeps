@@ -6,6 +6,9 @@ public struct KeepsOfflineManifest: Codable, Sendable {
     public var formatVersion: Int
     public var libraryID: String
     public var revision: Int64
+    public var mode: String? = nil
+    public var generation: String? = nil
+    public var fromRevision: Int64? = nil
     public var assetCount: Int
     public var thumbnailCount: Int
     public var missingThumbnailCount: Int
@@ -40,20 +43,39 @@ public actor KeepsOfflineRebuild {
     public init(session: URLSession = KeepsClient.apiSession, cache: PreviewCache = .thumbnails, browsingCache: PreviewCache = .browsing) {
         self.session = session; self.cache = cache; self.browsingCache = browsingCache
     }
-    public func run(configuration: KeepsConfiguration, databaseRoot: URL? = nil, includeThumbnails: Bool = true,
+    public func run(configuration: KeepsConfiguration, databaseRoot: URL? = nil, includeThumbnails: Bool = true, forceRebuild: Bool = false,
                     progress: @escaping @Sendable (Progress) async -> Void = { _ in }) async throws -> KeepsOfflineManifest {
-        let identity = Data((configuration.baseURL.absoluteString + "\n" + configuration.libraryID + "\n" + String(includeThumbnails)).utf8)
+        let identity = Data((configuration.baseURL.absoluteString + "\n" + configuration.libraryID + "\n" + (configuration.accessCredential ?? "")).utf8)
         let key = SHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
         let base = databaseRoot ?? URL.applicationSupportDirectory.appendingPathComponent("Keeps")
         let root = base.appendingPathComponent("OfflineRebuild/" + key)
+        for include in [true, false] {
+            let legacyIdentity = Data((configuration.baseURL.absoluteString + "\n" + configuration.libraryID + "\n" + String(include)).utf8)
+            let legacyKey = SHA256.hash(data: legacyIdentity).map { String(format: "%02x", $0) }.joined()
+            let legacy = base.appendingPathComponent("OfflineRebuild/" + legacyKey)
+            if legacy != root, FileManager.default.fileExists(atPath: legacy.path) { try FileManager.default.removeItem(at: legacy) }
+        }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseRoot)
+        let replica = try database.replicaID()
+        let generation = try database.generation
+        let since = try forceRebuild || generation == nil || database.syncCheckpoint != nil ? nil : database.revision
+        let parameters = Parameters(includeThumbnails: includeThumbnails, replicaID: replica,
+                                    generation: since == nil ? nil : generation, sinceRevision: since)
+        let parametersFile = root.appendingPathComponent("request.json")
+        if FileManager.default.fileExists(atPath: parametersFile.path),
+           try JSONDecoder().decode(Parameters.self, from: Data(contentsOf: parametersFile)) != parameters {
+            try FileManager.default.removeItem(at: root)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        }
+        try JSONEncoder().encode(parameters).write(to: parametersFile, options: .atomic)
         let jobFile = root.appendingPathComponent("job.json")
         let archive = root.appendingPathComponent("bundle.tar")
         var job: Job
         if FileManager.default.fileExists(atPath: jobFile.path) {
             job = try JSONDecoder().decode(Job.self, from: Data(contentsOf: jobFile))
         } else {
-            job = try await fetch(configuration, method: "POST", suffix: [], includeThumbnails: includeThumbnails)
+            job = try await fetch(configuration, method: "POST", suffix: [], parameters: parameters)
             try JSONEncoder().encode(job).write(to: jobFile, options: .atomic)
         }
         while job.state != "ready" {
@@ -71,7 +93,7 @@ public actor KeepsOfflineRebuild {
         let existing = (try? archive.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
         guard existing <= size else { throw failure("离线包断点长度错误") }
         if existing < size {
-            var request = request(configuration, method: "GET", suffix: [job.id.uuidString, "download"])
+            var request = try request(configuration, method: "GET", suffix: [job.id.uuidString, "download"])
             if existing > 0 { request.setValue("bytes=\(existing)-", forHTTPHeaderField: "Range") }
             request.setValue("\"\(digest)\"", forHTTPHeaderField: "If-Match")
             let download = OfflineFileDownload(file: archive, offset: existing, total: size, digest: digest, progress: progress)
@@ -99,20 +121,43 @@ public actor KeepsOfflineRebuild {
         }
         let manifest = try await unpack(archive, root: root, configuration: configuration, databaseRoot: databaseRoot, progress: progress)
         try FileManager.default.removeItem(at: root)
+        try await acknowledge(configuration: configuration, databaseRoot: databaseRoot)
         return manifest
     }
-    private func request(_ configuration: KeepsConfiguration, method: String, suffix: [String], includeThumbnails: Bool = true) -> URLRequest {
+    private struct Parameters: Codable, Equatable {
+        var includeThumbnails: Bool
+        var replicaID: String
+        var generation: String?
+        var sinceRevision: Int64?
+    }
+
+    public func acknowledge(configuration: KeepsConfiguration, databaseRoot: URL? = nil) async throws {
+        let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseRoot)
+        guard let generation = try database.generation, let revision = try database.revision else { return }
+        var url = configuration.baseURL
+        for part in ["libraries", configuration.libraryID, "replicas", try database.replicaID(), "ack"] { url.appendPathComponent(part) }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["generation": generation, "revision": revision])
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let token = configuration.accessCredential { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        let (data, response) = try await session.data(for: request)
+        guard let response = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
+        guard (200..<300).contains(response.statusCode) else { throw KeepsAPIError.http(response.statusCode, String(decoding: data, as: UTF8.self)) }
+    }
+
+    private func request(_ configuration: KeepsConfiguration, method: String, suffix: [String], parameters: Parameters? = nil) throws -> URLRequest {
         var url = configuration.baseURL
         for part in ["libraries", configuration.libraryID, "offline-rebuild"] + suffix { url.appendPathComponent(part) }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        if method == "POST" { request.httpBody = Data("{\"includeThumbnails\":\(includeThumbnails)}".utf8); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
+        if method == "POST" { request.httpBody = try JSONEncoder().encode(parameters); request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         if let token = configuration.accessCredential { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
         return request
     }
-    private func fetch(_ configuration: KeepsConfiguration, method: String, suffix: [String], includeThumbnails: Bool = true) async throws -> Job {
-        let (data, response) = try await session.data(for: request(configuration, method: method, suffix: suffix, includeThumbnails: includeThumbnails))
+    private func fetch(_ configuration: KeepsConfiguration, method: String, suffix: [String], parameters: Parameters? = nil) async throws -> Job {
+        let (data, response) = try await session.data(for: request(configuration, method: method, suffix: suffix, parameters: parameters))
         guard let response = response as? HTTPURLResponse else { throw KeepsAPIError.invalidResponse }
         guard (200..<300).contains(response.statusCode) else { throw KeepsAPIError.http(response.statusCode, String(decoding: data, as: UTF8.self)) }
         return try JSONDecoder().decode(Job.self, from: data)
@@ -124,9 +169,17 @@ public actor KeepsOfflineRebuild {
         let reader = try OfflineTarReader(archive)
         guard let first = try reader.next(), first.name == "manifest.json", first.size <= 1_048_576 else { throw failure("离线包缺少 manifest") }
         let manifest = try JSONDecoder().decode(KeepsOfflineManifest.self, from: reader.data(first.size))
-        guard manifest.formatVersion == 1, manifest.libraryID == configuration.libraryID,
+        guard (1...2).contains(manifest.formatVersion), manifest.libraryID == configuration.libraryID,
               manifest.assetCount >= 0, manifest.thumbnailCount >= 0, manifest.missingThumbnailCount >= 0,
               manifest.thumbnailCount + manifest.missingThumbnailCount == manifest.assetCount else { throw failure("离线包清单不匹配") }
+        if manifest.formatVersion == 2 {
+            guard let generation = manifest.generation, UUID(uuidString: generation) != nil,
+                  manifest.mode == "snapshot" || manifest.mode == "delta",
+                  (manifest.mode == "delta") == (manifest.fromRevision != nil),
+                  manifest.mode != "delta" || (manifest.thumbnailCount == 0 && (manifest.browseThumbnailCount ?? 0) == 0) else {
+                throw failure("离线包同步版本不完整")
+            }
+        }
         if let count = manifest.browseThumbnailCount, let missing = manifest.missingBrowseThumbnailCount {
             guard count >= 0, missing >= 0, count <= manifest.assetCount,
                   missing == manifest.assetCount - count else { throw failure("离线包快速浏览图清单不匹配") }
@@ -170,10 +223,18 @@ public actor KeepsOfflineRebuild {
                 await progress(Progress(phase: .importing, completed: try reader.position, total: archiveBytes + 1, message: "导入离线图库"))
             }
         }
+        snapshot.close()
         guard count == manifest.thumbnailCount, browseCount == (manifest.browseThumbnailCount ?? 0) else { throw failure("离线包缩略图数量错误") }
         try Task.checkCancellation()
         let database = try KeepsLibraryDatabase(configuration: configuration, rootDirectory: databaseRoot)
-        try database.replaceSnapshot(from: catalog, revision: manifest.revision, assetCount: manifest.assetCount)
+        if manifest.mode == "delta", let generation = manifest.generation, let fromRevision = manifest.fromRevision {
+            try database.applyDelta(from: catalog, generation: generation, fromRevision: fromRevision,
+                                    revision: manifest.revision, assetCount: manifest.assetCount)
+        } else {
+            let stagedGeneration = try { try KeepsLibraryDatabase(snapshotURL: catalog).generation }()
+            guard manifest.formatVersion == 1 || stagedGeneration == manifest.generation else { throw failure("离线包图库世代不匹配") }
+            try database.replaceSnapshot(from: catalog, revision: manifest.revision, assetCount: manifest.assetCount, consumingSource: true)
+        }
         await progress(Progress(phase: .importing, completed: archiveBytes + 1, total: archiveBytes + 1, message: "离线图库已准备好"))
         return manifest
     }

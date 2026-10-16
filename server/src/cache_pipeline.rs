@@ -133,15 +133,23 @@ impl Store {
         Ok(())
     }
     pub fn reconcile_cache(&self) -> Result<()> {
-        self.lock()?.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec) SELECT a.library_id,a.id,coalesce(d.content_hash,a.content_hash),? FROM catalog_assets a LEFT JOIN catalog_defaults d ON a.library_id=d.library_id AND a.id=d.asset_id WHERE a.trashed=0 ON CONFLICT(library_id,asset_id) DO UPDATE SET source_hash=excluded.source_hash,spec=excluded.spec,status='pending',attempts=0,available_at=0,last_error=NULL WHERE media_cache.source_hash!=excluded.source_hash OR media_cache.spec!=excluded.spec OR (media_cache.status='cancelled' AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=excluded.library_id AND p.asset_id=excluded.asset_id AND p.content_hash=excluded.source_hash AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))", [spec()?])?;
-        self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE status='ready' AND json_extract(thumbnail,'$.version') NOT LIKE 'video-v3:%' AND EXISTS (SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND (lower(a.filename) GLOB '*.mov' OR lower(a.filename) GLOB '*.mp4' OR lower(a.filename) GLOB '*.m4v' OR lower(a.filename) GLOB '*.avi' OR lower(a.filename) GLOB '*.mkv' OR lower(a.filename) GLOB '*.mts' OR lower(a.filename) GLOB '*.m2ts'))", [])?;
+        let mut db = self.lock()?;
+        let tx = db.transaction()?;
+        tx.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec) SELECT a.library_id,a.id,coalesce(d.content_hash,a.content_hash),? FROM catalog_assets a LEFT JOIN catalog_defaults d ON a.library_id=d.library_id AND a.id=d.asset_id WHERE a.trashed=0 ON CONFLICT(library_id,asset_id) DO UPDATE SET source_hash=excluded.source_hash,spec=excluded.spec,status='pending',attempts=0,available_at=0,last_error=NULL WHERE media_cache.source_hash!=excluded.source_hash OR media_cache.spec!=excluded.spec OR (media_cache.status='cancelled' AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=excluded.library_id AND p.asset_id=excluded.asset_id AND p.content_hash=excluded.source_hash AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))", [spec()?])?;
+        tx.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE status='ready' AND json_extract(thumbnail,'$.version') NOT LIKE 'video-v3:%' AND EXISTS (SELECT 1 FROM catalog_assets a WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND (lower(a.filename) GLOB '*.mov' OR lower(a.filename) GLOB '*.mp4' OR lower(a.filename) GLOB '*.m4v' OR lower(a.filename) GLOB '*.avi' OR lower(a.filename) GLOB '*.mkv' OR lower(a.filename) GLOB '*.mts' OR lower(a.filename) GLOB '*.m2ts'))", [])?;
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn recover_cache(&self) -> Result<()> {
-        self.lock()?.execute(
+        let mut db = self.lock()?;
+        let tx = db.transaction()?;
+        tx.execute(
             "UPDATE media_cache SET status='failed',last_error='服务已重启，媒体处理已中断，请人工重试' WHERE status='processing' AND NOT EXISTS(SELECT 1 FROM remote_cache_tasks r WHERE r.library_id=media_cache.library_id AND r.asset_id=media_cache.asset_id AND r.completed=0 AND r.expires_at>unixepoch())",
             [],
         )?;
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn cache_status(&self, library: &str) -> Result<Value> {
@@ -180,11 +188,21 @@ impl Store {
         )
     }
     pub fn rebuild_cache(&self, library: &str) -> Result<usize> {
-        Ok(self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE rowid IN (SELECT rowid FROM media_cache WHERE library_id=? AND status='ready' ORDER BY updated_at LIMIT 20)",[library])?)
+        let mut db = self.lock()?;
+        let tx = db.transaction()?;
+        let changed = tx.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL WHERE rowid IN (SELECT rowid FROM media_cache WHERE library_id=? AND status='ready' ORDER BY updated_at LIMIT 20)",[library])?;
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
+        Ok(changed)
     }
     pub fn retry_cache(&self, library: &str) -> Result<usize> {
-        self.lock()?.execute("UPDATE media_cache SET browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND browse_last_error IS NOT NULL",[library])?;
-        Ok(self.lock()?.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,updated_at=0 WHERE rowid IN (SELECT rowid FROM media_cache WHERE library_id=? AND status IN ('pending','failed') AND last_error IS NOT NULL ORDER BY updated_at LIMIT 20)",[library])?)
+        let mut db = self.lock()?;
+        let tx = db.transaction()?;
+        tx.execute("UPDATE media_cache SET browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND browse_last_error IS NOT NULL",[library])?;
+        let changed = tx.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,updated_at=0 WHERE rowid IN (SELECT rowid FROM media_cache WHERE library_id=? AND status IN ('pending','failed') AND last_error IS NOT NULL ORDER BY updated_at LIMIT 20)",[library])?;
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
+        Ok(changed)
     }
     pub fn cache_descriptors(&self, library: &str, asset: &str) -> Result<Option<(Value, Value)>> {
         let media = self.media_snapshot(library, asset)?;
@@ -210,6 +228,7 @@ impl Store {
         if let Some((lib, id, _)) = &row {
             tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
         }
+        crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(row)
     }
@@ -238,6 +257,7 @@ impl Store {
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("UPDATE media_cache SET status='pending',attempts=MAX(attempts-1,0),available_at=unixepoch()+30 WHERE library_id=? AND asset_id=? AND status='processing'",params![lib,id])?;
         tx.execute("UPDATE remote_cache_tasks SET completed=-1 WHERE library_id=? AND asset_id=? AND completed=0",params![lib,id])?;
+        crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(())
     }
@@ -251,6 +271,7 @@ impl Store {
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let failed = record_failure(&tx, lib, id, hash, error)?;
+        crate::revisions::flush(&tx)?;
         tx.commit()?;
         Ok(failed)
     }
@@ -315,10 +336,14 @@ impl Store {
         if let Some(browse) = self.browse_descriptor(lib, id)?
             && !previews.contains(&browse["objectRef"])?
         {
-            self.lock()?.execute(
+            let mut db = self.lock()?;
+            let tx = db.transaction()?;
+            tx.execute(
                 "UPDATE media_cache SET browse_thumbnail=NULL WHERE library_id=? AND asset_id=?",
                 params![lib, id],
             )?;
+            crate::revisions::flush(&tx)?;
+            tx.commit()?;
         }
         Ok(previews.contains(&thumbnail["objectRef"])? && standard_current(&standard)?)
     }
@@ -374,6 +399,7 @@ pub fn process_asset(
         tx.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec) SELECT a.library_id,a.id,coalesce(d.content_hash,a.content_hash),?3 FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE a.library_id=?1 AND a.id=?2 AND a.trashed=0 ON CONFLICT(library_id,asset_id) DO UPDATE SET source_hash=excluded.source_hash,spec=excluded.spec,status='pending',attempts=0,available_at=0,last_error=NULL WHERE media_cache.source_hash!=excluded.source_hash OR media_cache.spec!=excluded.spec OR (media_cache.status='cancelled' AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=excluded.library_id AND p.asset_id=excluded.asset_id AND p.content_hash=excluded.source_hash AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))",params![lib,id,spec()?])?;
         let reserved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=? AND p.asset_id=? AND l.expires_at>unixepoch())",params![lib,id],|r|r.get(0))?;
         if reserved {
+            crate::revisions::flush(&tx)?;
             tx.commit()?;
             return Ok(());
         }
@@ -387,6 +413,7 @@ pub fn process_asset(
         if row.as_ref().is_some_and(|r| r.1 == "pending") {
             tx.execute("UPDATE media_cache SET status='processing',attempts=attempts+1,updated_at=unixepoch() WHERE library_id=? AND asset_id=?",params![lib,id])?;
         }
+        crate::revisions::flush(&tx)?;
         tx.commit()?;
         row
     };
@@ -401,7 +428,11 @@ pub fn process_asset(
             crate::browse_cache::process_asset(store, previews, lib, id)?;
             return Ok(());
         }
-        store.lock()?.execute("UPDATE media_cache SET status='processing',attempts=1,last_error=NULL WHERE library_id=? AND asset_id=?", params![lib,id])?;
+        let mut db = store.lock()?;
+        let tx = db.transaction()?;
+        tx.execute("UPDATE media_cache SET status='processing',attempts=1,last_error=NULL WHERE library_id=? AND asset_id=?", params![lib,id])?;
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
     }
     ensure!(
         status == "pending" || status == "ready",
@@ -695,6 +726,38 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn revoking_ready_cache_publishes_immediately_and_noop_rebuild_keeps_version() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        seed(&store, 1)?;
+        store.reconcile_cache()?;
+        {
+            let mut db = store.lock()?;
+            let tx = db.transaction()?;
+            tx.execute(
+                "UPDATE media_cache SET status='ready',thumbnail='{}',standard='{}'",
+                [],
+            )?;
+            crate::revisions::flush(&tx)?;
+            tx.commit()?;
+        }
+        let before = store.library_revision("lib")?["revision"].as_i64().unwrap();
+        assert_eq!(store.rebuild_cache("lib")?, 1);
+        let after = store.library_revision("lib")?["revision"].as_i64().unwrap();
+        assert_eq!(after, before + 1);
+        assert_eq!(store.rebuild_cache("lib")?, 0);
+        assert_eq!(store.library_revision("lib")?["revision"], after);
+        assert_eq!(
+            store
+                .lock()?
+                .query_row("SELECT count(*) FROM catalog_revision_dirty", [], |r| r
+                    .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
     #[test]
     fn import_compute_lease_blocks_nas_claim_and_direct_encoding_until_expiry() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -779,6 +779,7 @@ pub(crate) async fn upload(
 
 #[cfg(test)]
 pub(crate) fn remove_schema(db: &Connection) -> Result<()> {
+    db.execute_batch("DROP TRIGGER IF EXISTS catalog_sync_asset_negative;")?;
     db.execute_batch(
         "DROP TABLE photo_edit_requests; DROP TABLE photo_edits;
 ALTER TABLE catalog_assets DROP COLUMN negative_hash;

@@ -8,8 +8,10 @@ pub mod media;
 pub mod navigation;
 mod photo_relations;
 pub mod previews;
+mod replicas;
 pub mod revisions;
 pub mod store;
+pub mod sync_navigation;
 pub mod versions;
 pub mod worker;
 
