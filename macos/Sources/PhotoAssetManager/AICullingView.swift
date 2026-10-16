@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import KeepsAPI
 
 struct AICullingView: View {
@@ -13,6 +14,11 @@ struct AICullingView: View {
     @State private var editsInstruction = false
     @State private var preferenceDraft = ""
     @State private var instructionDraft = ""
+    @State private var zoomed: KeepsAsset?
+    @State private var globalExposure = 0.0
+    @State private var photoSize = 240.0
+    @AppStorage("keeps.culling.preloadCount") private var preloadCount = 6
+    @State private var instructionError: String?
     @State private var enlarged: KeepsAsset?
     @State private var exposureSettings: [UUID: CullingExposureSettings] = [:]
     let returnToLibrary: () -> Void
@@ -20,8 +26,17 @@ struct AICullingView: View {
     var body: some View {
         ZStack {
             reviewContent
-                .disabled(enlarged != nil)
-                .accessibilityHidden(enlarged != nil)
+                .disabled(enlarged != nil || zoomed != nil)
+                .accessibilityHidden(enlarged != nil || zoomed != nil)
+            if let asset = zoomed {
+                VStack(spacing: 0) {
+                    CullingZoomView(asset: asset, configuration: library.configuration,
+                                    exposureEV: $globalExposure, close: { zoomed = nil })
+                    decisionControls(for: asset).padding(.bottom, 12)
+                }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(WorkspaceStyle.panel)
+            }
             if let asset = enlarged {
                 exposureEditor(asset)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -31,33 +46,44 @@ struct AICullingView: View {
         .task {
             if let configuration = library.configuration { store.configure(configuration) }
             preferences = store.preferences
+            instruction = store.session?.instruction ?? ""
             library.isCullingActive = true
         }
-        .onDisappear { store.cancel(); library.isCullingActive = false; library.refresh(force: true) }
+        .task(id: preloadIdentity) {
+            guard let configuration = library.configuration else { return }
+            await CullingFullSizeCache.shared.prefetch(assets: preloadAssets, configuration: configuration)
+        }
+        .onDisappear {
+            store.cancel(); library.isCullingActive = false; library.refresh(force: true)
+            Task { await CullingFullSizeCache.shared.cancel() }
+        }
     }
 
     private var reviewContent: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                Text("AI 筛片助手").font(.title2.bold())
-                Spacer()
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text("AI 筛片").font(.headline)
+                requirements
+                Spacer(minLength: 8)
+                if store.group != nil {
+                    Text("曝光").font(.subheadline)
+                    Slider(value: $globalExposure, in: -4...4).frame(width: 110)
+                        .accessibilityLabel("全局曝光")
+                    Text(String(format: "%+.1f", globalExposure)).monospacedDigit().frame(width: 36)
+                    Button { globalExposure = 0 } label: { Image(systemName: "arrow.counterclockwise") }
+                        .help("重置曝光")
+                    Text("照片大小").font(.subheadline)
+                    Slider(value: $photoSize, in: 220...480).frame(width: 110)
+                        .accessibilityLabel("照片大小")
+                }
+                Picker("预载", selection: $preloadCount) {
+                    ForEach([0, 3, 6, 12, 24], id: \.self) { count in Text("\(count) 张").tag(count) }
+                }.frame(width: 100)
                 if let session = store.session {
-                    Text("已过目 \(session.completed)/\(session.assets.count) 张").foregroundStyle(.secondary)
+                    Text("\(session.completed)/\(session.assets.count)").foregroundStyle(.secondary).monospacedDigit()
                 }
                 Button("稍后继续") { returnToLibrary() }.disabled(store.busy)
-            }
-            if let session = store.session {
-                Text(session.sourcePath ?? "恢复中的筛片任务").font(.headline).lineLimit(1)
-                    .help(session.sourcePath ?? "")
-                DisclosureGroup("本次使用的筛片偏好") {
-                    Text(session.preferences ?? "未设置长期偏好").frame(maxWidth: .infinity, alignment: .leading)
-                    if !session.instruction.isEmpty { Text("本次要求：" + session.instruction) }
-                    Text("偏好在开始时固定。新的长期偏好用于下一次目录筛片。")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
-                Button("编辑长期偏好") { beginPreferenceEditing() }
-                    .disabled(store.busy)
-            }
+            }.controlSize(.small)
             if store.session == nil {
                 setup
             } else if store.finished {
@@ -65,10 +91,8 @@ struct AICullingView: View {
                     description: Text("已确认 \((store.session?.completed ?? 0) - (store.session?.skippedCount ?? 0)) 张，跳过 \(store.session?.skippedCount ?? 0) 张。跳过的照片保持原标记；开始后新加入目录的照片不在本次清单内。"))
                 Button("完成") { store.finish(); if store.session == nil { returnToLibrary() } }
             } else if let group = store.group, let session = store.session {
-                Text(group.title).font(.title3.bold())
-                Text(group.reason).foregroundStyle(.secondary)
                 ScrollView {
-                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 16)], spacing: 16) {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: photoSize, maximum: photoSize), spacing: 8)], alignment: .leading, spacing: 8) {
                         ForEach(group.photos, id: \.index) { photo in
                             card(photo, asset: session.assets[photo.index])
                         }
@@ -97,7 +121,7 @@ struct AICullingView: View {
                     .frame(maxHeight: 100)
             }
         }
-        .padding(24)
+        .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .interactiveDismissDisabled(store.busy)
         .onChange(of: store.session?.completed) { _, _ in exposureSettings.removeAll() }
@@ -107,7 +131,8 @@ struct AICullingView: View {
                              error: preferenceError, cancel: { editsPreferences = false }) {
                 do {
                     try store.savePreferences(preferenceDraft)
-                    preferences = preferenceDraft
+                    preferences = store.preferences
+                    try store.updateRequirements(preferences: preferences, instruction: instruction)
                     preferenceError = nil
                     editsPreferences = false
                 } catch { preferenceError = String(reflecting: error) }
@@ -115,9 +140,13 @@ struct AICullingView: View {
         }
         .sheet(isPresented: $editsInstruction) {
             textEditingSheet(title: "本次目录的补充要求", text: $instructionDraft,
-                             cancel: { editsInstruction = false }) {
-                instruction = instructionDraft
-                editsInstruction = false
+                             error: instructionError, cancel: { editsInstruction = false }) {
+                do {
+                    try store.updateRequirements(preferences: preferences, instruction: instructionDraft)
+                    instruction = instructionDraft
+                    editsInstruction = false
+                    instructionError = nil
+                } catch { instructionError = AIEditingFailure.userMessage(error) }
             }
         }
     }
@@ -126,36 +155,65 @@ struct AICullingView: View {
         CullingExposureView(asset: asset, client: library.client,
             settings: Binding(get: { exposureSettings[asset.id] ?? CullingExposureSettings() },
                               set: { exposureSettings[asset.id] = $0 }),
-            kept: Binding(get: {
-                guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return false }
-                return store.session?.kept.contains(index) == true
-            }, set: { value in
-                guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }),
-                      store.session?.kept.contains(index) != value else { return }
-                store.toggle(index)
-            }), canChoose: !store.busy && !store.hasPending && !store.loadFailed,
+            flagState: flagBinding(for: asset), rating: ratingBinding(for: asset),
+            proposal: proposal(for: asset),
+            canChoose: !store.busy && !store.hasPending && !store.loadFailed,
             returnToGroup: { enlarged = nil })
+    }
+
+    private func flagBinding(for asset: KeepsAsset) -> Binding<String> {
+        Binding(get: {
+            guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return "unflagged" }
+            if store.session?.rejected.contains(index) == true { return "rejected" }
+            return store.session?.picked?.contains(index) == true ? "picked" : "unflagged"
+        }, set: { value in
+            guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return }
+            store.setFlag(index: index, value: value)
+        })
+    }
+
+    private func ratingBinding(for asset: KeepsAsset) -> Binding<Int> {
+        Binding(get: {
+            guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return asset.rating }
+            return store.session?.ratings[index] ?? asset.rating
+        }, set: { value in
+            guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return }
+            store.setRating(index: index, value: value)
+        })
+    }
+
+    private func proposal(for asset: KeepsAsset) -> AICullingResult.Photo? {
+        guard let index = store.session?.assets.firstIndex(where: { $0.id == asset.id }) else { return nil }
+        return store.group?.photos.first { $0.index == index }
+    }
+
+    private func decisionControls(for asset: KeepsAsset) -> some View {
+        CullingDecisionControls(flagState: flagBinding(for: asset), rating: ratingBinding(for: asset), proposal: proposal(for: asset))
+            .disabled(store.busy || store.hasPending || store.loadFailed)
+    }
+
+    private var preloadAssets: [KeepsAsset] {
+        guard let session = store.session else { return [] }
+        let current = store.group?.photos.map(\.index) ?? []
+        let laterGroups = session.groups.dropFirst(session.groupIndex + 1).flatMap { $0.photos.map(\.index) }
+        let unprocessed = Array(session.offset..<session.assets.count)
+        var seen = Set<Int>()
+        let indices = (current + Array((laterGroups + unprocessed).prefix(max(0, min(24, preloadCount)))))
+            .filter { session.assets.indices.contains($0) && seen.insert($0).inserted }
+        return indices.map { session.assets[$0] }
+    }
+
+    private var preloadIdentity: String {
+        (library.configuration?.baseURL.absoluteString ?? "") + "|" +
+        (library.configuration?.libraryID ?? "") + "|" +
+        (library.configuration?.accessCredential ?? "") + "|" +
+        preloadAssets.map { $0.id.uuidString + ($0.standard?.version ?? "") }.joined(separator: ",")
     }
 
     private var setup: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
-                Text(library.query.directory ?? "请先在服务器来源中打开要筛选的目录").font(.headline)
-                    .fixedSize(horizontal: false, vertical: true)
                 Toggle("包含子目录", isOn: $includeSubdirectories)
-                Text("从整个目录读取照片清单，AI 按场景带你逐组过目。确认或跳过后自动继续，直到清单全部看完。当前搜索、评分筛选和照片选择不限制本次范围，隐藏目录仍遵循图库设置。")
-                Text("个人长期偏好").font(.headline)
-                preferenceSummary(preferences, placeholder: "尚未设置长期偏好", action: beginPreferenceEditing)
-                Text("例如：更重视真实表情；不同构图都保留；家庭纪念照宁可多留；连拍通常留两张。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("本次目录的补充要求")
-                preferenceSummary(instruction, placeholder: "未设置补充要求") {
-                    instructionDraft = instruction
-                    editsInstruction = true
-                }
-                Text("确认一组后，所选标为留用、其余标为排除；跳过保持原标记。不会移动或删除文件。长期偏好由你明确保存，不从单次改选自动推断。")
-                Text("使用「AI 修图」账户发送照片预览分析。无标准图时使用缩略图，推荐不能代替原片级对焦检查；进度保存在这台 Mac。")
-                    .font(.callout).foregroundStyle(.secondary)
                 if let preferenceError { Text(preferenceError).foregroundStyle(.red).textSelection(.enabled) }
                 Button("保存偏好并开始此目录") {
                     guard let client = library.client, let path = library.query.directory else { return }
@@ -172,35 +230,30 @@ struct AICullingView: View {
         }
     }
 
+    private var requirements: some View {
+        HStack(spacing: 6) {
+            Button("长期偏好", action: beginPreferenceEditing)
+            Button("本次要求", action: beginInstructionEditing)
+        }.disabled(store.busy || store.hasPending || store.loadFailed)
+    }
+
+    private func beginInstructionEditing() {
+        instructionDraft = instruction
+        instructionError = nil
+        editsInstruction = true
+    }
+
     private func beginPreferenceEditing() {
         preferenceDraft = preferences
         preferenceError = nil
         editsPreferences = true
     }
 
-    private func preferenceSummary(_ text: String, placeholder: String, action: @escaping () -> Void) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(text.isEmpty ? placeholder : text)
-                .foregroundStyle(text.isEmpty ? .secondary : .primary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            Text("双击编辑").font(.caption).foregroundStyle(.secondary)
-        }
-        .padding(12)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.3)))
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2, perform: action)
-        .accessibilityAction(named: Text("编辑"), action)
-    }
-
     private func textEditingSheet(title: String, text: Binding<String>, error: String? = nil,
                                   cancel: @escaping () -> Void, save: @escaping () -> Void) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.title2)
-            TextEditor(text: text)
-                .scrollContentBackground(.hidden)
-                .padding(10)
+            CullingRequirementsEditor(text: text)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(.background, in: RoundedRectangle(cornerRadius: 8))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(.secondary.opacity(0.3)))
@@ -219,49 +272,29 @@ struct AICullingView: View {
     }
 
     private func card(_ photo: AICullingResult.Photo, asset: KeepsAsset) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            KeepsPreviewImage(asset: asset, configuration: library.configuration, loadStandard: true)
-                .frame(height: 210).frame(maxWidth: .infinity)
+        VStack(alignment: .leading, spacing: 6) {
+            CullingPreviewView(asset: asset, configuration: library.configuration, exposureEV: globalExposure)
+                .frame(height: photoSize * 0.75).frame(maxWidth: .infinity)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { zoomed = asset }
             HStack {
                 Text(asset.originalFilename).lineLimit(1)
                 Spacer()
+                Button("放大") { zoomed = asset }
                 Button("编辑") { enlarged = asset }
             }
-            HStack {
-                let kept = store.session?.kept.contains(photo.index) == true
-                Button {
-                    if !kept { store.toggle(photo.index) }
-                } label: {
-                    Label("留用", systemImage: kept ? "checkmark.circle.fill" : "checkmark.circle")
-                }
-                .tint(kept ? .accentColor : .secondary)
-                Button {
-                    if kept { store.toggle(photo.index) }
-                } label: {
-                    Label("排除", systemImage: kept ? "xmark.circle" : "xmark.circle.fill")
-                }
-                .tint(kept ? .secondary : .red)
-            }
-            .buttonStyle(.bordered)
-            .disabled(store.busy || store.hasPending || store.loadFailed)
-            if photo.recommended { Text("AI 推荐保留").font(.caption.bold()).foregroundStyle(.green) }
-            Text(photo.reason).font(.callout).foregroundStyle(.secondary)
-            Text("原标记：\(asset.flagState == "picked" ? "留用" : asset.flagState == "rejected" ? "排除" : "未标记")")
-                .font(.caption).foregroundStyle(.secondary)
-        }.padding(12)
+            decisionControls(for: asset)
+                .help(photo.reason)
+        }.padding(8)
             .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(store.session?.kept.contains(photo.index) == true ? Color.accentColor : .clear, lineWidth: 2))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(store.session?.rejected.contains(photo.index) == true ? Color.red : .clear, lineWidth: 2))
     }
 
     private var reviewActions: some View {
         HStack {
-            Button("跳过这组") { store.skip() }.disabled(store.busy || store.hasPending)
-            Button("整组留用") { confirm(keepAll: true) }.disabled(store.busy || store.hasPending)
             Spacer()
-            let keep = store.session?.kept.count ?? 0
-            let reject = (store.group?.photos.count ?? 0) - keep
-            Text("留用 \(keep) 张 · 排除 \(reject) 张").foregroundStyle(.secondary)
-            Button(store.hasPending ? "继续保存已确认标记" : "确认这组并继续") { confirm() }
+            Text("弃用 \(store.session?.rejected.count ?? 0) 张").foregroundStyle(.secondary)
+            Button(store.hasPending ? "继续保存已确认标记" : "下一组") { confirm() }
                 .buttonStyle(.borderedProminent).disabled(store.busy)
         }
     }
@@ -270,8 +303,93 @@ struct AICullingView: View {
         guard let client = library.client else { return }
         store.analyze(client: client, editor: batch.editor)
     }
-    private func confirm(keepAll: Bool = false) {
+    private func confirm() {
         guard let client = library.client else { return }
-        store.confirm(client: client, keepAll: keepAll)
+        store.confirm(client: client)
+    }
+}
+
+private struct CullingRequirementsEditor: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeCoordinator() -> Coordinator { Coordinator(text: $text) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.drawsBackground = false
+        let editor = NSTextView()
+        editor.isRichText = false
+        editor.font = .systemFont(ofSize: 14)
+        editor.textColor = .labelColor
+        editor.drawsBackground = false
+        editor.textContainerInset = NSSize(width: 12, height: 12)
+        editor.textContainer?.lineFragmentPadding = 0
+        editor.textContainer?.widthTracksTextView = true
+        editor.isHorizontallyResizable = false
+        editor.isVerticallyResizable = true
+        editor.autoresizingMask = [.width]
+        editor.minSize = .zero
+        editor.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        editor.delegate = context.coordinator
+        editor.string = text
+        editor.setSelectedRange(NSRange(location: 0, length: 0))
+        scroll.documentView = editor
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        context.coordinator.text = $text
+        guard let editor = scroll.documentView as? NSTextView, editor.string != text else { return }
+        editor.string = text
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var text: Binding<String>
+        init(text: Binding<String>) { self.text = text }
+        func textDidChange(_ notification: Notification) {
+            guard let editor = notification.object as? NSTextView else { return }
+            text.wrappedValue = editor.string
+        }
+    }
+}
+
+struct CullingDecisionControls: View {
+    @Binding var flagState: String
+    @Binding var rating: Int
+    let proposal: AICullingResult.Photo?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let proposal {
+                HStack(spacing: 6) {
+                    Text("AI")
+                    Text(proposal.rejected ? "弃用" : "不弃用")
+                    if proposal.rating > 0 {
+                        Text(String(repeating: "★", count: min(5, proposal.rating)))
+                    } else {
+                        Text("旧记录未评分")
+                    }
+                }.font(.caption2).foregroundStyle(.blue).help(proposal.reason)
+            }
+            HStack(spacing: 8) {
+            Button { flagState = flagState == "picked" ? "unflagged" : "picked" } label: {
+                Image(systemName: flagState == "picked" ? "flag.fill" : "flag")
+            }.tint(flagState == "picked" ? .green : .secondary)
+                .buttonStyle(.bordered).help("留用；再次点击取消").accessibilityLabel("留用")
+            Button { flagState = flagState == "rejected" ? "unflagged" : "rejected" } label: {
+                Image(systemName: flagState == "rejected" ? "xmark.circle.fill" : "xmark.circle")
+            }.tint(flagState == "rejected" ? .red : .secondary)
+                .buttonStyle(.bordered).help("弃用；再次点击取消").accessibilityLabel("弃用")
+            HStack(spacing: 4) {
+                ForEach(1...5, id: \.self) { star in
+                    Button { rating = rating == star ? 0 : star } label: {
+                        Image(systemName: star <= rating ? "star.fill" : "star")
+                            .foregroundStyle(star <= rating ? Color.yellow : Color.secondary)
+                    }.buttonStyle(.plain).help("\(star) 星").accessibilityLabel("\(star) 星")
+                }
+            }
+            }
+        }
     }
 }

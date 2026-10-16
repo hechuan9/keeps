@@ -70,10 +70,10 @@ final class PhotoCanvasView: NSView {
                       width: size.width, height: size.height)
     }
 
-    func update(image: CGImage) {
+    func update(image: CGImage, preserveViewport: Bool = false) {
         guard self.image !== image else { return }
         self.image = image
-        fitsWindow = true
+        if !preserveViewport { fitsWindow = true }
         resizeImage()
     }
     override func layout() { super.layout(); resizeImage() }

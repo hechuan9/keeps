@@ -10,7 +10,9 @@ struct CullingExposureView: View {
     let asset: KeepsAsset
     let client: KeepsClient?
     @Binding var settings: CullingExposureSettings
-    @Binding var kept: Bool
+    @Binding var flagState: String
+    @Binding var rating: Int
+    let proposal: AICullingResult.Photo?
     let canChoose: Bool
     let returnToGroup: () -> Void
     @State private var renderer = CullingExposureRenderer()
@@ -62,10 +64,7 @@ struct CullingExposureView: View {
                     Text("仅临时检查原片，不发布调色。自动曝光展开现有明暗层次，不代表恢复已丢失的信息；AI 推荐仍基于此前预览。")
                         .font(.caption).foregroundStyle(.secondary)
                     Spacer()
-                    HStack {
-                        Button("留用") { kept = true }.tint(kept ? .accentColor : .secondary)
-                        Button("排除") { kept = false }.tint(kept ? .secondary : .accentColor)
-                    }.buttonStyle(.borderedProminent).disabled(!canChoose)
+                    CullingDecisionControls(flagState: $flagState, rating: $rating, proposal: proposal).disabled(!canChoose)
                 }.frame(width: 260)
             }
         }.padding(24)

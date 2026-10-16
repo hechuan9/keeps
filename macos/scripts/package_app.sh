@@ -23,6 +23,7 @@ MARKETING_VERSION="$(awk '$1 == "MARKETING_VERSION" { print $3 }' "$ROOT_DIR/Ver
 BUILD_NUMBER="$(awk '$1 == "CURRENT_PROJECT_VERSION" { print $3 }' "$ROOT_DIR/Version.xcconfig")"
 [[ -n "$MARKETING_VERSION" && -n "$BUILD_NUMBER" ]]
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier local.keeps.debug" "$CONTENTS_DIR/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Keeps Debug" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Keeps Debug" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable Keeps" "$CONTENTS_DIR/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $MARKETING_VERSION" "$CONTENTS_DIR/Info.plist"

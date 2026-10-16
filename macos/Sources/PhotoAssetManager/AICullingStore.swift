@@ -8,7 +8,8 @@ import UniformTypeIdentifiers
 struct AICullingResult: Codable {
     struct Photo: Codable {
         let index: Int
-        let recommended: Bool
+        let rejected: Bool
+        let rating: Int
         let reason: String
     }
     struct Group: Codable {
@@ -18,38 +19,73 @@ struct AICullingResult: Codable {
     }
     let groups: [Group]
 
-    static func previewRole(for asset: KeepsAsset) throws -> KeepsMediaRole {
-        if asset.standard != nil { return .standard }
-        if asset.thumbnail != nil { return .thumbnail }
-        if asset.preview != nil { return .preview }
-        throw AIEditingFailure("照片 \(asset.originalFilename)（\(asset.id)）尚无可用预览，请先完成目录的媒体处理。")
-    }
-
     func validate(count: Int) throws {
         let indices = groups.flatMap { $0.photos.map(\.index) }
         guard count > 0, !groups.isEmpty, groups.allSatisfy({ !$0.photos.isEmpty }),
               indices.count == count, Set(indices) == Set(0..<count),
-              groups.allSatisfy({ $0.photos.contains(where: \.recommended) }) else {
-            throw AIEditingFailure("AI 分组遗漏、重复了照片或没有保留候选，请重新分析。")
+              groups.allSatisfy({ $0.photos.allSatisfy { (1...5).contains($0.rating) } }) else {
+            throw AIEditingFailure("AI 分组遗漏、重复了照片或未给出 1–5 星评分，请重新分析。")
         }
     }
 }
 
 @MainActor final class AICullingStore: ObservableObject {
+    struct Decision: Codable {
+        let flagState: String
+        let rating: Int
+    }
     struct Session: Codable {
         var assets: [KeepsAsset]
         var instruction: String
         var offset = 0
         var groups: [AICullingResult.Group] = []
         var groupIndex = 0
-        var kept: Set<Int> = []
+        var rejected: Set<Int> = []
+        var picked: Set<Int>?
+        var ratings: [Int: Int] = [:]
         var completed = 0
-        var pending: [Int: String] = [:]
+        var pending: [Int: Decision] = [:]
         var confirming = false
         var sourcePath: String?
         var recursive: Bool?
         var preferences: String?
         var skippedCount: Int?
+
+        static func restore(from data: Data) throws -> Session {
+            guard var document = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let kept = document["kept"] as? [Int] else {
+                return try JSONDecoder().decode(Session.self, from: data)
+            }
+            let assets = document["assets"] as? [[String: Any]] ?? []
+            var groups = document["groups"] as? [[String: Any]] ?? []
+            for groupIndex in groups.indices {
+                var photos = groups[groupIndex]["photos"] as? [[String: Any]] ?? []
+                for index in photos.indices {
+                    let assetIndex = photos[index]["index"] as? Int ?? -1
+                    photos[index]["rejected"] = !(photos[index].removeValue(forKey: "recommended") as? Bool ?? true)
+                    photos[index]["rating"] = assets.indices.contains(assetIndex) ? assets[assetIndex]["rating"] as? Int ?? 0 : 0
+                }
+                groups[groupIndex]["photos"] = photos
+            }
+            let groupIndex = document["groupIndex"] as? Int ?? 0
+            let current = groups.indices.contains(groupIndex) ? groups[groupIndex]["photos"] as? [[String: Any]] ?? [] : []
+            document["groups"] = groups
+            document["rejected"] = current.compactMap { $0["index"] as? Int }.filter { !kept.contains($0) }
+            document["ratings"] = Dictionary(uniqueKeysWithValues: current.compactMap { photo -> (String, Int)? in
+                guard let index = photo["index"] as? Int, let rating = photo["rating"] as? Int else { return nil }
+                return (String(index), rating)
+            })
+            let pending = document["pending"] as? [String: String] ?? [:]
+            var decisions: [String: [String: Any]] = [:]
+            for (key, flag) in pending {
+                let index = Int(key) ?? -1
+                decisions[key] = ["flagState": flag,
+                                  "rating": assets.indices.contains(index) ? assets[index]["rating"] as? Int ?? 0 : 0]
+            }
+            document["pending"] = decisions
+            document.removeValue(forKey: "kept")
+            return try JSONDecoder().decode(Session.self, from: JSONSerialization.data(withJSONObject: document))
+        }
 
         var prompt: String {
             "个人长期偏好：\n" + (preferences ?? "") + "\n\n本次目录要求：\n" + instruction
@@ -96,7 +132,8 @@ struct AICullingResult: Codable {
             }
             let file = root.appendingPathComponent("session.json")
             if FileManager.default.fileExists(atPath: file.path) {
-                session = try JSONDecoder().decode(Session.self, from: Data(contentsOf: file))
+                session = try Session.restore(from: Data(contentsOf: file))
+                try save()
             }
         } catch { loadFailed = true; report(error) }
     }
@@ -106,6 +143,16 @@ struct AICullingResult: Codable {
                                                 attributes: [.posixPermissions: 0o700])
         try JSONEncoder().encode(text).write(to: storageRoot.appendingPathComponent("preferences.json"), options: .atomic)
         preferences = text
+    }
+
+    func updateRequirements(preferences: String, instruction: String) throws {
+        guard !busy, !hasPending, !loadFailed else { throw AIEditingFailure("请等待当前操作完成后再修改筛片要求。") }
+        guard var updated = session else { return }
+        guard let directory else { throw AIEditingFailure("筛片工作台尚未初始化。") }
+        updated.preferences = preferences
+        updated.instruction = instruction
+        try JSONEncoder().encode(updated).write(to: directory.appendingPathComponent("session.json"), options: .atomic)
+        session = updated
     }
 
     func startDirectory(client: KeepsClient, path: String, recursive: Bool, instruction: String, showHidden: Bool = false) {
@@ -147,10 +194,23 @@ struct AICullingResult: Codable {
         }
     }
 
-    func toggle(_ index: Int) {
-        guard !busy, !loadFailed, !hasPending else { return }
-        if session?.kept.contains(index) == true { session?.kept.remove(index) }
-        else { session?.kept.insert(index) }
+    func setFlag(index: Int, value: String) {
+        guard !busy, !loadFailed, !hasPending, ["picked", "rejected", "unflagged"].contains(value),
+              group?.photos.contains(where: { $0.index == index }) == true else { return }
+        session?.rejected.remove(index)
+        session?.picked?.remove(index)
+        if value == "rejected" { session?.rejected.insert(index) }
+        if value == "picked" {
+            if session?.picked == nil { session?.picked = [] }
+            session?.picked?.insert(index)
+        }
+        do { try save() } catch { report(error) }
+    }
+
+    func setRating(index: Int, value: Int) {
+        guard !busy, !loadFailed, !hasPending, (0...5).contains(value),
+              group?.photos.contains(where: { $0.index == index }) == true else { return }
+        session?.ratings[index] = value
         do { try save() } catch { report(error) }
     }
 
@@ -168,26 +228,24 @@ struct AICullingResult: Codable {
             for (index, asset) in assets.enumerated() {
                 try Task.checkCancellation()
                 self.status = "准备预览 \(index + 1)/\(assets.count)"
-                let source = job.appendingPathComponent("source-\(index)")
+                let source: URL
                 do {
-                    let role = try AICullingResult.previewRole(for: asset)
-                    try await client.downloadPreview(assetID: asset.id, role: role, to: source)
+                    source = try await CullingFullSizeCache.shared.file(asset: asset, configuration: client.configuration)
                 } catch {
                     throw AIEditingFailure("准备照片 \(asset.originalFilename)（\(asset.id)）失败：\n" + String(reflecting: error))
                 }
                 let output = job.appendingPathComponent("photo-\(index).jpg")
                 try await Self.makePreview(source: source, output: output)
-                try FileManager.default.removeItem(at: source)
                 images.append(output)
             }
             self.status = "AI 正在比较照片并分组"
-            let data = try await editor.cullPhotos(images, instruction: session.prompt + "\n\n输入图像可能是低分辨率缩略图。只按可见信息判断，不将缺少细节视为失焦，不推断原片清晰度。", job: job)
+            let data = try await editor.cullPhotos(images, instruction: session.prompt + "\n\n输入图像由全尺寸照片缩小生成。只按可见信息判断，不将缩图缺少细节视为失焦，不推断原片清晰度。", job: job)
             try Task.checkCancellation()
             let result = try JSONDecoder().decode(AICullingResult.self, from: data)
             try result.validate(count: assets.count)
             self.session?.groups = result.groups.map { group in
                 AICullingResult.Group(title: group.title, reason: group.reason, photos: group.photos.map {
-                    AICullingResult.Photo(index: $0.index + session.offset, recommended: $0.recommended, reason: $0.reason)
+                    AICullingResult.Photo(index: $0.index + session.offset, rejected: $0.rejected, rating: $0.rating, reason: $0.reason)
                 })
             }
             self.session?.groupIndex = 0
@@ -197,34 +255,29 @@ struct AICullingResult: Codable {
         }
     }
 
-    func confirm(client: KeepsClient, keepAll: Bool = false) {
+    func confirm(client: KeepsClient) {
         guard !busy, !loadFailed, let group, let session else { return }
         paused = false
         run {
             if !self.hasPending {
                 self.session?.confirming = true
                 self.session?.pending = Dictionary(uniqueKeysWithValues: group.photos.map {
-                    ($0.index, keepAll || session.kept.contains($0.index) ? "picked" : "rejected")
+                    ($0.index, Decision(flagState: session.rejected.contains($0.index) ? "rejected" : (session.picked?.contains($0.index) == true ? "picked" : "unflagged"),
+                                        rating: session.ratings[$0.index] ?? $0.rating))
                 })
             }
             // Persist the explicit decision before the first server mutation so interrupted groups can resume.
             try self.save()
             for index in (self.session?.pending.keys.sorted() ?? []) {
                 try Task.checkCancellation()
-                guard let flag = self.session?.pending[index] else { continue }
+                guard let decision = self.session?.pending[index] else { continue }
                 self.status = "保存标记，剩余 \(self.session?.pending.count ?? 0) 张"
-                _ = try await client.updateAsset(id: session.assets[index].id, patch: KeepsAssetPatch(flagState: flag))
+                _ = try await client.updateAsset(id: session.assets[index].id, patch: KeepsAssetPatch(rating: decision.rating, flagState: decision.flagState))
                 self.session?.pending[index] = nil
                 try self.save()
             }
             try self.advance()
         }
-    }
-
-    func skip() {
-        guard !busy, !loadFailed, !hasPending else { return }
-        paused = false
-        do { try advance(skipped: true) } catch { report(error) }
     }
 
     func finish() {
@@ -238,11 +291,12 @@ struct AICullingResult: Codable {
     func cancel() { paused = true; task?.cancel() }
 
     private func selectRecommendations() {
-        session?.kept = Set(group?.photos.filter(\.recommended).map(\.index) ?? [])
+        session?.picked = []
+        session?.rejected = Set(group?.photos.filter(\.rejected).map(\.index) ?? [])
+        session?.ratings = Dictionary(uniqueKeysWithValues: group?.photos.map { ($0.index, $0.rating) } ?? [])
     }
-    private func advance(skipped: Bool = false) throws {
+    private func advance() throws {
         guard let group else { return }
-        if skipped { session?.skippedCount = (session?.skippedCount ?? 0) + group.photos.count }
         session?.confirming = false
         session?.completed += group.photos.count
         session?.groupIndex += 1

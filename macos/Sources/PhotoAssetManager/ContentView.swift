@@ -162,7 +162,7 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(spacing: 20) {
             railButton("显示或隐藏目录", icon: "sidebar.left", selected: showsSidebar) { showsSidebar.toggle() }
-            Text("Keeps").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
+            Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? "Keeps").font(.system(size: 14, weight: .semibold)).foregroundStyle(.secondary)
             Button {
                 guard let client = library.client else { return }
                 importTasks.configure(client) { library.refreshNavigation(); library.refresh(force: true) }
