@@ -1,7 +1,6 @@
 use serde_json::{Value, json};
 use std::{
     io::Write,
-    os::unix::fs::PermissionsExt,
     process::{Command, Stdio},
 };
 
@@ -9,19 +8,12 @@ use std::{
 fn inspection_is_streaming_read_only_and_independent_of_catalog() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap();
-    // A deterministic ExifTool response isolates the CLI contract from installed media tools.
-    let exiftool = root.join("exiftool");
-    std::fs::write(
-        &exiftool,
-        "#!/bin/sh\nprintf '%s\\n' '[{\"EXIF:DateTimeOriginal\":\"0000:00:00 00:00:00\",\"PNG:ImageWidth\":2,\"PNG:ImageHeight\":3}]'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&exiftool, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let timeout = root.join("timeout");
-    std::fs::write(&timeout, "#!/bin/sh\nshift 4\nexec \"$@\"\n").unwrap();
-    std::fs::set_permissions(&timeout, std::fs::Permissions::from_mode(0o755)).unwrap();
     let photo = root.join("sample.png");
-    let bytes = b"immutable inspection fixture";
+    let bytes: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 3, 8, 2,
+        0, 0, 0, 54, 136, 73, 214, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96, 192, 2, 0, 0, 21,
+        0, 1, 170, 101, 151, 196, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
     std::fs::write(&photo, bytes).unwrap();
     let link = root.join("link.png");
     std::os::unix::fs::symlink(&photo, &link).unwrap();
@@ -77,13 +69,7 @@ fn inspection_is_streaming_read_only_and_independent_of_catalog() {
         result["sha256"],
         keeps_server::media::sha256_file(&photo).unwrap()
     );
-    assert_eq!(
-        result["capture"]["captureTime"],
-        chrono::DateTime::<chrono::Utc>::from(
-            std::fs::metadata(&photo).unwrap().modified().unwrap()
-        )
-        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-    );
+    assert!(result["capture"]["captureTime"].is_null());
     assert_eq!(result["width"], 2);
     assert_eq!(result["height"], 3);
     assert_eq!(result["priority"], 2);
