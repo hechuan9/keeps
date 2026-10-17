@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod identity;
 pub mod jobs;
 pub mod media;
+mod native_metadata;
 pub mod navigation;
 mod photo_relations;
 pub mod previews;
@@ -13,6 +14,7 @@ pub mod revisions;
 pub mod store;
 pub mod sync_navigation;
 pub mod versions;
+mod video_metadata;
 pub mod worker;
 
 pub mod remote_worker;

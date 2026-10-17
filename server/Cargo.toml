@@ -5,6 +5,8 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+exif = { git = "https://github.com/hechuan9/exif-rs", rev = "edbcc6148ce8658309b08874c2e806c818f880f7" }
+xmp_toolkit = "1.12.1"
 libc = "0.2"
 http-body-util = "0.1"
 anyhow = "1"

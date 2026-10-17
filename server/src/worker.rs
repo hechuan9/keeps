@@ -59,7 +59,16 @@ fn run_claimed(
                 jobs.set_phase(&job.id, "publishing")?;
             }
             let _directory_guard = jobs.directory_mutation.write().unwrap();
-            crate::sync_navigation::refresh(store, jobs, &job.library_id)?;
+            if job.scope_kind == "file" {
+                crate::sync_navigation::refresh_file(
+                    store,
+                    jobs,
+                    &job.library_id,
+                    Path::new(&job.path),
+                )?;
+            } else {
+                crate::sync_navigation::refresh(store, jobs, &job.library_id)?;
+            }
             store.finish_revision_batch(&job.id, false)
         })();
         if let Err(error) = publication {
@@ -473,7 +482,7 @@ fn process_file(
 ) -> Result<bool> {
     jobs.validate_path(path.parent().context("original has no parent")?)?;
     let text = path.to_str().context("original path must be UTF-8")?;
-    let (mut size, mut mtime) = file_stamp(path)?;
+    let (size, mtime) = file_stamp(path)?;
     let mut sidecars = media::sidecar_stamp(path)?;
     let previous = jobs.file_state(&job.folder_id, text)?;
     let mut asset_id = previous
@@ -499,8 +508,12 @@ fn process_file(
     let mut identity_checked = false;
     let result: Result<bool> = (|| {
         let processor = MediaProcessor::new();
+        let started = std::time::Instant::now();
         hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
+        let digest_ms = started.elapsed().as_millis();
+        let extracted = std::time::Instant::now();
         let metadata = processor.extract(path)?;
+        let metadata_ms = extracted.elapsed().as_millis();
         if stopped(jobs, job, stop)? {
             return Ok(false);
         }
@@ -511,20 +524,28 @@ fn process_file(
         let now = Utc::now().to_rfc3339();
         let mut snapshot = json!({
             "cameraMake": metadata.camera_make, "cameraModel": metadata.camera_model,
-            "lensModel": metadata.lens_model, "originalFilename": path.file_name().context("original filename missing")?.to_str().context("original filename must be UTF-8")?,
+            "lensModel": metadata.lens_model, "originalFilename": metadata.original_filename.as_deref().unwrap_or(path.file_name().context("original filename missing")?.to_str().context("original filename must be UTF-8")?),
             "contentFingerprint": hash, "metadataFingerprint": metadata.fingerprint(path),
             "rating": metadata.rating, "flagState":"unflagged", "tags":[], "createdAt":now, "updatedAt":now,
         });
         if let Some(capture_time) = &metadata.capture_time {
             snapshot["captureTime"] = json!(capture_time);
         }
-        let existing_root = crate::identity::read(path)?;
-        if let Some(root) = &existing_root {
-            snapshot["originalDocumentID"] = json!(root);
+        if let Some(id) = &metadata.photo_id {
+            snapshot["photoID"] = json!(id);
+        }
+        if let Some(id) = &metadata.camera_image_id {
+            snapshot["cameraImageID"] = json!(id);
+        }
+        if let Some(id) = &metadata.document_id {
+            snapshot["documentID"] = json!(id);
+        }
+        if let Some(id) = &metadata.original_document_id {
+            snapshot["originalDocumentID"] = json!(id);
         }
         let file = json!({"contentHash":hash,"sizeBytes":size,"role":if media::is_raw(path){"raw_original"}else{"jpeg_original"}});
         let evidence = VersionEvidence {
-            visual_hash: media::jpeg_visual_hash(path, &metadata)?,
+            visual_hash: None,
             width: metadata.width,
             height: metadata.height,
             edited: metadata.edited && !media::is_raw(path),
@@ -539,6 +560,7 @@ fn process_file(
             media::sidecar_stamp(path)? == sidecars,
             "sidecar changed during metadata extraction"
         );
+        let ingested = std::time::Instant::now();
         asset_id = store.ingest_original_with_revision(
             &job.library_id,
             text,
@@ -547,26 +569,36 @@ fn process_file(
             &evidence,
             Some(&job.id),
         )?;
-        if existing_root.is_some() {
+        let ingest_ms = ingested.elapsed().as_millis();
+        let root = store.root_id(&job.library_id, &asset_id)?;
+        if crate::identity::standard_sidecar_photo_id(path)?.as_deref() == Some(root.as_str()) {
+            tracing::info!(
+                path = text,
+                digest_ms,
+                metadata_ms,
+                ingest_ms,
+                total_ms = started.elapsed().as_millis(),
+                "indexed photo metadata"
+            );
             identity_checked = true;
             return Ok(true);
         }
-        let root = store.root_id(&job.library_id, &asset_id)?;
-        let old_hash = hash.clone();
-        let updated = store.with_identity_update(&job.library_id, text, &old_hash, || {
-            let written = crate::identity::ensure(path, &root)?;
+        let updated = store.with_identity_update(&job.library_id, text, &hash, || {
+            crate::identity::ensure_metadata(path, &root, &metadata)?;
             sidecars = media::sidecar_stamp(path)?;
-            if written.changed && written.path == path {
-                hash = crate::imports::file_digest(jobs, &job.library_id, path)?;
-                (size, mtime) = file_stamp(path)?;
-                Ok(Some((hash.clone(), size as u64, mtime.to_string())))
-            } else {
-                Ok(None)
-            }
+            Ok(())
         })?;
         if !updated {
             return Ok(false);
         }
+        tracing::info!(
+            path = text,
+            digest_ms,
+            metadata_ms,
+            ingest_ms,
+            total_ms = started.elapsed().as_millis(),
+            "indexed photo metadata"
+        );
         identity_checked = true;
         Ok(true)
     })();
@@ -1118,6 +1150,46 @@ mod tests {
                 false
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_file_job_publishes_only_its_directory_branch() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let originals = fixture.path().join("originals");
+        fs::create_dir_all(originals.join("unrelated/child/deep"))?;
+        let jobs = Jobs::open(&fixture.path().join("jobs.sqlite"), &originals)?;
+        let store = Store::open(&fixture.path().join("catalog.sqlite"), true)?;
+        let previews = PreviewStorage::new(
+            &fixture.path().join("keeps"),
+            Some(&originals),
+            "http://localhost:2283",
+            "test-key",
+        )?;
+        let folder = jobs.add_folder("library", ".")?;
+        crate::sync_navigation::refresh(&store, &jobs, "library")?;
+        let unrelated_path = jobs.root().join("unrelated/child/deep");
+        let unrelated = crate::sync_navigation::pages(&store.read()?, "library")?
+            [unrelated_path.to_str().unwrap()]
+        .clone();
+        fs::create_dir(unrelated_path.join("new"))?;
+        let file = jobs.root().join("2024/trip/gone.ARW");
+        fs::create_dir_all(file.parent().unwrap())?;
+        let queued = jobs.enqueue_manual_file(&folder.id, &file)?;
+        store.note_revision_activity("library", &queued.id, file.to_str().unwrap())?;
+        let job = jobs.claim_next()?.unwrap();
+        run_claimed(&store, &jobs, &previews, &job, &AtomicBool::new(false))?;
+        assert_eq!(jobs.job(&job.id)?.unwrap().status, "completed");
+        assert!(
+            crate::sync_navigation::pages(&store.read()?, "library")?
+                .contains_key(file.parent().unwrap().to_str().unwrap())
+        );
+        assert_eq!(
+            crate::sync_navigation::pages(&store.read()?, "library")?
+                [unrelated_path.to_str().unwrap()],
+            unrelated
+        );
+        assert!(!store.revision_batch_ids()?.contains(&job.id));
         Ok(())
     }
 

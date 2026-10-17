@@ -45,10 +45,17 @@ fn extension(path: &Path) -> String {
 #[derive(Debug, Default, Clone)]
 pub struct Metadata {
     pub capture_time: Option<String>,
+    pub photo_id: Option<String>,
+    pub camera_image_id: Option<String>,
+    pub original_document_id: Option<String>,
+    pub document_id: Option<String>,
+    pub instance_id: Option<String>,
+    pub original_filename: Option<String>,
     pub camera_make: String,
     pub camera_model: String,
     pub lens_model: String,
     pub rating: i64,
+    pub xmp_rating: Option<i32>,
     pub camera_serial: String,
     pub capture_original: String,
     pub width: i64,
@@ -149,23 +156,41 @@ impl MediaProcessor {
             .as_str()
             .or_else(|| tags["EXIF:DateTimeOriginal"].as_str())
             .unwrap_or_default();
-        let capture_time = Some(complete_capture_time(&tags, &path)?);
-        let mut rating = rating(&tags);
-        if rating.is_none() {
-            for candidate in sidecars(&path)? {
-                rating = rating_from_sidecar(&candidate)?;
-                if rating.is_some() {
-                    break;
-                }
-            }
-        }
+        let capture_time = complete_capture_time(&tags, &path)?;
+        let optional_text = |keys: &[&str]| {
+            keys.iter().find_map(|key| {
+                tags[*key]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned)
+            })
+        };
         Ok(Metadata {
             capture_time,
+            photo_id: crate::identity::identifier_photo_id(&tags["XMP:Identifier"]).or_else(|| {
+                optional_text(&["XMP:PhotoID"]).and_then(|id| crate::identity::normalize(&id))
+            }),
+            camera_image_id: optional_text(&[
+                "EXIF:ImageUniqueID",
+                "MakerNotes:ImageUniqueID",
+                "XMP:ImageUniqueID",
+            ]),
+            original_document_id: optional_text(&["XMP:OriginalDocumentID"]),
+            document_id: optional_text(&["XMP:DocumentID"]),
+            instance_id: optional_text(&["XMP:InstanceID"]),
+            original_filename: optional_text(&["XMP:OriginalFileName", "XMP:PreservedFileName"]),
             camera_make: text("EXIF:Make"),
             camera_model: text("EXIF:Model"),
             lens_model: text("EXIF:LensModel"),
-            rating: rating.unwrap_or(0),
-            camera_serial: text("EXIF:BodySerialNumber"),
+            rating: rating(&tags).unwrap_or(0),
+            xmp_rating: tags["XMP:Rating"]
+                .as_i64()
+                .or_else(|| tags["XMP:Rating"].as_str()?.parse().ok())
+                .filter(|value| (-1..=5).contains(value))
+                .map(|value| value as i32),
+            camera_serial: optional_text(&["EXIF:SerialNumber", "EXIF:BodySerialNumber"])
+                .unwrap_or_default(),
             capture_original: capture_original.to_owned(),
             width: image_dimension(&tags, "ImageWidth"),
             height: image_dimension(&tags, "ImageHeight"),
@@ -447,38 +472,7 @@ fn run_with_timeout(command: &mut Command, seconds: u64) -> Result<Vec<u8>> {
 }
 
 fn read_tags(path: &Path) -> Result<Value> {
-    let output = run(Command::new("exiftool")
-        .args([
-            "-j",
-            "-G0",
-            "-n",
-            "-DateTimeOriginal",
-            "-SubSecDateTimeOriginal",
-            "-CreateDate",
-            "-DateCreated",
-            "-BodySerialNumber",
-            "-ImageWidth",
-            "-ImageHeight",
-            "-Orientation",
-            "-ColorSpace",
-            "-HasSettings",
-            "-Make",
-            "-Model",
-            "-LensModel",
-            "-Rating",
-            "-StarRating",
-            "-Urgency",
-            "--",
-        ])
-        .arg(path))?;
-    let mut tags: Vec<Value> = serde_json::from_slice(&output).context("parsing ExifTool JSON")?;
-    ensure!(
-        tags.len() == 1,
-        "ExifTool returned {} records for {}",
-        tags.len(),
-        path.display()
-    );
-    Ok(tags.remove(0))
+    crate::native_metadata::read_tags(path)
 }
 
 fn rating(tags: &Value) -> Option<i64> {
@@ -536,10 +530,6 @@ pub fn sidecar_stamp(path: &Path) -> Result<String> {
     Ok(entries.join("|"))
 }
 
-fn rating_from_sidecar(path: &Path) -> Result<Option<i64>> {
-    Ok(rating(&read_tags(path)?))
-}
-
 fn image_dimension(tags: &Value, name: &str) -> i64 {
     ["File", "PNG", "QuickTime", "EXIF"]
         .iter()
@@ -547,11 +537,13 @@ fn image_dimension(tags: &Value, name: &str) -> i64 {
         .unwrap_or(0)
 }
 
-fn complete_capture_time(tags: &Value, path: &Path) -> Result<String> {
+fn complete_capture_time(tags: &Value, path: &Path) -> Result<Option<String>> {
     for key in [
         "Composite:SubSecDateTimeOriginal",
         "EXIF:DateTimeOriginal",
+        "XMP:DateTimeOriginal",
         "EXIF:CreateDate",
+        "XMP:CreateDate",
         "XMP:DateCreated",
         "QuickTime:CreateDate",
     ] {
@@ -564,21 +556,22 @@ fn complete_capture_time(tags: &Value, path: &Path) -> Result<String> {
                     })
                     .map_err(anyhow::Error::from)
             }) {
-                Ok(time) => return Ok(time),
+                Ok(time) => return Ok(Some(time)),
                 Err(error) => {
                     tracing::warn!(path = %path.display(), error = %format!("{error:#}"), "invalid date metadata")
                 }
             }
         }
     }
-    let modified = path
-        .metadata()?
-        .modified()
-        .context("reading fallback photo date")?;
-    Ok(DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    Ok(None)
 }
 
 fn parse_capture_time(value: &str) -> Result<String> {
+    // ExifTool retains the UTC Z suffix while formatting XMP dates with colons.
+    let utc = value
+        .strip_suffix('Z')
+        .map(|value| format!("{value}+00:00"));
+    let value = utc.as_deref().unwrap_or(value);
     // Composite timestamps retain the camera's fractional seconds and explicit offset.
     if let Ok(date) = DateTime::parse_from_str(value, "%Y:%m:%d %H:%M:%S%.f%:z") {
         return Ok(date
@@ -725,22 +718,31 @@ mod tests {
     }
 
     #[test]
-    fn capture_date_completion_preserves_valid_date_and_falls_back() -> Result<()> {
+    fn capture_date_preserves_valid_date_and_keeps_missing_unknown() -> Result<()> {
         let file = tempfile::NamedTempFile::new()?;
         let tags = serde_json::json!({"EXIF:DateTimeOriginal":"0000:00:00 00:00:00", "EXIF:CreateDate":"2020-02-03T04:05:06Z"});
         assert_eq!(
             complete_capture_time(&tags, file.path())?,
-            "2020-02-03T04:05:06Z"
+            Some("2020-02-03T04:05:06Z".to_owned())
         );
         let tags = serde_json::json!({"EXIF:DateTimeOriginal":"2021-02-03T04:05:06Z", "EXIF:CreateDate":"2020-02-03T04:05:06Z"});
         assert_eq!(
             complete_capture_time(&tags, file.path())?,
-            "2021-02-03T04:05:06Z"
+            Some("2021-02-03T04:05:06Z".to_owned())
         );
         assert_eq!(
             complete_capture_time(&serde_json::json!({}), file.path())?,
-            DateTime::<Utc>::from(file.as_file().metadata()?.modified()?)
-                .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn xmp_capture_date_preserves_hawaii_offset_and_subseconds() -> Result<()> {
+        let tags = serde_json::json!({"XMP:DateTimeOriginal":"2026:05:30 17:09:23.488-10:00"});
+        assert_eq!(
+            complete_capture_time(&tags, Path::new("IMG_2724.HEIC"))?,
+            Some("2026-05-31T03:09:23.488Z".to_owned())
         );
         Ok(())
     }
@@ -755,7 +757,57 @@ mod tests {
             parse_capture_time("2025:11:24 20:02:35.100-05:00")?,
             parse_capture_time("2025:11:24 20:02:35.200-05:00")?
         );
+        assert_eq!(
+            parse_capture_time("2024:01:02 03:04:05.123Z")?,
+            "2024-01-02T03:04:05.123Z"
+        );
         assert!(parse_capture_time("not-a-date").is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires ExifTool"]
+    fn extract_tiff_serial_and_xmp_utc_date() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("metadata.tif");
+        let tags = [
+            (256u16, 4u16, 1u32, 1u32),
+            (257, 4, 1, 1),
+            (258, 3, 1, 8),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (273, 4, 1, 134),
+            (277, 3, 1, 1),
+            (278, 4, 1, 1),
+            (279, 4, 1, 1),
+            (284, 3, 1, 1),
+        ];
+        let mut bytes = b"II".to_vec();
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+        bytes.extend_from_slice(&(tags.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in tags {
+            bytes.extend_from_slice(&tag.to_le_bytes());
+            bytes.extend_from_slice(&kind.to_le_bytes());
+            bytes.extend_from_slice(&count.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.push(0);
+        std::fs::write(&path, bytes)?;
+        run(crate::identity::exiftool()?
+            .args([
+                "-overwrite_original",
+                "-EXIF:SerialNumber=SERIAL123",
+                "-XMP:DateCreated=2024-01-02T03:04:05.123Z",
+            ])
+            .arg(&path))?;
+        let metadata = MediaProcessor::new().extract(&path)?;
+        assert_eq!(metadata.camera_serial, "SERIAL123");
+        assert_eq!(
+            metadata.capture_time.as_deref(),
+            Some("2024-01-02T03:04:05.123Z")
+        );
         Ok(())
     }
 

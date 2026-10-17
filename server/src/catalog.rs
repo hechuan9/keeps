@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 19;
+const VERSION: i64 = 20;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -43,6 +43,10 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         "database schema {version} is newer than this server supports ({VERSION})"
     );
     if version == VERSION {
+        db.prepare("SELECT library_id,kind,value,asset_id FROM catalog_photo_sources LIMIT 0")?;
+        db.prepare(
+            "SELECT library_id,asset_id,created_at FROM catalog_missing_capture_dates LIMIT 0",
+        )?;
         db.prepare("SELECT library_id,generation,floor FROM catalog_sync_state LIMIT 0")?;
         db.prepare("SELECT library_id,path,page_json FROM catalog_sync_navigation LIMIT 0")?;
         db.prepare("SELECT library_id,asset_id,revision,deleted,changed_at FROM catalog_sync_assets LIMIT 0")?;
@@ -187,9 +191,25 @@ CREATE TRIGGER IF NOT EXISTS catalog_tags_update AFTER UPDATE OF snapshot ON cat
     if version < 19 {
         crate::replicas::migrate(&tx)?;
     }
+    if version < 20 {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_photo_sources(library_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,asset_id TEXT NOT NULL,PRIMARY KEY(library_id,kind,value,asset_id));
+CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));")?;
+    }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
     Ok(())
+}
+
+fn capture_uuid(snapshot: &Value) -> String {
+    let millis = snapshot["captureTime"]
+        .as_str()
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|v| v.timestamp_millis())
+        .unwrap_or_else(|| Utc::now().timestamp_millis());
+    let mut bytes = *Uuid::new_v4().as_bytes();
+    bytes[..6].copy_from_slice(&(millis.max(0) as u64).to_be_bytes()[2..]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    Uuid::from_bytes(bytes).to_string()
 }
 
 fn text<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
@@ -729,81 +749,6 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn moved_original(db: &Connection, lib: &str, hash: &str) -> Result<Option<(String, Vec<String>)>> {
-    let ids = {
-        let mut q = db.prepare("SELECT DISTINCT asset_id FROM catalog_files WHERE library_id=? AND content_hash=? AND role IN ('jpeg_original','raw_original') LIMIT 2")?;
-        q.query_map(params![lib, hash], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if ids.len() != 1 {
-        return Ok(None);
-    }
-    let id = &ids[0];
-    let paths = {
-        let mut q = db.prepare("SELECT path FROM catalog_paths WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3 UNION SELECT path FROM catalog_version_paths WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3")?;
-        q.query_map(params![lib, id, hash], |r| r.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    if paths.is_empty() {
-        return Ok(None);
-    }
-    for path in &paths {
-        match std::fs::symlink_metadata(path) {
-            Ok(_) => return Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).with_context(|| format!("check moved original {path}")),
-        }
-    }
-    Ok(Some((id.clone(), paths)))
-}
-
-fn metadata_identity_updated(
-    db: &Connection,
-    lib: &str,
-    id: &str,
-    path: &str,
-    old: &str,
-    metadata: (&str, u64, &str),
-) -> Result<()> {
-    let (new, size, mtime) = metadata;
-    db.execute("UPDATE catalog_assets SET negative_hash=?4,edit_revision=edit_revision+1 WHERE library_id=?1 AND id=?2 AND negative_hash=?3",params![lib,id,old,new])?;
-    db.execute("UPDATE photo_edits SET negative_hash=?4 WHERE library_id=?1 AND asset_id=?2 AND negative_hash=?3",params![lib,id,old,new])?;
-    let size = i64::try_from(size)?;
-    db.execute("INSERT OR REPLACE INTO catalog_files SELECT library_id,asset_id,?4,?5,role,holder,availability FROM catalog_files WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3",params![lib,id,old,new,size])?;
-    db.execute("INSERT OR IGNORE INTO catalog_versions SELECT library_id,asset_id,?4,visual_hash,capture_key,width,height,priority,json_set(evidence,'$.capture.contentFingerprint',?4) FROM catalog_versions WHERE library_id=?1 AND asset_id=?2 AND content_hash=?3",params![lib,id,old,new])?;
-    db.execute(
-        "UPDATE catalog_paths SET content_hash=? WHERE library_id=? AND path=?",
-        params![new, lib, path],
-    )?;
-    db.execute(
-        "UPDATE catalog_version_paths SET content_hash=? WHERE library_id=? AND path=?",
-        params![new, lib, path],
-    )?;
-    db.execute("UPDATE catalog_defaults SET content_hash=? WHERE library_id=? AND asset_id=? AND content_hash=?",params![new,lib,id,old])?;
-    db.execute("UPDATE catalog_assets SET content_hash=?4,snapshot=json_set(snapshot,'$.contentFingerprint',?4) WHERE library_id=?1 AND id=?2 AND content_hash=?3",params![lib,id,old,new])?;
-    db.execute(
-        "UPDATE media_cache SET source_hash=? WHERE library_id=? AND asset_id=? AND source_hash=?",
-        params![new, lib, id, old],
-    )?;
-    db.execute("UPDATE remote_cache_tasks SET source_hash=?4 WHERE library_id=?1 AND asset_id=?2 AND source_hash=?3 AND completed<>0",params![lib,id,old,new])?;
-    db.execute("UPDATE remote_cache_tasks SET input_hash=?4 WHERE library_id=?1 AND input_path=?2 AND input_hash=?3 AND completed<>0",params![lib,path,old,new])?;
-    db.execute("UPDATE media_cache SET standard=json_set(standard,'$.version',?3,'$.sizeBytes',?4,'$.mtimeNs',?5) WHERE library_id=?1 AND json_extract(standard,'$.path')=?2",params![lib,path,new,size,mtime])?;
-    db.execute("UPDATE catalog_versions SET evidence=json_set(evidence,'$.generatedFrom',?4) WHERE library_id=?1 AND asset_id=?2 AND json_extract(evidence,'$.generatedFrom')=?3",params![lib,id,old,new])?;
-    let other:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths WHERE library_id=? AND asset_id=? AND content_hash=?)",params![lib,id,old],|r|r.get(0))?;
-    if !other {
-        db.execute(
-            "DELETE FROM catalog_files WHERE library_id=? AND asset_id=? AND content_hash=?",
-            params![lib, id, old],
-        )?;
-        db.execute(
-            "DELETE FROM catalog_versions WHERE library_id=? AND asset_id=? AND content_hash=?",
-            params![lib, id, old],
-        )?;
-        db.execute("UPDATE catalog_version_paths SET content_hash=? WHERE library_id=? AND asset_id=? AND content_hash=?",params![new,lib,id,old])?;
-    }
-    Ok(())
-}
-
 impl Store {
     pub fn root_id(&self, lib: &str, asset: &str) -> Result<String> {
         Ok(self.lock()?.query_row(
@@ -830,7 +775,7 @@ impl Store {
         action: F,
     ) -> Result<bool>
     where
-        F: FnOnce() -> Result<Option<(String, u64, String)>>,
+        F: FnOnce() -> Result<()>,
     {
         // Source mutation precedes the database lock; media claims use the same
         // order, while ordinary catalog reads and edits never wait for file I/O.
@@ -847,22 +792,17 @@ impl Store {
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            if let Some((id, hash)) = &indexed {
+            if let Some((_, hash)) = &indexed {
                 ensure!(
                     hash == expected_hash,
                     "identity update source changed in catalog"
                 );
-                let processing: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM media_cache WHERE library_id=? AND asset_id=? AND status='processing')", params![lib,id], |r| r.get(0))?;
-                if processing {
-                    return Ok(false);
-                }
             }
             indexed
         };
-        let updated = action()?;
-        let mut db = self.lock()?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let current: Option<(String, String)> = tx
+        action()?;
+        let db = self.lock()?;
+        let current: Option<(String, String)> = db
             .query_row(
                 "SELECT asset_id,content_hash FROM catalog_paths WHERE library_id=? AND path=?",
                 params![lib, path],
@@ -871,15 +811,8 @@ impl Store {
             .optional()?;
         ensure!(
             current == indexed,
-            "identity update source changed in catalog during file update"
+            "identity update source changed in catalog during sidecar update"
         );
-        if let Some((hash, size, mtime)) = updated
-            && let Some((id, old)) = indexed
-        {
-            metadata_identity_updated(&tx, lib, &id, path, &old, (&hash, size, &mtime))?;
-        }
-        crate::revisions::flush(&tx)?;
-        tx.commit()?;
         Ok(true)
     }
     pub fn original_is_online(&self, lib: &str, path: &str, hash: &str) -> Result<bool> {
@@ -916,62 +849,71 @@ impl Store {
         let mut db = self.lock()?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let hash = text(file, "contentHash")?;
-        let directory = std::path::Path::new(path)
-            .parent()
-            .context("original has no parent directory")?
-            .to_str()
-            .context("original directory must be UTF-8")?;
-        let prefix = format!("{}/", directory.trim_end_matches('/'));
-        // Missing version paths retain identity when an original reappears.
-        let by_path: Option<String> = tx.query_row("SELECT asset_id FROM catalog_paths WHERE library_id=?1 AND path=?2 AND content_hash=?3 UNION ALL SELECT asset_id FROM catalog_version_paths WHERE library_id=?1 AND path=?2 AND content_hash=?3 LIMIT 1",params![lib,path,hash],|r|r.get(0)).optional()?;
-        let root = snapshot["originalDocumentID"]
+
+        let root = snapshot["photoID"]
             .as_str()
             .map(|value| Uuid::parse_str(value).map(|id| id.to_string()))
             .transpose()
-            .context("invalid originalDocumentID")?;
+            .context("invalid photoID")?;
         let previous_path_asset: Option<String> = tx
             .query_row(
-                "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=?",
-                params![lib, path],
+                "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=? AND content_hash=?",
+                params![lib, path, hash],
                 |r| r.get(0),
             )
             .optional()?;
-        let identity_match = if let Some(root) = &root {
-            let known: Option<String> = tx.query_row("SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",params![lib,root],|r|r.get(0)).optional()?;
-            known
+        let id = if let Some(root) = &root {
+            tx.query_row(
+                "SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",
+                params![lib, root],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| root.clone())
+        } else if let Some(id) = previous_path_asset {
+            id
         } else {
-            None
+            let mut matched = None;
+            for (kind, field) in [
+                ("camera", "cameraImageID"),
+                ("software", "originalDocumentID"),
+                ("software", "documentID"),
+            ] {
+                if let Some(raw) = snapshot[field].as_str().filter(|v| !v.is_empty()) {
+                    let normalized = if kind == "software" {
+                        crate::identity::normalize(raw).unwrap_or_else(|| raw.to_owned())
+                    } else {
+                        raw.to_owned()
+                    };
+                    let value = normalized.as_str();
+                    if kind == "software" {
+                        let known: Option<String> = tx.query_row("SELECT asset_id FROM catalog_identity_aliases WHERE library_id=? AND root_id=?",params![lib,value],|r|r.get(0)).optional()?;
+                        if known.is_some() {
+                            matched = known;
+                            break;
+                        }
+                    }
+                    let mut q = tx.prepare("SELECT DISTINCT asset_id FROM catalog_photo_sources WHERE library_id=? AND kind=? AND value=? LIMIT 2")?;
+                    let ids = q
+                        .query_map(params![lib, kind, value], |r| r.get::<_, String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    if ids.len() == 1 {
+                        matched = ids.into_iter().next();
+                        break;
+                    }
+                }
+            }
+            let matched = matched.or_else(|| {
+                snapshot["originalDocumentID"]
+                    .as_str()
+                    .and_then(crate::identity::normalize)
+            });
+            match matched {
+                Some(id) => id,
+                None => crate::photo_relations::filename_match(&tx, lib, path, snapshot)?
+                    .unwrap_or_else(|| capture_uuid(snapshot)),
+            }
         };
-        let capture_match = if root.is_none() {
-            crate::photo_relations::capture_match(&tx, lib, path, snapshot)?
-        } else {
-            None
-        };
-        let raw_heif_match = if identity_match.is_none() && previous_path_asset.is_none() {
-            crate::photo_relations::raw_heif_match(&tx, lib, path, snapshot, evidence)?
-        } else {
-            None
-        };
-        let matched = if identity_match.is_some() {
-            identity_match
-        } else if raw_heif_match.is_some() {
-            raw_heif_match
-        } else if previous_path_asset.is_none() && capture_match.is_some() {
-            capture_match
-        } else if by_path.is_some() {
-            by_path.clone()
-        } else {
-            let by_hash: Option<String> = tx.query_row("SELECT c.asset_id FROM (SELECT asset_id FROM catalog_files WHERE library_id=?1 AND content_hash=?3 AND role IN ('jpeg_original','raw_original') UNION SELECT id FROM catalog_assets WHERE library_id=?1 AND content_hash=?3) c WHERE EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=?1 AND p.asset_id=c.asset_id AND p.content_hash=?3 AND p.role IN ('jpeg_original','raw_original') AND substr(p.path,1,length(?2))=?2 AND instr(substr(p.path,length(?2)+1),'/')=0) ORDER BY c.asset_id LIMIT 1",params![lib,prefix,hash],|r|r.get(0)).optional()?;
-            by_hash.or(crate::versions::exact_match(&tx, lib, &prefix, evidence)?)
-        };
-        let moved = if root.is_none() && matched.is_none() && std::path::Path::new(path).is_file() {
-            moved_original(&tx, lib, hash)?
-        } else {
-            None
-        };
-        let id = matched
-            .or_else(|| moved.as_ref().map(|(id, _)| id.clone()))
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
         if existing(&tx, lib, &id)?.is_none() {
             let mut snapshot = snapshot.clone();
             snapshot
@@ -994,16 +936,6 @@ impl Store {
         register_file(&tx, lib, &id, file, "online")?;
         tx.execute("INSERT INTO catalog_paths VALUES(?,?,?,?,?) ON CONFLICT(library_id,path) DO UPDATE SET asset_id=excluded.asset_id,content_hash=excluded.content_hash,role=excluded.role",params![lib,path,id,hash,text(file,"role")?])?;
         crate::versions::register(&tx, lib, &id, path, file, snapshot, evidence)?;
-        if let Some((_, paths)) = moved {
-            // Register the replacement first so the selected version and its preview remain valid.
-            for old in paths {
-                tx.execute(
-                    "DELETE FROM catalog_paths WHERE library_id=? AND path=? AND asset_id=?",
-                    params![lib, old, id],
-                )?;
-                crate::versions::missing_path(&tx, lib, &id, &old)?;
-            }
-        }
         if root.is_some() {
             let paths = {
                 let mut q = tx.prepare(
@@ -1026,7 +958,38 @@ impl Store {
                 }
             }
         }
-        crate::photo_relations::reconcile_directory(&tx, lib, directory)?;
+        for (kind, field) in [
+            ("camera", "cameraImageID"),
+            ("software", "originalDocumentID"),
+            ("software", "documentID"),
+        ] {
+            if let Some(raw) = snapshot[field].as_str().filter(|v| !v.is_empty()) {
+                let value = if kind == "software" {
+                    crate::identity::normalize(raw).unwrap_or_else(|| raw.to_owned())
+                } else {
+                    raw.to_owned()
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO catalog_photo_sources VALUES(?,?,?,?)",
+                    params![lib, kind, value, id],
+                )?;
+            }
+        }
+        if let Some(time) = snapshot["captureTime"].as_str() {
+            tx.execute("UPDATE catalog_assets SET snapshot=json_set(snapshot,'$.captureTime',?),sort_time=? WHERE library_id=? AND id=? AND json_extract(snapshot,'$.captureTime') IS NULL",params![time,time,lib,id])?;
+        }
+        let known_date: bool = tx.query_row("SELECT json_extract(snapshot,'$.captureTime') IS NOT NULL FROM catalog_assets WHERE library_id=? AND id=?",params![lib,id],|r|r.get(0))?;
+        if known_date {
+            tx.execute(
+                "DELETE FROM catalog_missing_capture_dates WHERE library_id=? AND asset_id=?",
+                params![lib, id],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT OR IGNORE INTO catalog_missing_capture_dates VALUES(?,?,?)",
+                params![lib, id, Utc::now().to_rfc3339()],
+            )?;
+        }
         let id = tx.query_row(
             "SELECT asset_id FROM catalog_paths WHERE library_id=? AND path=?",
             params![lib, path],
@@ -1237,6 +1200,153 @@ mod tests {
         json!({"assetID":Uuid::new_v4(),"captureTime":"2024-01-01T00:00:00Z","cameraMake":"Canon","cameraModel":"R3","lensModel":"50mm","originalFilename":"photo.jpg","contentFingerprint":"photo-hash","metadataFingerprint":"2024|Canon|R3|photo","rating":1,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
     }
     #[test]
+    fn document_and_original_document_ids_link_in_both_import_orders() -> Result<()> {
+        for export_first in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let store = Store::open(&tmp.path().join("catalog.sqlite"), true)?;
+            let document = Uuid::new_v4().to_string();
+            let mut raw = snapshot();
+            raw["documentID"] = json!(format!(
+                "xmp.did:{}",
+                document.replace('-', "").to_uppercase()
+            ));
+            raw["originalFilename"] = json!("capture.3FR");
+            let mut export = snapshot();
+            export["originalDocumentID"] = json!(format!("urn:uuid:{document}"));
+            export["documentID"] = json!(Uuid::new_v4().to_string());
+            export["originalFilename"] = json!("renamed.jpg");
+            let raw_file = json!({"contentHash":"raw-hash","sizeBytes":42,"role":"raw_original"});
+            let export_file =
+                json!({"contentHash":"export-hash","sizeBytes":12,"role":"jpeg_original"});
+            let inputs = [
+                ("/raw/capture.3FR", &raw_file, &raw),
+                ("/exports/renamed.jpg", &export_file, &export),
+            ];
+            let order = if export_first { [1, 0] } else { [0, 1] };
+            let first = inputs[order[0]];
+            let second = inputs[order[1]];
+            let id = store.ingest_original("lib", first.0, first.1, first.2)?;
+            assert_eq!(
+                store.ingest_original("lib", second.0, second.1, second.2)?,
+                id
+            );
+            assert_eq!(store.lock()?.query_row(
+                "SELECT count(DISTINCT asset_id) FROM catalog_photo_sources WHERE library_id='lib' AND kind='software' AND value=?",
+                [&document], |row| row.get::<_, i64>(0))?, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_document_ids_preserve_camera_and_filename_pairing() -> Result<()> {
+        for camera in [false, true] {
+            let tmp = tempfile::tempdir()?;
+            let store = Store::open(&tmp.path().join("catalog.sqlite"), true)?;
+            let mut raw = snapshot();
+            raw["originalFilename"] = json!("pair.3FR");
+            raw["documentID"] = json!(Uuid::new_v4().to_string());
+            if camera {
+                raw["cameraImageID"] = json!("same-capture");
+            }
+            let mut export = raw.clone();
+            export["originalFilename"] = json!(if camera { "renamed.heic" } else { "pair.heic" });
+            export["documentID"] = json!(Uuid::new_v4().to_string());
+            let file = json!({"contentHash":"raw","sizeBytes":42,"role":"raw_original"});
+            let id = store.ingest_original("lib", "/photos/pair.3FR", &file, &raw)?;
+            let path = if camera {
+                "/photos/renamed.heic"
+            } else {
+                "/photos/pair.heic"
+            };
+            assert_eq!(
+                store.ingest_original(
+                    "lib",
+                    path,
+                    &json!({"contentHash":"heic","sizeBytes":12,"role":"jpeg_original"}),
+                    &export
+                )?,
+                id
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn photo_identity_uses_ids_and_camera_pairing_without_hash_dedup() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Store::open(&tmp.path().join("catalog.sqlite"), true)?;
+        let file = json!({"contentHash":"same-hash","sizeBytes":42,"role":"raw_original"});
+        let mut a = snapshot();
+        a["photoID"] = json!(Uuid::new_v4().to_string());
+        let first = store.ingest_original("lib", "/photos/a.3FR", &file, &a)?;
+        let mut b = a.clone();
+        b["photoID"] = json!(Uuid::new_v4().to_string());
+        let second = store.ingest_original("lib", "/photos/b.3FR", &file, &b)?;
+        assert_ne!(first, second);
+        let mut raw = snapshot();
+        raw["cameraImageID"] = json!("camera-pair");
+        raw["originalFilename"] = json!("pair.3FR");
+        let r = store.ingest_original("lib", "/photos/pair.3FR", &file, &raw)?;
+        let mut heif = raw.clone();
+        heif["originalFilename"] = json!("renamed.heif");
+        heif["originalDocumentID"] = json!(Uuid::new_v4().to_string());
+        let h = store.ingest_original(
+            "lib",
+            "/photos/renamed.heif",
+            &json!({"contentHash":"other-hash","sizeBytes":12,"role":"jpeg_original"}),
+            &heif,
+        )?;
+        assert_eq!(r, h);
+        let software = Uuid::new_v4().to_string();
+        let decorated = format!("xmp.did:{}", software.replace('-', "").to_uppercase());
+        let mut export = heif.clone();
+        export["originalDocumentID"] = json!(decorated);
+        store.ingest_original("lib", "/photos/decorated.heif", &file, &export)?;
+        export.as_object_mut().unwrap().remove("cameraImageID");
+        export["originalFilename"] = json!("third-party-export.jpg");
+        export["originalDocumentID"] = json!(format!("urn:uuid:{software}"));
+        assert_eq!(
+            store.ingest_original("lib", "/elsewhere/third-party-export.jpg", &file, &export)?,
+            r
+        );
+        assert_eq!(store.lock()?.query_row("SELECT count(*) FROM catalog_photo_sources WHERE library_id='lib' AND kind='software' AND value=? AND asset_id=?",params![software,r],|row|row.get::<_,i64>(0))?,1);
+
+        let generated = Uuid::parse_str(&r)?;
+        assert_eq!(generated.get_version_num(), 7);
+        assert_eq!(
+            &generated.as_bytes()[..6],
+            &1704067200000_u64.to_be_bytes()[2..]
+        );
+        let mut unknown = snapshot();
+        unknown.as_object_mut().unwrap().remove("captureTime");
+        unknown["originalFilename"] = json!("unknown.jpg");
+        let id = store.ingest_original("lib", "/photos/unknown.jpg", &file, &unknown)?;
+        assert!(store.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_missing_capture_dates WHERE asset_id=?)",
+            [&id],
+            |r| r.get::<_, bool>(0)
+        )?);
+        let mut dated = unknown.clone();
+        dated["photoID"] = json!(id);
+        dated["captureTime"] = json!("2024-03-01T00:00:00Z");
+        store.ingest_original("lib", "/photos/dated.heif", &file, &dated)?;
+        store.ingest_original("lib", "/photos/unknown.jpg", &file, &unknown)?;
+        assert!(!store.lock()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM catalog_missing_capture_dates WHERE asset_id=?)",
+            [&id],
+            |r| r.get::<_, bool>(0)
+        )?);
+        let mut pair = snapshot();
+        pair["originalFilename"] = json!("newpair.3FR");
+        let paired = store.ingest_original("lib", "/photos/newpair.3FR", &file, &pair)?;
+        pair["originalFilename"] = json!("newpair.HEIC");
+        assert_eq!(
+            store.ingest_original("lib", "/photos/newpair.HEIC", &file, &pair)?,
+            paired
+        );
+        Ok(())
+    }
+    #[test]
     fn capture_cursor_survives_inserts_removed_boundary_and_time_ties() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
@@ -1363,9 +1473,10 @@ mod tests {
         let other = json!({"contentHash":"second-hash","sizeBytes":6,"role":"jpeg_original"});
         let mut snap = snapshot();
         snap["contentFingerprint"] = json!("second-hash");
+        snap["originalFilename"] = json!("b.jpg");
         snap["rating"] = json!(5);
         let second = store.ingest_original("lib", b.to_str().unwrap(), &other, &snap)?;
-        snap["originalDocumentID"] = json!(first);
+        snap["photoID"] = json!(first);
         assert_eq!(
             store.ingest_original("lib", b.to_str().unwrap(), &other, &snap)?,
             first
@@ -1396,6 +1507,7 @@ mod tests {
         assert_eq!(store.root_id("lib", &id)?, id);
         let root = Uuid::new_v4().to_string();
         let mut snap = snapshot();
+        snap["photoID"] = json!(id);
         snap["originalDocumentID"] = json!(root);
         assert_eq!(
             store.ingest_original("lib", a.to_str().unwrap(), &file, &snap)?,
@@ -1453,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_copy_adds_identity_alias_without_replacing_canonical_root() -> Result<()> {
+    fn exact_copy_with_distinct_ids_stays_separate() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let original_root = Uuid::new_v4().to_string();
@@ -1463,44 +1575,72 @@ mod tests {
         snap["originalDocumentID"] = json!(original_root);
         let id = store.ingest_original("lib", "/album/first.jpg", &file, &snap)?;
         snap["originalDocumentID"] = json!(alias);
-        assert_eq!(
-            store.ingest_original("lib", "/album/copy.jpg", &file, &snap)?,
-            id
-        );
+        let second = store.ingest_original("lib", "/album/copy.jpg", &file, &snap)?;
+        assert_ne!(second, id);
         assert_eq!(store.root_id("lib", &id)?, original_root);
         let edited = json!({"contentHash":"edited-hash","sizeBytes":6,"role":"jpeg_original"});
         assert_eq!(
             store.ingest_original("lib", "/other/edited.jpg", &edited, &snap)?,
-            id
+            second
         );
         assert_eq!(store.root_id("lib", &id)?, original_root);
         Ok(())
     }
 
     #[test]
-    fn metadata_update_preserves_other_copy_of_original_hash() -> Result<()> {
+    fn sidecar_update_checks_catalog_path_before_and_after_io() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let file = json!({"contentHash":"photo-hash","sizeBytes":5,"role":"jpeg_original"});
-        let id = store.ingest_original("lib", "/a.jpg", &file, &snapshot())?;
+        store.ingest_original("lib", "/a.jpg", &file, &snapshot())?;
+        assert!(
+            store
+                .with_identity_update("lib", "/a.jpg", "stale-hash", || panic!(
+                    "stale source must not write"
+                ))
+                .is_err()
+        );
+        let result = store.with_identity_update("lib", "/a.jpg", "photo-hash", || {
+            store.lock()?.execute("UPDATE catalog_paths SET content_hash='changed' WHERE library_id='lib' AND path='/a.jpg'", [])?;
+            Ok(())
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("during sidecar update")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sidecar_update_preserves_all_original_hashes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shared = snapshot();
+        shared["photoID"] = json!(Uuid::new_v4().to_string());
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let a = dir.path().join("a.jpg");
+        let b = dir.path().join("b.jpg");
+        std::fs::write(&a, b"first")?;
+        std::fs::write(&b, b"first")?;
+        let file = json!({"contentHash":"photo-hash","sizeBytes":5,"role":"jpeg_original"});
+        let id = store.ingest_original("lib", a.to_str().unwrap(), &file, &shared)?;
         assert_eq!(
-            store.ingest_original("lib", "/b.jpg", &file, &snapshot())?,
+            store.ingest_original("lib", b.to_str().unwrap(), &file, &shared)?,
             id
         );
-        store.with_identity_update("lib", "/a.jpg", "photo-hash", || {
-            Ok(Some(("new-hash".into(), 9, "2".into())))
-        })?;
+        store.with_identity_update("lib", a.to_str().unwrap(), "photo-hash", || Ok(()))?;
         let db = store.lock()?;
         let old: String = db.query_row(
-            "SELECT content_hash FROM catalog_paths WHERE path='/b.jpg'",
-            [],
+            "SELECT content_hash FROM catalog_paths WHERE path=?",
+            [b.to_str().unwrap()],
             |r| r.get(0),
         )?;
         assert_eq!(old, "photo-hash");
         assert_eq!(
             db.query_row("SELECT count(*) FROM catalog_versions", [], |r| r
                 .get::<_, i64>(0))?,
-            2
+            1
         );
         assert_eq!(
             db.query_row(
@@ -1513,7 +1653,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn identity_metadata_update_keeps_ready_cache_and_defers_processing() -> Result<()> {
+    fn sidecar_update_preserves_cache_hashes_and_allows_processing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let file = json!({"contentHash":"photo-hash","sizeBytes":5,"role":"jpeg_original"});
@@ -1526,13 +1666,7 @@ mod tests {
         ] {
             store.lock()?.execute("INSERT INTO remote_cache_tasks VALUES(?,'lib',?,'photo-hash','photo-hash',?,'worker',0,?)",params![task,id,path,completed])?;
         }
-        assert!(
-            store.with_identity_update("lib", "/a.jpg", "photo-hash", || Ok(Some((
-                "new-hash".into(),
-                9,
-                "2".into()
-            ))))?
-        );
+        assert!(store.with_identity_update("lib", "/a.jpg", "photo-hash", || Ok(()))?);
         let result: (String, String, String) = store.lock()?.query_row(
             "SELECT status,source_hash,json_extract(standard,'$.version') FROM media_cache",
             [],
@@ -1540,7 +1674,7 @@ mod tests {
         )?;
         assert_eq!(
             result,
-            ("ready".into(), "new-hash".into(), "new-hash".into())
+            ("ready".into(), "photo-hash".into(), "photo-hash".into())
         );
         let tasks = {
             let db = store.lock()?;
@@ -1558,20 +1692,16 @@ mod tests {
         assert_eq!(
             tasks,
             vec![
-                ("cancelled".into(), "new-hash".into(), "new-hash".into()),
-                ("done".into(), "new-hash".into(), "new-hash".into()),
-                ("other".into(), "new-hash".into(), "photo-hash".into())
+                ("cancelled".into(), "photo-hash".into(), "photo-hash".into()),
+                ("done".into(), "photo-hash".into(), "photo-hash".into()),
+                ("other".into(), "photo-hash".into(), "photo-hash".into())
             ]
         );
 
         store
             .lock()?
             .execute("UPDATE media_cache SET status='processing'", [])?;
-        assert!(
-            !store.with_identity_update("lib", "/a.jpg", "new-hash", || panic!(
-                "must not write a processing source"
-            ))?
-        );
+        assert!(store.with_identity_update("lib", "/a.jpg", "photo-hash", || Ok(()))?);
         Ok(())
     }
     #[test]
@@ -1704,6 +1834,8 @@ mod tests {
     #[test]
     fn moved_legacy_original_preserves_imported_holder_identity() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let mut shared = snapshot();
+        shared["photoID"] = json!(Uuid::new_v4().to_string());
         let old = dir.path().join("old/photo.jpg");
         let new = dir.path().join("new/photo.jpg");
         std::fs::create_dir_all(old.parent().unwrap())?;
@@ -1711,7 +1843,7 @@ mod tests {
         std::fs::write(&old, b"same")?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let file = json!({"contentHash":"same","sizeBytes":4,"role":"jpeg_original"});
-        let id = store.ingest_original("lib", old.to_str().unwrap(), &file, &snapshot())?;
+        let id = store.ingest_original("lib", old.to_str().unwrap(), &file, &shared)?;
         store
             .lock()?
             .execute("UPDATE catalog_files SET holder='legacy-mac'", [])?;
@@ -1720,7 +1852,7 @@ mod tests {
             .execute("DELETE FROM catalog_version_paths", [])?;
         std::fs::rename(&old, &new)?;
         assert_eq!(
-            store.ingest_original("lib", new.to_str().unwrap(), &file, &snapshot())?,
+            store.ingest_original("lib", new.to_str().unwrap(), &file, &shared)?,
             id
         );
         assert!(store.original_is_online("lib", new.to_str().unwrap(), "same")?);
@@ -1731,6 +1863,8 @@ mod tests {
     #[test]
     fn cross_directory_move_preserves_identity_and_default() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let mut shared = snapshot();
+        shared["photoID"] = json!(Uuid::new_v4().to_string());
         let old = dir.path().join("old/photo.jpg");
         let new = dir.path().join("new/photo.jpg");
         std::fs::create_dir_all(old.parent().unwrap())?;
@@ -1738,13 +1872,13 @@ mod tests {
         std::fs::write(&old, b"same")?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let file = json!({"contentHash":"same","sizeBytes":4,"role":"jpeg_original"});
-        let id = store.ingest_original("lib", old.to_str().unwrap(), &file, &snapshot())?;
+        let id = store.ingest_original("lib", old.to_str().unwrap(), &file, &shared)?;
         store.patch_asset("lib", &id, &json!({"rating":5,"tags":["keep"]}))?;
         store.set_default_version("lib", &id, "same")?;
         store.declare_generated_preview("lib", &id, &json!({"role":"preview","fileObject":{},"objectRef":{"bucket":"local","key":"preview"},"pixelSize":{"width":10,"height":10}}))?;
         std::fs::rename(&old, &new)?;
         assert_eq!(
-            store.ingest_original("lib", new.to_str().unwrap(), &file, &snapshot())?,
+            store.ingest_original("lib", new.to_str().unwrap(), &file, &shared)?,
             id
         );
         assert_eq!(
@@ -1812,6 +1946,8 @@ mod tests {
     #[test]
     fn duplicate_paths_and_missing_restore_keep_one_asset() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let mut shared = snapshot();
+        shared["photoID"] = json!(Uuid::new_v4().to_string());
         let photos = dir.path().join("photos");
         std::fs::create_dir(&photos)?;
         let a = photos.join("one.jpg");
@@ -1820,9 +1956,9 @@ mod tests {
         std::fs::write(&b, b"same")?;
         let store = Store::open(&dir.path().join("db"), true)?;
         let file = json!({"contentHash":"same","sizeBytes":4,"role":"jpeg_original"});
-        let id = store.ingest_original("lib", a.to_str().unwrap(), &file, &snapshot())?;
+        let id = store.ingest_original("lib", a.to_str().unwrap(), &file, &shared)?;
         assert_eq!(
-            store.ingest_original("lib", b.to_str().unwrap(), &file, &snapshot())?,
+            store.ingest_original("lib", b.to_str().unwrap(), &file, &shared)?,
             id
         );
         assert!(store.original_is_online("lib", a.to_str().unwrap(), "same")?);
@@ -1845,7 +1981,7 @@ mod tests {
         assert_eq!(store.counts("lib", false)?["all"], 0);
         std::fs::write(&a, b"same")?;
         assert_eq!(
-            store.ingest_original("lib", a.to_str().unwrap(), &file, &snapshot())?,
+            store.ingest_original("lib", a.to_str().unwrap(), &file, &shared)?,
             id
         );
         assert!(store.original_is_online("lib", a.to_str().unwrap(), "same")?);
