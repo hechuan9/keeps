@@ -81,6 +81,8 @@ jobs:
             rust-${{ runner.os }}-${{ runner.arch }}-${{ steps.rust.outputs.version }}-${{ hashFiles('server/Cargo.lock') }}-
       - run: cargo +stable fmt --manifest-path server/Cargo.toml --check
       - run: cargo +stable clippy --manifest-path server/Cargo.toml --locked --all-targets -- -D warnings
+      - name: Install video metadata test dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
       - run: cargo +stable test --manifest-path server/Cargo.toml --locked
 
   shared:
