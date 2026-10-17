@@ -199,6 +199,10 @@ fn claim_pending_scoped(
     worker: &str,
     batch: Option<&str>,
 ) -> Result<Option<(String, String, String)>> {
+    // A ready preview may still be awaiting browse publication in complete_sync.
+    let _guard = COMMIT
+        .lock()
+        .map_err(|_| anyhow::anyhow!("worker commit poisoned"))?;
     let _source = store
         .source_mutation
         .read()
@@ -493,11 +497,12 @@ async fn complete(
     run(move || complete_sync(&s, &lib, &id)).await
 }
 fn complete_sync(s: &AppState, lib: &str, id: &str) -> Result<Value> {
-    let _directory_guard = s.jobs.directory_mutation.read().unwrap();
-    crate::directory_move::ensure_reconciled(&s.jobs)?;
+    // Queued completions must not hold directory reads while another publication runs.
     let _guard = COMMIT
         .lock()
         .map_err(|_| anyhow::anyhow!("worker commit poisoned"))?;
+    let _directory_guard = s.jobs.directory_mutation.read().unwrap();
+    crate::directory_move::ensure_reconciled(&s.jobs)?;
     let t = task(&s.store, lib, id)?;
     if t.completed == 1 {
         let root = scratch(s, &t)?;
@@ -692,7 +697,72 @@ async fn fail(
 mod tests {
     use super::*;
     #[test]
-    fn identity_io_allows_catalog_edits_but_cache_claim_waits_for_new_hash() -> Result<()> {
+    fn queued_completion_does_not_block_directory_writer() -> Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let root = tempfile::tempdir()?;
+        let originals = root.path().join("photos");
+        fs::create_dir(&originals)?;
+        let state = Arc::new(AppState {
+            store: Arc::new(Store::open(
+                &root.path().join("keeps/db/catalog.sqlite"),
+                true,
+            )?),
+            jobs: Arc::new(crate::jobs::Jobs::open(
+                &root.path().join("jobs.sqlite"),
+                &originals,
+            )?),
+            previews: Arc::new(crate::previews::PreviewStorage::new(
+                &root.path().join("keeps"),
+                Some(&originals),
+                "http://localhost",
+                "test",
+            )?),
+            access_token: "test".into(),
+            library_id: "lib".into(),
+            original_root_names: Default::default(),
+        });
+        let commit = COMMIT.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn({
+            let state = state.clone();
+            move || {
+                started_tx.send(()).unwrap();
+                finished_tx
+                    .send(complete_sync(&state, "lib", "missing-task"))
+                    .unwrap();
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let waiting_for_commit = matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let directory = state.jobs.directory_mutation.try_write().ok();
+        let writer_acquired = directory.is_some();
+        drop(commit);
+        let waiting_for_directory = matches!(
+            finished_rx.recv_timeout(Duration::from_millis(100)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        drop(directory);
+        worker.join().unwrap();
+        assert!(waiting_for_commit);
+        assert!(
+            writer_acquired,
+            "completion queued behind COMMIT must not retain a directory read lock"
+        );
+        assert!(
+            waiting_for_directory,
+            "completion must wait until the directory mutation ends"
+        );
+        assert!(finished_rx.recv_timeout(Duration::from_secs(2))?.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_sidecar_io_allows_catalog_edits_and_serializes_cache_claim() -> Result<()> {
         use std::sync::{Arc, mpsc};
         use std::time::Duration;
         let dir = tempfile::tempdir()?;
@@ -709,7 +779,7 @@ mod tests {
                 store.with_identity_update("lib", "/photo.jpg", "old-hash", || {
                     started_tx.send(())?;
                     release_rx.recv_timeout(Duration::from_secs(5))?;
-                    Ok(Some(("new-hash".into(), 9, "2".into())))
+                    Ok(())
                 })
             }
         });
@@ -745,13 +815,13 @@ mod tests {
         assert_eq!(patched??["rating"], 5);
         assert!(
             claim_blocked,
-            "cache claim must wait while the source is changing"
+            "cache claim must respect the sidecar update lock"
         );
         let (_, asset, hash) = claimed_rx
             .recv_timeout(Duration::from_secs(2))??
             .context("cache claim")?;
         assert_eq!(asset, id);
-        assert_eq!(hash, "new-hash");
+        assert_eq!(hash, "old-hash");
         assert_eq!(store.asset("lib", &id)?["rating"], 5);
         Ok(())
     }
@@ -869,7 +939,7 @@ mod tests {
             let db = store.lock()?;
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                19
+                20
             );
             let edited: (f64, Option<String>) = db.query_row(
                 "SELECT exposure_ev,recipe FROM photo_edits WHERE asset_id='asset'",
@@ -950,6 +1020,50 @@ mod tests {
         assert!(claim_pending(&store, "lib", "other")?.is_some());
         Ok(())
     }
+    #[test]
+    fn batch_claim_waits_until_preview_and_browse_publication_finish() -> Result<()> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let (root, store) = setup()?;
+        add_indexed_source(root.path(), &store)?;
+        store.lock()?.execute(
+            "INSERT INTO import_compute_leases VALUES('lib','batch',?,'worker',unixepoch()+3600)",
+            [root.path().join("photo.jpg").to_str().unwrap()],
+        )?;
+        let store = Arc::new(store);
+        let thumbnail = json!({"objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/thumbnail/hash.heic"},"version":"spec:hash","width":10,"height":10,"sizeBytes":10});
+        let browse = json!({"objectRef":{"bucket":"keeps-previews","key":"libraries/lib/assets/asset/derivatives/browse/browse.heic"},"version":"browse:hash","sourceThumbnailVersion":"spec:hash","spec":crate::browse_cache::SPEC,"width":10,"height":10,"sizeBytes":10});
+        let publication = COMMIT.lock().unwrap();
+        store.cache_publish("lib", "asset", "hash", &thumbnail, &json!({}))?;
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let claimant = std::thread::spawn({
+            let store = store.clone();
+            move || {
+                started_tx.send(()).unwrap();
+                finished_tx
+                    .send(claim_pending_scoped(&store, "lib", "worker", Some("batch")))
+                    .unwrap();
+            }
+        });
+        started_rx.recv_timeout(Duration::from_secs(2))?;
+        let early_claim = finished_rx.recv_timeout(Duration::from_millis(100));
+        let receipt = task(&store, "lib", "task");
+        let published =
+            crate::browse_cache::publish(&store, "lib", "asset", "hash", "spec:hash", &browse);
+        drop(publication);
+        claimant.join().unwrap();
+        assert!(
+            matches!(early_claim, Err(mpsc::RecvTimeoutError::Timeout)),
+            "a ready thumbnail awaiting browse publication must not be reclaimed"
+        );
+        assert_eq!(receipt?.completed, 1);
+        published?;
+        assert!(finished_rx.recv_timeout(Duration::from_secs(2))??.is_none());
+        assert_eq!(store.media_snapshot("lib", "asset")?["browse"], browse);
+        Ok(())
+    }
+
     #[test]
     fn batch_claim_recovers_ready_preview_without_browse_after_worker_restart() -> Result<()> {
         let (root, store) = pending_setup()?;

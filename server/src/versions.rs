@@ -47,17 +47,6 @@ pub(crate) fn capture_key(snapshot: &Value) -> Option<String> {
         .collect();
     values.map(|v| json!(v).to_string())
 }
-pub(crate) fn exact_match(
-    db: &Connection,
-    lib: &str,
-    directory_prefix: &str,
-    evidence: &VersionEvidence,
-) -> Result<Option<String>> {
-    let Some(hash) = evidence.visual_hash.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(None);
-    };
-    Ok(db.query_row("SELECT DISTINCT v.asset_id FROM catalog_versions v JOIN catalog_paths p ON p.library_id=v.library_id AND p.asset_id=v.asset_id WHERE v.library_id=?1 AND v.visual_hash=?2 AND p.content_hash=v.content_hash AND p.role IN ('jpeg_original','raw_original') AND substr(p.path,1,length(?3))=?3 AND instr(substr(p.path,length(?3)+1),'/')=0 ORDER BY v.asset_id LIMIT 1", params![lib,hash,directory_prefix], |r|r.get(0)).optional()?)
-}
 pub(crate) fn register(
     db: &Connection,
     lib: &str,
@@ -659,6 +648,11 @@ mod tests {
     fn snapshot() -> Value {
         json!({"assetID":uuid::Uuid::new_v4(),"captureTime":"2024-01-01T00:00:00Z","cameraMake":"Canon","cameraModel":"R3","lensModel":"50mm","originalFilename":"same.jpg","contentFingerprint":"unused","metadataFingerprint":"same","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"})
     }
+    fn named_snapshot(name: &str) -> Value {
+        let mut value = snapshot();
+        value["originalFilename"] = json!(name);
+        value
+    }
     fn file(hash: &str, raw: bool) -> Value {
         json!({"contentHash":hash,"sizeBytes":100,"role":if raw{"raw_original"}else{"jpeg_original"}})
     }
@@ -769,11 +763,13 @@ mod tests {
             lens_model: "50mm".into(),
             ..Default::default()
         };
+        let root = uuid::Uuid::new_v4().to_string();
         let snapshots: Vec<_> = ["/photos/a.jpg", "/photos/b.jpg"]
             .iter()
             .map(|path| {
                 let path = std::path::Path::new(path);
                 let mut value = snapshot();
+                value["originalDocumentID"] = json!(root);
                 value["originalFilename"] = json!(path.file_name().unwrap().to_str().unwrap());
                 value["metadataFingerprint"] = json!(metadata.fingerprint(path));
                 value
@@ -942,29 +938,32 @@ mod tests {
             )?,
             id
         );
+        let mut copy = snapshot();
+        copy["originalFilename"] = json!("metadata-copy.jpg");
         let visual = store.ingest_original_with_evidence(
             "lib",
             "/one/metadata-copy.jpg",
             &file("b-metadata", false),
-            &snapshot(),
+            &copy,
             &evidence("image-b"),
         )?;
         assert_ne!(visual, id);
+        copy["originalFilename"] = json!("hash-copy.jpg");
         let hash = store.ingest_original_with_evidence(
             "lib",
             "/one/hash-copy.jpg",
             &file("b", false),
-            &snapshot(),
+            &copy,
             &VersionEvidence::default(),
         )?;
         assert_ne!(hash, id);
         assert_ne!(hash, visual);
-        assert_eq!(
+        assert_ne!(
             store.ingest_original_with_evidence(
                 "lib",
                 "/two/copy.jpg",
                 &file("b", false),
-                &snapshot(),
+                &copy,
                 &evidence("image-b")
             )?,
             id
@@ -979,14 +978,14 @@ mod tests {
             "lib",
             "/a.jpg",
             &file("a", false),
-            &snapshot(),
+            &named_snapshot("a.jpg"),
             &evidence("image-a"),
         )?;
         let b = store.ingest_original_with_evidence(
             "lib",
             "/b.jpg",
             &file("b", false),
-            &snapshot(),
+            &named_snapshot("b.jpg"),
             &evidence("image-b"),
         )?;
         assert_ne!(a, b);
@@ -1000,7 +999,7 @@ mod tests {
             "lib",
             "/c.jpg",
             &file("c", false),
-            &snapshot(),
+            &named_snapshot("c.jpg"),
             &ev,
         )?;
         ev.camera_serial = "serial2".into();
@@ -1009,7 +1008,7 @@ mod tests {
             "lib",
             "/d.jpg",
             &file("d", false),
-            &snapshot(),
+            &named_snapshot("d.jpg"),
             &ev,
         )?;
         assert!(
@@ -1019,7 +1018,7 @@ mod tests {
                 .iter()
                 .any(|v| v["assetID"] == d)
         );
-        let mut unknown = snapshot();
+        let mut unknown = named_snapshot("e.jpg");
         unknown["lensModel"] = json!("");
         let e = store.ingest_original("lib", "/e.jpg", &file("e", false), &unknown)?;
         assert!(
@@ -1150,8 +1149,10 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("db");
         let store = Store::open(&path, true)?;
-        let a = store.ingest_original("lib", "/a.jpg", &file("a", false), &snapshot())?;
-        let b = store.ingest_original("lib", "/b.jpg", &file("b", false), &snapshot())?;
+        let a =
+            store.ingest_original("lib", "/a.jpg", &file("a", false), &named_snapshot("a.jpg"))?;
+        let b =
+            store.ingest_original("lib", "/b.jpg", &file("b", false), &named_snapshot("b.jpg"))?;
         assert_ne!(a, b);
         {
             let db = store.lock()?;
@@ -1165,7 +1166,7 @@ mod tests {
         assert_eq!(store.counts("lib", false)?["all"], 2);
         assert_eq!(store.versions("lib", &a)?["items"], json!([]));
         assert_eq!(
-            store.ingest_original("lib", "/a.jpg", &file("a", false), &snapshot())?,
+            store.ingest_original("lib", "/a.jpg", &file("a", false), &named_snapshot("a.jpg"))?,
             a
         );
         Ok(())

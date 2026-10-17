@@ -35,118 +35,54 @@ struct Original {
     visual: Option<String>,
 }
 
-pub(crate) fn capture_match(
+pub(crate) fn filename_match(
     db: &Connection,
     lib: &str,
     path: &str,
     snapshot: &Value,
 ) -> Result<Option<String>> {
     let path = Path::new(path);
-    if !crate::media::is_photo(path) {
+    let stem = Path::new(snapshot["originalFilename"].as_str().unwrap_or(""))
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("");
+    if stem.is_empty() {
         return Ok(None);
     }
-    let Some(key) = crate::versions::capture_key(snapshot) else {
-        return Ok(None);
-    };
-    let mut q = db.prepare("SELECT p.path,p.asset_id FROM catalog_versions v JOIN catalog_paths p ON p.library_id=v.library_id AND p.asset_id=v.asset_id AND p.content_hash=v.content_hash WHERE v.library_id=? AND v.capture_key=? ORDER BY p.path")?;
-    for row in q.query_map(params![lib, key], |r| {
+    let directory = path.parent().unwrap_or(Path::new(""));
+    let prefix = format!("{}/", directory.to_string_lossy().trim_end_matches('/'));
+    let end = format!("{}0", directory.to_string_lossy().trim_end_matches('/'));
+    let mut q = db.prepare("SELECT DISTINCT p.asset_id,a.snapshot FROM catalog_paths p JOIN catalog_assets a ON a.library_id=p.library_id AND a.id=p.asset_id WHERE p.library_id=?1 AND p.path>=?2 AND p.path<?3 AND instr(substr(p.path,length(?2)+1),'/')=0")?;
+    let mut matches = BTreeSet::new();
+    for row in q.query_map(params![lib, prefix, end], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
     })? {
-        let (other, id) = row?;
-        let other = Path::new(&other);
-        if other != path
-            && crate::media::is_photo(other)
-            && other.parent() == path.parent()
-            && other.file_stem() == path.file_stem()
-        {
-            return Ok(Some(id));
-        }
-    }
-    Ok(None)
-}
-
-/// RAW and camera HEIF may live in different directories or have collision suffixes.
-/// Require the camera's original timestamp because displayed capture times can
-/// differ after timezone interpretation, and a filename alone is not identity.
-pub(crate) fn raw_heif_match(
-    db: &Connection,
-    lib: &str,
-    path: &str,
-    snapshot: &Value,
-    evidence: &crate::versions::VersionEvidence,
-) -> Result<Option<String>> {
-    let path = Path::new(path);
-    let extension = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-    let raw = extension.eq_ignore_ascii_case("3fr");
-    let heif = ["heif", "heic", "hif"]
-        .iter()
-        .any(|s| extension.eq_ignore_ascii_case(s));
-    if !raw && !heif || evidence.capture_original.is_empty() {
-        return Ok(None);
-    }
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return Ok(None);
-    };
-    let stem = collision_stem(stem);
-    let mut matches = BTreeSet::new();
-    let mut q = db.prepare("SELECT p.path,p.asset_id,v.evidence FROM catalog_versions v INDEXED BY version_capture_original JOIN catalog_paths p ON p.library_id=v.library_id AND p.asset_id=v.asset_id AND p.content_hash=v.content_hash WHERE v.library_id=? AND json_extract(v.evidence,'$.captureOriginal')=? AND p.role IN ('raw_original','jpeg_original')")?;
-    for row in q.query_map(params![lib, evidence.capture_original], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
-        let (other_path, id, detail) = row?;
-        let other = Path::new(&other_path);
-        let other_ext = other.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let opposite = if raw {
-            ["heif", "heic", "hif"]
-                .iter()
-                .any(|s| other_ext.eq_ignore_ascii_case(s))
-        } else {
-            other_ext.eq_ignore_ascii_case("3fr")
-        };
-        if !opposite {
-            continue;
-        }
-        let other_stem = other.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        let other_base = collision_stem(other_stem);
-        if !stem.eq_ignore_ascii_case(other_base) {
-            continue;
-        }
+        let (id, detail) = row?;
         let detail: Value = serde_json::from_str(&detail)?;
-        let capture = &detail["capture"];
-        let same_camera = ["cameraMake", "cameraModel", "lensModel"]
-            .iter()
-            .all(|key| {
-                snapshot[key]
-                    .as_str()
-                    .is_some_and(|v| !v.is_empty() && capture[key].as_str() == Some(v))
-            });
-        if same_camera
-            && detail["captureOriginal"].as_str() == Some(evidence.capture_original.as_str())
-            && (evidence.camera_serial.is_empty()
-                || detail["cameraSerial"].as_str().unwrap_or("").is_empty()
-                || detail["cameraSerial"].as_str() == Some(evidence.camera_serial.as_str()))
+        let other = Path::new(detail["originalFilename"].as_str().unwrap_or(""));
+        if !other
+            .file_stem()
+            .and_then(|v| v.to_str())
+            .is_some_and(|v| v.eq_ignore_ascii_case(stem))
         {
+            continue;
+        }
+        let conflict = ["cameraImageID", "cameraMake", "cameraModel", "captureTime"]
+            .iter()
+            .any(|key| {
+                let a = snapshot[key].as_str().filter(|v| !v.is_empty());
+                let b = detail[key].as_str().filter(|v| !v.is_empty());
+                matches!((a,b),(Some(a),Some(b)) if a!=b)
+            });
+        if !conflict {
             matches.insert(id);
         }
     }
-    Ok((matches.len() == 1)
-        .then(|| matches.into_iter().next())
-        .flatten())
-}
-
-fn collision_stem(stem: &str) -> &str {
-    let Some(numbered) = stem.strip_suffix(')') else {
-        return stem;
-    };
-    let prefix = numbered.trim_end_matches(|c: char| c.is_ascii_digit());
-    if prefix.len() == numbered.len() {
-        return stem;
-    }
-    prefix.strip_suffix(" (").unwrap_or(stem)
+    Ok(if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    })
 }
 
 fn originals(db: &Connection, lib: &str, directory: &str) -> Result<Vec<Original>> {
@@ -337,6 +273,7 @@ mod tests {
                 let mut metadata = snapshot(hash);
                 metadata["captureTime"] = json!(time);
                 metadata["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+                metadata["cameraImageID"] = json!("camera-pair");
                 ids.push(store.ingest_original_with_evidence(
                     "lib", path.to_str().unwrap(),
                     &json!({"contentHash":hash,"sizeBytes":hash.len(),"role":if crate::media::is_raw(path) {"raw_original"} else {"jpeg_original"}}),
@@ -374,6 +311,7 @@ mod tests {
             std::fs::write(path, hash)?;
             let mut metadata = snapshot(hash);
             metadata["originalDocumentID"] = json!(uuid::Uuid::new_v4().to_string());
+            metadata["cameraImageID"] = json!("camera-pair");
             ids.push(store.ingest_original_with_evidence(
                 "lib", path.to_str().unwrap(),
                 &json!({"contentHash":hash,"sizeBytes":hash.len(),"role":if crate::media::is_raw(path) {"raw_original"} else {"jpeg_original"}}),
@@ -436,6 +374,11 @@ mod tests {
             )?,
             id
         );
+        reconcile_directory(
+            &*store.lock()?,
+            "lib",
+            a.parent().unwrap().to_str().unwrap(),
+        )?;
         let versions = store.versions("lib", &id)?;
         assert_eq!(versions["items"].as_array().unwrap().len(), 1);
         assert_eq!(versions["items"][0]["paths"].as_array().unwrap().len(), 1);
@@ -452,7 +395,7 @@ mod tests {
                 .set_default_version("lib", &id, "other-metadata")
                 .is_err()
         );
-        let before = store.library_revision("lib")?;
+
         ingest(
             &store,
             &c,
@@ -460,35 +403,52 @@ mod tests {
             &snapshot("other-metadata"),
             Some("pixels"),
         )?;
-        assert_eq!(store.library_revision("lib")?, before);
+        reconcile_directory(
+            &*store.lock()?,
+            "lib",
+            a.parent().unwrap().to_str().unwrap(),
+        )?;
+        assert_eq!(
+            store.versions("lib", &id)?["deprecatedFiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(std::fs::read_to_string(b)?, "same");
         assert_eq!(std::fs::read_to_string(c)?, "other-metadata");
         Ok(())
     }
 
     #[test]
-    fn pairing_requires_stem_and_complete_metadata() -> Result<()> {
+    fn filename_pairing_needs_scope_and_no_explicit_conflict() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
-        let raw = dir.path().join("photos/a.3FR");
-        let id = ingest(&store, &raw, "raw", &snapshot("raw"), None)?;
-        for (index, relative, key) in [
-            (0, "other/a.HEIC", None),
-            (1, "photos/b.HEIC", None),
-            (2, "photos/a.HEIC", Some("captureTime")),
-            (3, "photos/a.jpg", Some("lensModel")),
-            (4, "photos/a.png", Some("cameraModel")),
-        ] {
-            let hash = format!("different{index}");
-            let mut metadata = snapshot(&hash);
-            if let Some(key) = key {
-                metadata[key] = json!("");
-            }
+        let mut raw = snapshot("raw");
+        raw["originalFilename"] = json!("a.3FR");
+        let id = ingest(&store, &dir.path().join("photos/a.3FR"), "raw", &raw, None)?;
+        for relative in ["other/a.HEIC", "photos/b.HEIC"] {
+            let mut meta = raw.clone();
+            meta["originalFilename"] =
+                json!(Path::new(relative).file_name().unwrap().to_str().unwrap());
             assert_ne!(
-                ingest(&store, &dir.path().join(relative), &hash, &metadata, None)?,
+                ingest(&store, &dir.path().join(relative), relative, &meta, None)?,
                 id
             );
         }
+        let mut meta = raw.clone();
+        meta["originalFilename"] = json!("a.HEIC");
+        meta.as_object_mut().unwrap().remove("captureTime");
+        assert_eq!(
+            ingest(
+                &store,
+                &dir.path().join("photos/a.HEIC"),
+                "heif",
+                &meta,
+                None
+            )?,
+            id
+        );
         Ok(())
     }
 
@@ -671,6 +631,11 @@ mod tests {
         let b = a.with_file_name("copy.jpg");
         let id = ingest(&store, &a, "same", &snapshot("same"), None)?;
         ingest(&store, &b, "same", &snapshot("same"), None)?;
+        reconcile_directory(
+            &*store.lock()?,
+            "lib",
+            a.parent().unwrap().to_str().unwrap(),
+        )?;
         store
             .lock()?
             .execute("DELETE FROM catalog_versions WHERE asset_id=?", [&id])?;
