@@ -250,8 +250,12 @@ public final class KeepsClient: Sendable {
     public func scanFolder(id: String) async throws -> KeepsJob {
         try await request("POST", library + ["folders", id, "scan"])
     }
-    public func refreshDirectoryMetadata(path: String) async throws -> KeepsJob {
-        try await request("POST", library + ["directories", "refresh"], body: JSONEncoder().encode(["path": path]))
+    public func refreshDirectoryMetadata(path: String, override: Bool = false) async throws -> KeepsJob {
+        struct Refresh: Encodable {
+            let path: String
+            let override: Bool
+        }
+        return try await request("POST", library + ["directories", "refresh"], body: JSONEncoder().encode(Refresh(path: path, override: override)))
     }
     public func taskStatus() async throws -> KeepsTaskStatus {
         try await request("GET", library + ["task-status"])

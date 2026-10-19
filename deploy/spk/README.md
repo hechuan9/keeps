@@ -31,7 +31,7 @@ python3 -m unittest discover -s deploy/spk -p 'test_*.py'
 ## 升级与恢复
 
 1. 暂停独立维护进程，停止服务；使用 SQLite backup API 一致备份状态目录的 `db/control_plane.sqlite`、`db/jobs.sqlite`，检查备份，并保留当前套件与配置。
-2. 安装新包，保留 library ID、token、原片和状态路径。禁止同时启动两个写入同一状态目录的服务。
+2. 安装新包，保留 library ID、token、原片和状态路径。禁止同时启动两个写入同一状态目录的服务。 若 schema 升级，安装后保持停服，以套件账号设置当前 KEEPS_ROOT 并执行 target/bin/keeps-server migrate；确认迁移成功后再启动，不依赖生产配置自动迁移。
 3. 启动后核对 `/healthz`、鉴权、资产计数、缩略图下载及后台状态，再恢复维护进程。可用性与全库处理完成是两回事。
 4. 回退前另存最新数据库。使用与数据库 schema 匹配的套件和配置；恢复旧数据库会丢失备份之后的整理修改，不能直接覆盖最新状态。
 

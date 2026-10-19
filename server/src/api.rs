@@ -437,6 +437,8 @@ struct CreateDirectoryRequest {
 #[derive(Deserialize)]
 struct RefreshDirectoryRequest {
     path: String,
+    #[serde(default)]
+    r#override: bool,
 }
 async fn refresh_directory(
     State(state): State<Arc<AppState>>,
@@ -459,11 +461,14 @@ async fn refresh_directory(
             })
             .max_by_key(|folder| folder.path.len())
             .ok_or_else(|| resource_error(404, "directory is not tracked in this library"))?;
-        Ok(serde_json::to_value(
+        let job = if body.r#override {
             state
                 .jobs
-                .enqueue_manual_metadata_refresh(&folder.id, &path)?,
-        )?)
+                .enqueue_manual_metadata_refresh(&folder.id, &path)?
+        } else {
+            state.jobs.enqueue_reconcile_scope(&folder.id, &path)?
+        };
+        Ok(serde_json::to_value(job)?)
     })
     .await?;
     Ok((StatusCode::ACCEPTED, Json(job)).into_response())

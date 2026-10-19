@@ -30,6 +30,7 @@ pub struct Job {
     pub scope_kind: String,
     pub work_class: String,
     pub refresh_metadata: bool,
+    pub rebuild_media: bool,
     pub path_sync: bool,
     pub wait_for_quiet: bool,
     pub status: String,
@@ -88,12 +89,17 @@ fn job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         scope_kind: row.get(15)?,
         work_class: row.get(16)?,
         phase: row.get(17)?,
+        rebuild_media: row.get(18)?,
     })
 }
-const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class,j.phase FROM jobs j JOIN folders f ON f.id=j.folder_id";
+const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class,j.phase,j.rebuild_media FROM jobs j JOIN folders f ON f.id=j.folder_id";
 
 fn covers(parent: &Job, child: &Job) -> bool {
-    if parent.folder_id != child.folder_id || parent.work_class != child.work_class {
+    if parent.folder_id != child.folder_id
+        || parent.work_class != child.work_class
+        || parent.refresh_metadata != child.refresh_metadata
+        || parent.rebuild_media != child.rebuild_media
+    {
         return false;
     }
     let parent_path = Path::new(&parent.path);
@@ -221,6 +227,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             ("scope_kind", "TEXT NOT NULL DEFAULT 'recursive'"),
             ("checkpoint", "TEXT"),
             ("refresh_metadata", "INTEGER NOT NULL DEFAULT 0"),
+            ("rebuild_media", "INTEGER NOT NULL DEFAULT 0"),
             ("path_sync", "INTEGER NOT NULL DEFAULT 0"),
             ("wait_for_quiet", "INTEGER NOT NULL DEFAULT 1"),
             ("rerun", "INTEGER NOT NULL DEFAULT 0"),
@@ -230,6 +237,10 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             if !columns.iter().any(|column| column == name) {
                 db.execute_batch(&format!("ALTER TABLE jobs ADD COLUMN {name} {definition}"))?;
             }
+        }
+        if !columns.iter().any(|column| column == "rebuild_media") {
+            // File jobs previously enabled metadata refresh implicitly, including normal retries.
+            db.execute_batch("UPDATE jobs SET refresh_metadata=0 WHERE scope_kind='file' AND status IN ('pending','running','failed')")?;
         }
         if !columns.iter().any(|column| column == "path_sync") {
             // Existing scoped discovery jobs are the pending directory moves that
@@ -373,6 +384,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             Path::new(&path),
             0,
             false,
+            false,
             wait_for_quiet,
             false,
             "recursive",
@@ -396,6 +408,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             path,
             debounce_seconds,
             true,
+            false,
             true,
             false,
             "recursive",
@@ -407,6 +420,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id,
             path,
             0,
+            false,
             false,
             false,
             false,
@@ -426,7 +440,17 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         } else {
             "automatic"
         };
-        self.enqueue_scope(folder_id, path, 0, false, true, true, "recursive", class)
+        self.enqueue_scope(
+            folder_id,
+            path,
+            0,
+            false,
+            false,
+            true,
+            true,
+            "recursive",
+            class,
+        )
     }
     #[cfg(test)]
     pub fn enqueue_path_change(
@@ -439,6 +463,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id,
             path,
             debounce_seconds,
+            false,
             false,
             true,
             true,
@@ -453,6 +478,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             path,
             delay,
             false,
+            false,
             true,
             true,
             "file",
@@ -460,16 +486,26 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         )
     }
     pub fn enqueue_operation_file(&self, folder_id: &str, path: &Path, delay: i64) -> Result<Job> {
-        self.enqueue_scope(folder_id, path, delay, false, true, true, "file", "manual")
+        self.enqueue_scope(
+            folder_id, path, delay, false, false, true, true, "file", "manual",
+        )
     }
     pub fn enqueue_manual_file(&self, folder_id: &str, path: &Path) -> Result<Job> {
-        self.enqueue_scope(folder_id, path, 0, true, false, true, "file", "manual")
+        self.enqueue_scope(
+            folder_id, path, 0, false, false, false, true, "file", "manual",
+        )
+    }
+    pub fn enqueue_manual_media_rebuild(&self, folder_id: &str, path: &Path) -> Result<Job> {
+        self.enqueue_scope(
+            folder_id, path, 0, false, true, false, true, "file", "manual",
+        )
     }
     pub fn enqueue_manual_directory(&self, folder_id: &str, path: &Path) -> Result<Job> {
         self.enqueue_scope(
             folder_id,
             path,
             0,
+            false,
             false,
             false,
             true,
@@ -483,6 +519,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             path,
             0,
             true,
+            false,
             false,
             false,
             "recursive",
@@ -501,6 +538,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             path,
             delay,
             false,
+            false,
             true,
             true,
             "directory",
@@ -518,6 +556,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             folder_id,
             path,
             delay,
+            false,
             false,
             true,
             true,
@@ -579,6 +618,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         path: &Path,
         debounce_seconds: i64,
         refresh_metadata: bool,
+        rebuild_media: bool,
         wait_for_quiet: bool,
         path_sync: bool,
         scope_kind: &str,
@@ -602,7 +642,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let available = chrono::Utc::now().timestamp() + debounce_seconds.max(0);
         tx.execute("INSERT OR IGNORE INTO jobs(id,folder_id,scope_path,scope_kind,status,available_at,wait_for_quiet,work_class) VALUES(?1,?2,?3,?4,'pending',?5,?6,?7)",
             params![Uuid::new_v4().to_string(), folder_id, scope, scope_kind, available, wait_for_quiet, work_class])?;
-        tx.execute("UPDATE jobs SET path_sync=MAX(path_sync,?6),refresh_metadata=MAX(refresh_metadata,?4),wait_for_quiet=MAX(wait_for_quiet,?5),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,available_at=MAX(available_at,?3),updated_at=unixepoch() WHERE folder_id=?1 AND scope_path=?2 AND scope_kind=?7 AND work_class=?8 AND status IN ('pending','running')", params![folder_id,scope,available,refresh_metadata,wait_for_quiet,path_sync,scope_kind,work_class])?;
+        tx.execute("UPDATE jobs SET rebuild_media=MAX(rebuild_media,?9),path_sync=MAX(path_sync,?6),refresh_metadata=MAX(refresh_metadata,?4),wait_for_quiet=MAX(wait_for_quiet,?5),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,available_at=MAX(available_at,?3),updated_at=unixepoch() WHERE folder_id=?1 AND scope_path=?2 AND scope_kind=?7 AND work_class=?8 AND status IN ('pending','running')", params![folder_id,scope,available,refresh_metadata,wait_for_quiet,path_sync,scope_kind,work_class,rebuild_media])?;
         let original = tx.query_row(&format!("{JOB_SELECT} WHERE j.folder_id=?1 AND j.scope_path=?2 AND j.scope_kind=?3 AND j.work_class=?4 AND j.status IN ('pending','running')"), params![folder_id,scope,scope_kind,work_class],job)?;
         Self::coalesce_transaction(&tx)?;
         let result = if tx.query_row("SELECT status FROM jobs WHERE id=?", [&original.id], |r| {
@@ -637,7 +677,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let mut retained: Vec<Job> = Vec::new();
         for candidate in pending {
             if let Some(parent) = retained.iter().find(|parent| covers(parent, &candidate)) {
-                tx.execute("UPDATE jobs SET refresh_metadata=MAX(refresh_metadata,(SELECT refresh_metadata FROM jobs WHERE id=?2)),path_sync=MAX(path_sync,(SELECT path_sync FROM jobs WHERE id=?2)),wait_for_quiet=MAX(wait_for_quiet,(SELECT wait_for_quiet FROM jobs WHERE id=?2)),available_at=MAX(available_at,(SELECT available_at FROM jobs WHERE id=?2)),rerun=MAX(rerun,(SELECT rerun FROM jobs WHERE id=?2)),updated_at=unixepoch() WHERE id=?1", params![parent.id,candidate.id])?;
+                tx.execute("UPDATE jobs SET rebuild_media=MAX(rebuild_media,(SELECT rebuild_media FROM jobs WHERE id=?2)),refresh_metadata=MAX(refresh_metadata,(SELECT refresh_metadata FROM jobs WHERE id=?2)),path_sync=MAX(path_sync,(SELECT path_sync FROM jobs WHERE id=?2)),wait_for_quiet=MAX(wait_for_quiet,(SELECT wait_for_quiet FROM jobs WHERE id=?2)),available_at=MAX(available_at,(SELECT available_at FROM jobs WHERE id=?2)),rerun=MAX(rerun,(SELECT rerun FROM jobs WHERE id=?2)),updated_at=unixepoch() WHERE id=?1", params![parent.id,candidate.id])?;
                 tx.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [&candidate.id])?;
             } else if candidate.scope_kind != "file" {
                 // The unique index already deduplicates files; only directories can cover another job.
@@ -696,12 +736,12 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .context("only failed jobs of active folders can be retried")?;
         let existing: Option<String> = tx.query_row("SELECT id FROM jobs WHERE folder_id=?1 AND scope_path=?2 AND scope_kind=?3 AND work_class='manual' AND status IN ('pending','running')", params![failed.folder_id, failed.path, failed.scope_kind], |row| row.get(0)).optional()?;
         let retry_id = if let Some(existing) = existing {
-            tx.execute("UPDATE jobs SET attempts=0,available_at=0,error=NULL,path_sync=MAX(path_sync,?2),refresh_metadata=MAX(refresh_metadata,?3),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,updated_at=unixepoch() WHERE id=?1", params![existing,failed.path_sync,failed.refresh_metadata])?;
+            tx.execute("UPDATE jobs SET attempts=0,available_at=0,error=NULL,path_sync=MAX(path_sync,?2),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,updated_at=unixepoch() WHERE id=?1", params![existing,failed.path_sync])?;
             tx.execute("UPDATE jobs SET status='cancelled',finished_at=unixepoch(),updated_at=unixepoch() WHERE id=?1", [id])?;
             existing
         } else {
             let status = transition(&failed.status, Event::Retry)?;
-            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,status=?2,phase='waiting',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![id,status])?;
+            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,refresh_metadata=0,rebuild_media=0,status=?2,phase='waiting',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![id,status])?;
             id.to_owned()
         };
         let result = tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&retry_id], job)?;
@@ -980,6 +1020,91 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn migration_clears_implicit_file_override_and_preserves_explicit_metadata_refresh() {
+        let (dir, jobs, folder) = setup();
+        let file = jobs
+            .enqueue_manual_file(&folder.id, &jobs.root().join("photo.jpg"))
+            .unwrap();
+        let metadata = jobs
+            .enqueue_manual_metadata_refresh(&folder.id, jobs.root())
+            .unwrap();
+        jobs.db
+            .lock()
+            .unwrap()
+            .execute("UPDATE jobs SET refresh_metadata=1 WHERE id=?1", [&file.id])
+            .unwrap();
+        jobs.db
+            .lock()
+            .unwrap()
+            .execute_batch("ALTER TABLE jobs DROP COLUMN rebuild_media")
+            .unwrap();
+        drop(jobs);
+        let jobs = Jobs::open(
+            &dir.path().join("jobs.sqlite"),
+            &dir.path().join("originals"),
+        )
+        .unwrap();
+        let migrated = jobs.job(&file.id).unwrap().unwrap();
+        assert!(!migrated.refresh_metadata && !migrated.rebuild_media);
+        let retained = jobs.job(&metadata.id).unwrap().unwrap();
+        assert!(retained.refresh_metadata && !retained.rebuild_media);
+    }
+
+    #[test]
+    fn manual_modes_are_operation_specific_and_retry_is_normal() {
+        let (_dir, jobs, folder) = setup();
+        let path = jobs.root().join("photo.jpg");
+        let normal = jobs.enqueue_manual_file(&folder.id, &path).unwrap();
+        assert!(!normal.refresh_metadata && !normal.rebuild_media);
+        let media = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &path)
+            .unwrap();
+        assert_eq!(normal.id, media.id);
+        assert!(media.rebuild_media && !media.refresh_metadata);
+        jobs.claim_class("manual").unwrap().unwrap();
+        jobs.finish(&media.id, Some("failed")).unwrap();
+        let retry = jobs.retry(&media.id).unwrap();
+        assert!(!retry.refresh_metadata && !retry.rebuild_media);
+        let metadata = jobs
+            .enqueue_manual_metadata_refresh(&folder.id, jobs.root())
+            .unwrap();
+        assert!(metadata.refresh_metadata && !metadata.rebuild_media);
+    }
+
+    #[test]
+    fn scoped_metadata_override_does_not_expand_to_parent() {
+        let (_dir, jobs, folder) = setup();
+        let parent = jobs
+            .enqueue_reconcile_scope(&folder.id, jobs.root())
+            .unwrap();
+        let child = jobs
+            .enqueue_manual_metadata_refresh(&folder.id, &jobs.root().join("child"))
+            .unwrap();
+        assert_ne!(parent.id, child.id);
+        assert_eq!(child.status, "pending");
+        let retained = jobs.jobs(10).unwrap();
+        assert!(
+            !retained
+                .iter()
+                .find(|job| job.id == parent.id)
+                .unwrap()
+                .refresh_metadata
+        );
+    }
+
+    #[test]
+    fn retry_does_not_reinstate_metadata_override() {
+        let (_dir, jobs, folder) = setup();
+        let refresh = jobs
+            .enqueue_manual_metadata_refresh(&folder.id, jobs.root())
+            .unwrap();
+        jobs.claim_class("manual").unwrap().unwrap();
+        jobs.finish(&refresh.id, Some("failed")).unwrap();
+        let retry = jobs.retry(&refresh.id).unwrap();
+        assert!(!retry.refresh_metadata && !retry.rebuild_media);
+    }
+
     #[test]
     fn task_phase_retains_failure_and_resets_on_explicit_retry() {
         let (_dir, jobs, folder) = setup();

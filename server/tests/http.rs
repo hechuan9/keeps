@@ -1910,7 +1910,8 @@ async fn task_summary_is_scoped_and_cache_rebuild_queues_manual_photo_work() {
     assert_eq!(body["requeued"], 1);
     let job = state.jobs.claim_class("manual").unwrap().unwrap();
     assert_eq!(job.folder_id, folder.id);
-    assert!(job.refresh_metadata);
+    assert!(!job.refresh_metadata);
+    assert!(job.rebuild_media);
     assert_eq!(
         db.query_row(
             "SELECT status FROM media_cache WHERE asset_id=?",
@@ -2563,12 +2564,25 @@ async fn directory_metadata_refresh_is_recursive_manual_durable_and_scoped() {
     assert_eq!(job["path"], path.to_str().unwrap());
     assert_eq!(job["scopeKind"], "recursive");
     assert_eq!(job["workClass"], "manual");
-    assert_eq!(job["refreshMetadata"], true);
+    assert_eq!(job["refreshMetadata"], false);
+    assert_eq!(job["rebuildMedia"], false);
     assert_eq!(job["pathSync"], false);
     assert_eq!(job["waitForQuiet"], false);
     assert_eq!(job["status"], "pending");
     let (_, repeated) = call(app.clone(), "POST", endpoint, json!({"path":path})).await;
     assert_eq!(repeated["id"], job["id"]);
+    let (status, forced) = call(
+        app.clone(),
+        "POST",
+        endpoint,
+        json!({"path":path,"override":true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(forced["id"], job["id"]);
+    assert_eq!(forced["refreshMetadata"], true);
+    assert_eq!(forced["rebuildMedia"], false);
+
     let (_, summary) = call(
         app.clone(),
         "GET",

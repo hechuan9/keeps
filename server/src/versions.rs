@@ -225,6 +225,17 @@ impl Store {
         source: &std::path::Path,
         source_hash: &str,
     ) -> Result<std::path::PathBuf> {
+        self.generated_standard_target_with_override(lib, id, source, source_hash, false)
+    }
+
+    pub fn generated_standard_target_with_override(
+        &self,
+        lib: &str,
+        id: &str,
+        source: &std::path::Path,
+        source_hash: &str,
+        override_existing: bool,
+    ) -> Result<std::path::PathBuf> {
         let stem = source
             .file_stem()
             .and_then(|s| s.to_str())
@@ -249,7 +260,8 @@ impl Store {
                     .all(|(owner, hash)| owner == id && hash.as_deref() == Some(source_hash));
             match std::fs::symlink_metadata(&target) {
                 Ok(meta)
-                    if owned
+                    if !override_existing
+                        && owned
                         && meta.is_file()
                         && self.generated_standard_matches(lib, id, &target)? =>
                 {
@@ -587,6 +599,49 @@ mod tests {
             dir.path().join("DSC02514.2.heic")
         );
         assert_eq!(std::fs::read(original)?, b"user photo");
+        Ok(())
+    }
+
+    #[test]
+    fn overridden_standard_uses_new_path_and_preserves_existing_files() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        let raw = dir.path().join("source.arw");
+        std::fs::write(&raw, b"camera raw")?;
+        let id = store.ingest_original(
+            "lib",
+            raw.to_str().unwrap(),
+            &file("rawhash", true),
+            &snapshot(),
+        )?;
+        let target = store.generated_standard_target("lib", &id, &raw, "rawhash")?;
+        let stage = dir.path().join("stage");
+        std::fs::write(&stage, b"previous generated")?;
+        store.publish_generated_standard("lib", &id, "rawhash", &stage, &target, (100, 100))?;
+        let user_file = dir.path().join("source.1.heic");
+        std::fs::write(&user_file, b"user photo")?;
+        assert_eq!(
+            store.generated_standard_target("lib", &id, &raw, "rawhash")?,
+            target
+        );
+        let replacement =
+            store.generated_standard_target_with_override("lib", &id, &raw, "rawhash", true)?;
+        assert_eq!(replacement, dir.path().join("source.2.heic"));
+        assert!(!replacement.exists());
+        let stage = dir.path().join("replacement-stage");
+        std::fs::write(&stage, b"new generated")?;
+        store.publish_generated_standard(
+            "lib",
+            &id,
+            "rawhash",
+            &stage,
+            &replacement,
+            (100, 100),
+        )?;
+        assert_eq!(std::fs::read(&replacement)?, b"new generated");
+        assert_eq!(std::fs::read(&target)?, b"previous generated");
+        assert_eq!(std::fs::read(&user_file)?, b"user photo");
+        assert_eq!(std::fs::read(&raw)?, b"camera raw");
         Ok(())
     }
 

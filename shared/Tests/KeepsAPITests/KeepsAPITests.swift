@@ -63,8 +63,9 @@ struct KeepsAPITests {
         let fixture = Fixture { request in
             #expect(request.httpMethod == "POST")
             #expect(request.url!.path == "/api/libraries/library/directories/refresh")
-            let body = try JSONDecoder().decode([String: String].self, from: request.bodyData)
-            #expect(body == ["path": "/photos/旅行 & RAW"])
+            let body = try #require(JSONSerialization.jsonObject(with: request.bodyData) as? [String: Any])
+            #expect(body["path"] as? String == "/photos/旅行 & RAW")
+            #expect(body["override"] as? Bool == false)
             return (202, """
             {"id":"refresh-1","folderID":"folder-1","libraryID":"library","path":"/photos/旅行 & RAW","status":"pending","processed":0}
             """)

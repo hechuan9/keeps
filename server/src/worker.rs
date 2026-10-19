@@ -450,15 +450,15 @@ fn process_photo(
         };
         for id in assets {
             store.initialize_negative(&job.library_id, &id)?;
-            if job.work_class == "manual" && (job.refresh_metadata || job.scope_kind == "file") {
-                let mut db = store.lock()?;
-                let tx = db.transaction()?;
-                tx.execute("UPDATE media_cache SET status='pending',attempts=0,available_at=0,last_error=NULL,browse_attempts=0,browse_available_at=0,browse_last_error=NULL WHERE library_id=? AND asset_id=? AND status<>'processing'",rusqlite::params![job.library_id,id])?;
-                crate::revisions::flush(&tx)?;
-                tx.commit()?;
-            }
             jobs.set_phase(&job.id, "media")?;
-            crate::cache_pipeline::process_asset(store, jobs, previews, &job.library_id, &id)?;
+            changed |= crate::cache_pipeline::process_asset_with_override(
+                store,
+                jobs,
+                previews,
+                &job.library_id,
+                &id,
+                job.rebuild_media,
+            )?;
             jobs.set_phase(&job.id, "cleanup")?;
             store.collect_asset_cache_garbage(previews, &job.library_id, &id)?;
         }
@@ -502,6 +502,8 @@ fn process_file(
         && previous.error.is_none()
         && !previous.asset_id.is_empty()
         && store.original_is_online(&job.library_id, text, &previous.version)?
+        && crate::identity::standard_sidecar_photo_id(path)?.as_deref()
+            == Some(store.root_id(&job.library_id, &previous.asset_id)?.as_str())
     {
         return Ok(false);
     }
@@ -634,6 +636,59 @@ fn process_file(
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn ordinary_file_reuses_index_but_metadata_override_reextracts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        fs::create_dir(&originals)?;
+        let jobs = Jobs::open(&temp.path().join("jobs.sqlite"), &originals)?;
+        let store = Store::open(&temp.path().join("catalog.sqlite"), true)?;
+        let previews = PreviewStorage::new(
+            &temp.path().join("keeps"),
+            Some(&originals),
+            "http://localhost",
+            "test",
+        )?;
+        let path = jobs.root().join("photo.jpg");
+        fs::write(
+            &path,
+            b"fixture must not be decoded when its index is current",
+        )?;
+        let hash = media::sha256_file(&path)?;
+        let (size, mtime) = file_stamp(&path)?;
+        let id = store.ingest_original(
+            "library",
+            path.to_str().unwrap(),
+            &json!({"contentHash":hash,"sizeBytes":size,"role":"jpeg_original"}),
+            &json!({"originalFilename":"photo.jpg","contentFingerprint":hash,"metadataFingerprint":"fixture","rating":0,"flagState":"unflagged","tags":[],"createdAt":"2024-01-01T00:00:00Z","updatedAt":"2024-01-01T00:00:00Z"}),
+        )?;
+        crate::identity::ensure_known(&path, &store.root_id("library", &id)?)?;
+        let folder = jobs.add_folder("library", ".")?;
+        jobs.record_file(
+            &folder.id,
+            path.to_str().unwrap(),
+            size,
+            mtime,
+            &id,
+            &hash,
+            None,
+        )?;
+        jobs.record_metadata_stamp(
+            &folder.id,
+            path.to_str().unwrap(),
+            &media::sidecar_stamp(&path)?,
+        )?;
+        let mut job = jobs.enqueue_manual_file(&folder.id, &path)?;
+        let stop = AtomicBool::new(false);
+        assert!(!process_file(&store, &jobs, &previews, &job, &path, &stop)?);
+        job.rebuild_media = true;
+        assert!(!process_file(&store, &jobs, &previews, &job, &path, &stop)?);
+        job.refresh_metadata = true;
+        assert!(process_file(&store, &jobs, &previews, &job, &path, &stop).is_err());
+        assert_eq!(media::sha256_file(&path)?, hash);
+        Ok(())
+    }
 
     #[test]
     fn import_uncheckpointed_pair_fails_without_touching_metadata() -> Result<()> {

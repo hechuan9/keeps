@@ -51,15 +51,38 @@ pub fn process_asset(
     library: &str,
     asset: &str,
 ) -> Result<bool> {
+    process_asset_with_override(store, previews, library, asset, false)
+}
+
+pub fn process_asset_with_override(
+    store: &Store,
+    previews: &PreviewStorage,
+    library: &str,
+    asset: &str,
+    override_media: bool,
+) -> Result<bool> {
     let selected = {
         let db = store.lock()?;
-        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail FROM media_cache c INDEXED BY media_cache_browse_pending JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?2 AND c.asset_id=?3 AND c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND (c.browse_thumbnail IS NULL OR json_extract(c.browse_thumbnail,'$.sourceThumbnailVersion') IS NOT c.browse_source_version OR json_extract(c.browse_thumbnail,'$.spec') IS NOT c.browse_spec) AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,library,asset], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?))).optional()?
+        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail,c.browse_thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?2 AND c.asset_id=?3 AND c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,library,asset], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?))).optional()?
     };
-    let Some((lib, id, hash, thumbnail)) = selected else {
+    let Some((lib, id, hash, thumbnail, browse)) = selected else {
         return Ok(false);
     };
     let thumbnail: Value = serde_json::from_str(&thumbnail)?;
     let version = thumbnail["version"].as_str().unwrap_or_default();
+    if !override_media && let Some(browse) = browse {
+        let browse: Value = serde_json::from_str(&browse)?;
+        if browse["sourceThumbnailVersion"].as_str() == Some(version)
+            && browse["spec"].as_str() == Some(SPEC)
+            && previews.contains(&browse["objectRef"])?
+        {
+            store.lock()?.execute(
+                "UPDATE media_cache SET browse_last_error=NULL WHERE library_id=? AND asset_id=?",
+                params![lib, id],
+            )?;
+            return Ok(false);
+        }
+    }
     store.lock()?.execute("UPDATE media_cache SET browse_attempts=browse_attempts+1 WHERE library_id=? AND asset_id=?", params![lib,id])?;
     let result: Result<()> = (|| {
         let input = previews.object_path(&thumbnail["objectRef"])?;
@@ -190,6 +213,32 @@ mod tests {
         assert!(store.browse_descriptor("lib", "asset")?.is_none());
         Ok(())
     }
+    #[test]
+    fn existing_browse_is_reused_only_while_its_file_and_spec_are_current() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(&temp.path().join("db"), true)?;
+        let previews = PreviewStorage::new(
+            &temp.path().join("keeps"),
+            None,
+            "http://localhost",
+            "secret",
+        )?;
+        seed(&store)?;
+        let fixture = temp.path().join("fixture");
+        std::fs::write(&fixture, b"browse")?;
+        let object = previews.put_generated_role("lib", "asset", "one", &fixture, "browse")?;
+        let mut browse = descriptor();
+        browse["objectRef"] = object.clone();
+        publish(&store, "lib", "asset", "hash", "preview-v1", &browse)?;
+        assert!(!process_asset(&store, &previews, "lib", "asset")?);
+        assert!(process_asset_with_override(&store, &previews, "lib", "asset", true).is_err());
+        assert!(previews.contains(&object)?);
+        assert!(!process_asset(&store, &previews, "lib", "asset")?);
+        std::fs::remove_file(previews.object_path(&object)?)?;
+        assert!(process_asset(&store, &previews, "lib", "asset").is_err());
+        Ok(())
+    }
+
     #[test]
     fn progress_only_counts_current_source_and_preview_spec() -> Result<()> {
         let temp = tempfile::tempdir()?;

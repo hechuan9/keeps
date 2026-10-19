@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 20;
+const VERSION: i64 = 21;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -71,7 +71,7 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         db.prepare("SELECT library_id,id,snapshot FROM photos LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM videos LIMIT 0")?;
         db.prepare("SELECT library_id,path,parent_path FROM directories LIMIT 0")?;
-        db.prepare("SELECT library_id,asset_id,source_hash,spec,status,attempts,available_at,last_error,thumbnail,standard,updated_at,audited_at FROM media_cache LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,source_hash,spec,status,attempts,available_at,last_error,thumbnail,standard,updated_at,audited_at,published_source_hash,published_spec FROM media_cache LIMIT 0")?;
         db.prepare("SELECT next_batch_at,last_batch_count,last_batch_at,last_error,free_bytes FROM cache_runtime LIMIT 0")?;
         db.prepare("SELECT snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed FROM catalog_assets LIMIT 0")?;
         db.prepare(
@@ -194,6 +194,9 @@ CREATE TRIGGER IF NOT EXISTS catalog_tags_update AFTER UPDATE OF snapshot ON cat
     if version < 20 {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS catalog_photo_sources(library_id TEXT NOT NULL,kind TEXT NOT NULL,value TEXT NOT NULL,asset_id TEXT NOT NULL,PRIMARY KEY(library_id,kind,value,asset_id));
 CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NULL,asset_id TEXT NOT NULL,created_at TEXT NOT NULL,PRIMARY KEY(library_id,asset_id));")?;
+    }
+    if version < 21 {
+        crate::cache_pipeline::migrate_published_state(&tx)?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -1128,6 +1131,53 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_twenty_media_publication_migrates_existing_results() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("catalog.sqlite");
+        let store = Store::open(&path, true)?;
+        {
+            let db = store.lock()?;
+            db.execute_batch("DROP TRIGGER media_cache_published_update; DROP TRIGGER media_cache_published_insert; ALTER TABLE media_cache DROP COLUMN published_source_hash; ALTER TABLE media_cache DROP COLUMN published_spec; PRAGMA user_version=20;")?;
+            db.execute("INSERT INTO media_cache(library_id,asset_id,source_hash,spec,status,thumbnail,standard) VALUES('lib','ready','source','spec','ready','{}','{}'),('lib','failed','source','spec','failed','{}','{}')", [])?;
+        }
+        drop(store);
+        assert!(Store::open(&path, false).is_err());
+        let store = Store::open(&path, true)?;
+        {
+            let db = store.lock()?;
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
+                VERSION
+            );
+            let published: (String,String) = db.query_row("SELECT published_source_hash,published_spec FROM media_cache WHERE asset_id='ready'", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            assert_eq!(published, ("source".into(), "spec".into()));
+            assert!(
+                db.query_row(
+                    "SELECT published_source_hash FROM media_cache WHERE asset_id='failed'",
+                    [],
+                    |r| r.get::<_, Option<String>>(0)
+                )?
+                .is_none()
+            );
+            db.execute("UPDATE media_cache SET source_hash='new',spec='new-spec',status='ready' WHERE asset_id='failed'", [])?;
+            assert_eq!(
+                db.query_row(
+                    "SELECT published_source_hash FROM media_cache WHERE asset_id='failed'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?,
+                "new"
+            );
+        }
+        drop(store);
+        let store = Store::open(&path, false)?;
+        store.lock()?.execute_batch("DROP TRIGGER media_cache_published_update; DROP TRIGGER media_cache_published_insert; ALTER TABLE media_cache DROP COLUMN published_source_hash;")?;
+        drop(store);
+        assert!(Store::open(&path, false).is_err());
+        Ok(())
+    }
+
     #[test]
     fn legacy_ai_state_survives_reopen_and_schema_twelve_migration() -> Result<()> {
         let directory = tempfile::tempdir()?;
