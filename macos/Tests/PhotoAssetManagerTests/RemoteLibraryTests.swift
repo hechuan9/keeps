@@ -804,8 +804,13 @@ private final class LibraryStubProtocol: URLProtocol, @unchecked Sendable {
                     data.append(buffer, count: count)
                 }
             }
-            let submitted = try! JSONDecoder().decode([String: String].self, from: data)
-            #expect(submitted == ["path": "other"])
+            struct RefreshRequest: Decodable {
+                let path: String
+                let override: Bool
+            }
+            let submitted = try! JSONDecoder().decode(RefreshRequest.self, from: data)
+            #expect(submitted.path == "other")
+            #expect(submitted.override == false)
             deliver(body: "{\"id\":\"refresh-1\",\"folderID\":\"folder-1\",\"libraryID\":\"test\",\"path\":\"other\",\"status\":\"pending\"}", status: 202)
             return
         }
