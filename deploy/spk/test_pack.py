@@ -36,6 +36,7 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(archive.getmember("scripts/postinst").mode, 0o755)
                 unit = archive.extractfile("conf/systemd/pkguser-KeepsNativeProbe.service").read().decode()
                 self.assertNotIn("User=root", unit)
+                self.assertIn("KillMode=mixed\n", unit)
                 self.assertIn("Slice=KeepsNativeProbe.slice\n", unit)
                 with tarfile.open(fileobj=io.BytesIO(archive.extractfile("package.tgz").read())) as inner:
                     self.assertEqual(inner.getmember("bin").mode, 0o755)

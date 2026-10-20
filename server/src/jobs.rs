@@ -31,6 +31,10 @@ pub struct Job {
     pub work_class: String,
     pub refresh_metadata: bool,
     pub rebuild_media: bool,
+    #[serde(skip)]
+    pub metadata_operation_id: Option<String>,
+    #[serde(skip)]
+    pub media_operation_id: Option<String>,
     pub path_sync: bool,
     pub wait_for_quiet: bool,
     pub status: String,
@@ -46,6 +50,7 @@ pub struct Job {
 #[derive(Debug, Clone)]
 pub struct FileState {
     pub metadata_stamp: String,
+    pub metadata_operation_id: Option<String>,
     pub size: i64,
     pub mtime_ns: i64,
     pub asset_id: String,
@@ -90,9 +95,11 @@ fn job(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         work_class: row.get(16)?,
         phase: row.get(17)?,
         rebuild_media: row.get(18)?,
+        metadata_operation_id: row.get(19)?,
+        media_operation_id: row.get(20)?,
     })
 }
-const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class,j.phase,j.rebuild_media FROM jobs j JOIN folders f ON f.id=j.folder_id";
+const JOB_SELECT: &str = "SELECT j.id,j.folder_id,f.library_id,COALESCE(j.scope_path,f.path),j.status,j.error,j.processed,j.skipped,j.failed,j.current_path,j.started_at,j.finished_at,j.refresh_metadata,j.wait_for_quiet,j.path_sync,j.scope_kind,j.work_class,j.phase,j.rebuild_media,j.metadata_operation_id,j.media_operation_id FROM jobs j JOIN folders f ON f.id=j.folder_id";
 
 fn covers(parent: &Job, child: &Job) -> bool {
     if parent.folder_id != child.folder_id
@@ -228,6 +235,8 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             ("checkpoint", "TEXT"),
             ("refresh_metadata", "INTEGER NOT NULL DEFAULT 0"),
             ("rebuild_media", "INTEGER NOT NULL DEFAULT 0"),
+            ("metadata_operation_id", "TEXT"),
+            ("media_operation_id", "TEXT"),
             ("path_sync", "INTEGER NOT NULL DEFAULT 0"),
             ("wait_for_quiet", "INTEGER NOT NULL DEFAULT 1"),
             ("rerun", "INTEGER NOT NULL DEFAULT 0"),
@@ -241,6 +250,14 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         if !columns.iter().any(|column| column == "rebuild_media") {
             // File jobs previously enabled metadata refresh implicitly, including normal retries.
             db.execute_batch("UPDATE jobs SET refresh_metadata=0 WHERE scope_kind='file' AND status IN ('pending','running','failed')")?;
+        }
+        for (column, flag) in [
+            ("metadata_operation_id", "refresh_metadata"),
+            ("media_operation_id", "rebuild_media"),
+        ] {
+            if !columns.iter().any(|existing| existing == column) {
+                db.execute_batch(&format!("UPDATE jobs SET {column}=id WHERE {flag}=1"))?;
+            }
         }
         if !columns.iter().any(|column| column == "path_sync") {
             // Existing scoped discovery jobs are the pending directory moves that
@@ -262,6 +279,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         for (name, definition) in [
             ("identity_status", "TEXT NOT NULL DEFAULT 'pending'"),
             ("identity_error", "TEXT"),
+            ("metadata_operation_id", "TEXT"),
         ] {
             if !file_columns.iter().any(|column| column == name) {
                 db.execute_batch(&format!("ALTER TABLE files ADD COLUMN {name} {definition}"))?;
@@ -276,10 +294,13 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             CREATE UNIQUE INDEX jobs_live_scope ON jobs(folder_id,scope_path,scope_kind,work_class) WHERE status IN ('pending','running');")?;
         crate::directory_move::initialize(&db)?;
         crate::video_trim::initialize(&db)?;
-        for status in ["pending", "running"] {
-            let interrupted = transition(status, Event::Interrupt)?;
-            db.execute("UPDATE jobs SET status=?1,error=CASE WHEN error IS NULL THEN '任务因服务重启已中断，请人工重试' ELSE error || char(10) || '任务因服务重启已中断，请人工重试' END,finished_at=unixepoch(),updated_at=unixepoch() WHERE status=?2", params![interrupted, status])?;
-        }
+        // Scan checkpoints and resource state make an interrupted scan resumable.
+        // Operation IDs retain unfinished overrides without forcing committed resource steps again.
+        let resumed = transition("running", Event::Yield)?;
+        db.execute(
+            "UPDATE jobs SET status=?1,phase='waiting',finished_at=NULL,updated_at=unixepoch() WHERE status='running' OR (status='pending' AND checkpoint IS NOT NULL)",
+            [resumed],
+        )?;
         let trash_db = Connection::open(path)?;
         trash_db.busy_timeout(std::time::Duration::from_secs(5))?;
         crate::directory_trash::initialize(&trash_db)?;
@@ -642,7 +663,8 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         let available = chrono::Utc::now().timestamp() + debounce_seconds.max(0);
         tx.execute("INSERT OR IGNORE INTO jobs(id,folder_id,scope_path,scope_kind,status,available_at,wait_for_quiet,work_class) VALUES(?1,?2,?3,?4,'pending',?5,?6,?7)",
             params![Uuid::new_v4().to_string(), folder_id, scope, scope_kind, available, wait_for_quiet, work_class])?;
-        tx.execute("UPDATE jobs SET rebuild_media=MAX(rebuild_media,?9),path_sync=MAX(path_sync,?6),refresh_metadata=MAX(refresh_metadata,?4),wait_for_quiet=MAX(wait_for_quiet,?5),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,available_at=MAX(available_at,?3),updated_at=unixepoch() WHERE folder_id=?1 AND scope_path=?2 AND scope_kind=?7 AND work_class=?8 AND status IN ('pending','running')", params![folder_id,scope,available,refresh_metadata,wait_for_quiet,path_sync,scope_kind,work_class,rebuild_media])?;
+        let operation_id = Uuid::new_v4().to_string();
+        tx.execute("UPDATE jobs SET metadata_operation_id=CASE WHEN ?4 THEN ?10 ELSE metadata_operation_id END,media_operation_id=CASE WHEN ?9 THEN ?10 ELSE media_operation_id END,rebuild_media=MAX(rebuild_media,?9),path_sync=MAX(path_sync,?6),refresh_metadata=MAX(refresh_metadata,?4),wait_for_quiet=MAX(wait_for_quiet,?5),rerun=CASE WHEN status='running' OR checkpoint IS NOT NULL THEN 1 ELSE rerun END,available_at=MAX(available_at,?3),updated_at=unixepoch() WHERE folder_id=?1 AND scope_path=?2 AND scope_kind=?7 AND work_class=?8 AND status IN ('pending','running')", params![folder_id,scope,available,refresh_metadata,wait_for_quiet,path_sync,scope_kind,work_class,rebuild_media,operation_id])?;
         let original = tx.query_row(&format!("{JOB_SELECT} WHERE j.folder_id=?1 AND j.scope_path=?2 AND j.scope_kind=?3 AND j.work_class=?4 AND j.status IN ('pending','running')"), params![folder_id,scope,scope_kind,work_class],job)?;
         Self::coalesce_transaction(&tx)?;
         let result = if tx.query_row("SELECT status FROM jobs WHERE id=?", [&original.id], |r| {
@@ -741,7 +763,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             existing
         } else {
             let status = transition(&failed.status, Event::Retry)?;
-            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,refresh_metadata=0,rebuild_media=0,status=?2,phase='waiting',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![id,status])?;
+            tx.execute("UPDATE jobs SET work_class='manual',wait_for_quiet=0,refresh_metadata=0,rebuild_media=0,metadata_operation_id=NULL,media_operation_id=NULL,status=?2,phase='waiting',attempts=0,available_at=0,error=NULL,checkpoint=NULL,rerun=0,processed=0,skipped=0,failed=0,current_path=NULL,started_at=NULL,finished_at=NULL,updated_at=unixepoch() WHERE id=?1",params![id,status])?;
             id.to_owned()
         };
         let result = tx.query_row(&format!("{JOB_SELECT} WHERE j.id=?1"), [&retry_id], job)?;
@@ -952,7 +974,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
             .unwrap_or(false))
     }
     pub fn file_state(&self, folder_id: &str, path: &str) -> Result<Option<FileState>> {
-        Ok(self.db.lock().unwrap().query_row("SELECT size,mtime_ns,asset_id,version,error,metadata_stamp FROM files WHERE folder_id=?1 AND path=?2",params![folder_id,path],|r|Ok(FileState {size:r.get(0)?,mtime_ns:r.get(1)?,asset_id:r.get(2)?,version:r.get(3)?,error:r.get(4)?,metadata_stamp:r.get(5)?})).optional()?)
+        Ok(self.db.lock().unwrap().query_row("SELECT size,mtime_ns,asset_id,version,error,metadata_stamp,metadata_operation_id FROM files WHERE folder_id=?1 AND path=?2",params![folder_id,path],|r|Ok(FileState {size:r.get(0)?,mtime_ns:r.get(1)?,asset_id:r.get(2)?,version:r.get(3)?,error:r.get(4)?,metadata_stamp:r.get(5)?,metadata_operation_id:r.get(6)?})).optional()?)
     }
     pub fn has_path_sync(&self) -> Result<bool> {
         Ok(self.db.lock().unwrap().query_row("SELECT EXISTS(SELECT 1 FROM jobs j JOIN folders f ON f.id=j.folder_id WHERE f.active=1 AND j.path_sync=1 AND j.status IN ('pending','running'))",[],|r|r.get(0))?)
@@ -1001,6 +1023,18 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         }
         Ok(())
     }
+    pub fn record_metadata_result(
+        &self,
+        folder_id: &str,
+        path: &str,
+        state: &FileState,
+    ) -> Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO files(folder_id,path,size,mtime_ns,asset_id,version,error,metadata_stamp,metadata_operation_id) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(folder_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,asset_id=excluded.asset_id,version=excluded.version,error=excluded.error,metadata_stamp=excluded.metadata_stamp,metadata_operation_id=excluded.metadata_operation_id",
+            params![folder_id,path,state.size,state.mtime_ns,state.asset_id,state.version,state.error,state.metadata_stamp,state.metadata_operation_id],
+        )?;
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn record_file(
         &self,
@@ -1012,7 +1046,7 @@ CREATE TABLE IF NOT EXISTS worker_photo_files(path TEXT PRIMARY KEY);
         version: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        self.db.lock().unwrap().execute("INSERT INTO files(folder_id,path,size,mtime_ns,asset_id,version,error) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(folder_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,asset_id=excluded.asset_id,version=excluded.version,error=excluded.error",params![folder_id,path,size,mtime_ns,asset_id,version,error])?;
+        self.db.lock().unwrap().execute("INSERT INTO files(folder_id,path,size,mtime_ns,asset_id,version,error) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(folder_id,path) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,asset_id=excluded.asset_id,version=excluded.version,error=excluded.error,metadata_operation_id=NULL",params![folder_id,path,size,mtime_ns,asset_id,version,error])?;
         Ok(())
     }
 }
@@ -1052,6 +1086,40 @@ mod tests {
     }
 
     #[test]
+    fn legacy_override_generations_are_backfilled_once_and_retained_on_restart() {
+        let (dir, jobs, folder) = setup();
+        let media = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &jobs.root().join("photo.jpg"))
+            .unwrap();
+        jobs.db.lock().unwrap().execute_batch("ALTER TABLE jobs DROP COLUMN media_operation_id; ALTER TABLE jobs DROP COLUMN metadata_operation_id; ALTER TABLE files DROP COLUMN metadata_operation_id;").unwrap();
+        drop(jobs);
+        let jobs = Jobs::open(
+            &dir.path().join("jobs.sqlite"),
+            &dir.path().join("originals"),
+        )
+        .unwrap();
+        let migrated = jobs.job(&media.id).unwrap().unwrap();
+        assert_eq!(
+            migrated.media_operation_id.as_deref(),
+            Some(media.id.as_str())
+        );
+        let renewed = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &jobs.root().join("photo.jpg"))
+            .unwrap();
+        assert_ne!(renewed.media_operation_id, migrated.media_operation_id);
+        drop(jobs);
+        let jobs = Jobs::open(
+            &dir.path().join("jobs.sqlite"),
+            &dir.path().join("originals"),
+        )
+        .unwrap();
+        assert_eq!(
+            jobs.job(&media.id).unwrap().unwrap().media_operation_id,
+            renewed.media_operation_id
+        );
+    }
+
+    #[test]
     fn manual_modes_are_operation_specific_and_retry_is_normal() {
         let (_dir, jobs, folder) = setup();
         let path = jobs.root().join("photo.jpg");
@@ -1070,6 +1138,44 @@ mod tests {
             .enqueue_manual_metadata_refresh(&folder.id, jobs.root())
             .unwrap();
         assert!(metadata.refresh_metadata && !metadata.rebuild_media);
+    }
+
+    #[test]
+    fn override_generations_are_independent_and_survive_rerun() {
+        let (_dir, jobs, folder) = setup();
+        let path = jobs.root().join("photo.jpg");
+        let media = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &path)
+            .unwrap();
+        assert!(media.media_operation_id.is_some());
+        assert!(media.metadata_operation_id.is_none());
+        jobs.claim_next().unwrap().unwrap();
+        let ordinary = jobs.enqueue_manual_file(&folder.id, &path).unwrap();
+        assert_eq!(ordinary.media_operation_id, media.media_operation_id);
+        assert!(ordinary.metadata_operation_id.is_none());
+        let metadata = jobs
+            .enqueue_scope(
+                &folder.id, &path, 0, true, false, false, true, "file", "manual",
+            )
+            .unwrap();
+        assert_eq!(metadata.media_operation_id, media.media_operation_id);
+        assert!(metadata.metadata_operation_id.is_some());
+        let next_media = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &path)
+            .unwrap();
+        assert_ne!(next_media.media_operation_id, media.media_operation_id);
+        assert_eq!(
+            next_media.metadata_operation_id,
+            metadata.metadata_operation_id
+        );
+        jobs.finish(&media.id, None).unwrap();
+        let rerun = jobs.claim_next().unwrap().unwrap();
+        assert_eq!(rerun.media_operation_id, next_media.media_operation_id);
+        assert_eq!(rerun.metadata_operation_id, metadata.metadata_operation_id);
+        jobs.finish(&rerun.id, Some("failure")).unwrap();
+        let retry = jobs.retry(&rerun.id).unwrap();
+        assert!(!retry.refresh_metadata && !retry.rebuild_media);
+        assert!(retry.metadata_operation_id.is_none() && retry.media_operation_id.is_none());
     }
 
     #[test]
@@ -1155,7 +1261,7 @@ mod tests {
         drop(jobs);
         let jobs = Jobs::open(&dir.path().join("jobs.sqlite"), &root).unwrap();
         assert_eq!(jobs.cancel_automatic_scans().unwrap(), 0);
-        assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "failed");
+        assert_eq!(jobs.job(&manual.id).unwrap().unwrap().status, "pending");
     }
 
     fn setup() -> (tempfile::TempDir, Jobs, Folder) {
@@ -1287,9 +1393,9 @@ mod tests {
             jobs.job(&automatic.id).unwrap().unwrap().work_class,
             "automatic"
         );
-        assert!(jobs.claim_class("reconcile").unwrap().is_none());
-        let resumed = jobs.job(&reconcile.id).unwrap().unwrap();
-        assert_eq!(resumed.status, "failed");
+        let resumed = jobs.claim_class("reconcile").unwrap().unwrap();
+        assert_eq!(resumed.id, reconcile.id);
+        assert_eq!(resumed.status, "running");
         assert_eq!(resumed.processed, 7);
         assert_eq!(
             jobs.load_checkpoint(&reconcile.id).unwrap().as_deref(),
@@ -1564,7 +1670,7 @@ mod tests {
         );
     }
     #[test]
-    fn checkpoint_survives_restart_without_automatic_resume() {
+    fn checkpoint_and_counters_resume_after_restart() {
         let (dir, jobs, folder) = setup();
         let queued = jobs.enqueue_scan(&folder.id).unwrap();
         jobs.claim_next().unwrap().unwrap();
@@ -1579,22 +1685,57 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert!(jobs.claim_next().unwrap().is_none());
-        let resumed = jobs.job(&queued.id).unwrap().unwrap();
-        assert_eq!(resumed.status, "failed");
+        let resumed = jobs.claim_next().unwrap().unwrap();
+        assert_eq!(resumed.id, queued.id);
         assert_eq!((resumed.processed, resumed.skipped), (2, 7));
         assert_eq!(resumed.current_path.as_deref(), Some("previous.jpg"));
         assert_eq!(
             jobs.load_checkpoint(&queued.id).unwrap().as_deref(),
             Some("frontier")
         );
-        jobs.retry(&queued.id).unwrap();
-        assert!(jobs.load_checkpoint(&queued.id).unwrap().is_none());
+        jobs.finish(&resumed.id, None).unwrap();
         let rerun = jobs.claim_next().unwrap().unwrap();
         assert_eq!((rerun.processed, rerun.skipped), (0, 0));
         jobs.finish(&rerun.id, None).unwrap();
         assert!(jobs.claim_next().unwrap().is_none());
     }
+    #[test]
+    fn restart_retains_unstarted_override_and_does_not_retry_business_failure() {
+        let (dir, jobs, folder) = setup();
+        let failed = jobs
+            .enqueue_manual_file(&folder.id, &jobs.root().join("failed.jpg"))
+            .unwrap();
+        jobs.claim_next().unwrap().unwrap();
+        jobs.finish(&failed.id, Some("decoder failure with full trace"))
+            .unwrap();
+        let running = jobs
+            .enqueue_manual_media_rebuild(&folder.id, &jobs.root().join("running.jpg"))
+            .unwrap();
+        jobs.claim_next().unwrap().unwrap();
+        let waiting = jobs
+            .enqueue_manual_metadata_refresh(&folder.id, &jobs.root().join("waiting"))
+            .unwrap();
+        drop(jobs);
+        let jobs = Jobs::open(
+            &dir.path().join("jobs.sqlite"),
+            &dir.path().join("originals"),
+        )
+        .unwrap();
+        let resumed = jobs.job(&running.id).unwrap().unwrap();
+        assert_eq!(resumed.status, "pending");
+        assert!(resumed.rebuild_media && !resumed.refresh_metadata);
+        assert_eq!(resumed.media_operation_id, running.media_operation_id);
+        let waiting = jobs.job(&waiting.id).unwrap().unwrap();
+        assert_eq!(waiting.status, "pending");
+        assert!(waiting.refresh_metadata);
+        let failed = jobs.job(&failed.id).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("decoder failure with full trace")
+        );
+    }
+
     #[test]
     fn running_or_resumable_ancestor_does_not_absorb_later_file_event() {
         let (_dir, jobs, folder) = setup();
@@ -1764,9 +1905,9 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert!(jobs.claim_next().unwrap().is_none());
-        let stopped = jobs.job(&scoped.id).unwrap().unwrap();
-        assert_eq!(stopped.status, "failed");
+        let stopped = jobs.claim_next().unwrap().unwrap();
+        assert_eq!(stopped.id, scoped.id);
+        assert_eq!(stopped.status, "running");
         assert!(stopped.path_sync);
         assert!(
             !jobs
@@ -1795,8 +1936,6 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert!(jobs.claim_next().unwrap().is_none());
-        jobs.retry(&manual.id).unwrap();
         let recovered = jobs.claim_next().unwrap().unwrap();
         assert_eq!(recovered.id, manual.id);
         assert!(!recovered.wait_for_quiet);
@@ -1835,7 +1974,7 @@ mod tests {
         assert!(jobs.job(&queued.id).unwrap().unwrap().wait_for_quiet);
     }
     #[test]
-    fn queue_deduplicates_and_requires_retry_after_restart() {
+    fn queue_deduplicates_and_resumes_after_restart() {
         let (dir, jobs, folder) = setup();
         let a = jobs.enqueue_scan(&folder.id).unwrap();
         assert_eq!(a.id, jobs.enqueue_scan(&folder.id).unwrap().id);
@@ -1847,11 +1986,10 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert!(jobs.claim_next().unwrap().is_none());
         let interrupted = jobs.job(&a.id).unwrap().unwrap();
-        assert_eq!(interrupted.status, "failed");
-        assert!(interrupted.error.unwrap().contains("已中断"));
-        jobs.retry(&a.id).unwrap();
+        assert_eq!(interrupted.status, "pending");
+        assert!(interrupted.error.is_none());
+        assert_eq!(jobs.enqueue_scan(&folder.id).unwrap().id, a.id);
         assert_eq!(jobs.claim_next().unwrap().unwrap().id, a.id);
         jobs.finish(&a.id, None).unwrap();
         assert_eq!(jobs.jobs(10).unwrap()[0].status, "completed");
@@ -1876,8 +2014,6 @@ mod tests {
             &dir.path().join("originals"),
         )
         .unwrap();
-        assert!(jobs.claim_next().unwrap().is_none());
-        jobs.retry(&queued.id).unwrap();
         let rerun = jobs.claim_next().unwrap().unwrap();
         assert_eq!(rerun.path, scope.to_str().unwrap());
         jobs.finish(&rerun.id, None).unwrap();

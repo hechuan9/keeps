@@ -125,11 +125,14 @@ pub(crate) fn register(
     if let Some(source) = generated_from {
         detail["generatedFrom"] = source;
     }
-    if let Some(source) = previous_detail
-        .as_ref()
-        .and_then(|v| v.get("sourceVersionID"))
-    {
-        detail["sourceVersionID"] = source.clone();
+    for key in [
+        "sourceVersionID",
+        "generationOperationID",
+        "generationTarget",
+    ] {
+        if let Some(value) = previous_detail.as_ref().and_then(|v| v.get(key)) {
+            detail[key] = value.clone();
+        }
     }
     let detail = detail.to_string();
     let changed = old.as_ref()
@@ -228,6 +231,45 @@ impl Store {
         self.generated_standard_target_with_override(lib, id, source, source_hash, false)
     }
 
+    pub fn generated_standard_target_for_operation(
+        &self,
+        lib: &str,
+        id: &str,
+        source: &std::path::Path,
+        source_hash: &str,
+        operation_id: Option<&str>,
+    ) -> Result<std::path::PathBuf> {
+        if let Some(operation_id) = operation_id {
+            let target: Option<String> = self.read()?.query_row("SELECT json_extract(v.evidence,'$.generationTarget') FROM catalog_versions v WHERE v.library_id=?1 AND v.asset_id=?2 AND json_extract(v.evidence,'$.generatedFrom')=?3 AND json_extract(v.evidence,'$.generationOperationID')=?4 AND json_extract(v.evidence,'$.generationTarget') IS NOT NULL LIMIT 1", params![lib,id,source_hash,operation_id], |r| r.get(0)).optional()?;
+            if let Some(target) = target {
+                let target = std::path::PathBuf::from(target);
+                let owned: bool = self.read()?.query_row("SELECT EXISTS(SELECT 1 FROM catalog_paths p JOIN catalog_versions v USING(library_id,asset_id,content_hash) WHERE p.library_id=?1 AND p.asset_id=?2 AND p.path=?3 AND json_extract(v.evidence,'$.generatedFrom')=?4 AND json_extract(v.evidence,'$.generationOperationID')=?5)", params![lib,id,target.to_str(),source_hash,operation_id], |r|r.get(0))?;
+                if owned {
+                    match std::fs::symlink_metadata(&target) {
+                        Ok(meta)
+                            if meta.is_file()
+                                && self.generated_standard_matches(lib, id, &target)? =>
+                        {
+                            return Ok(target);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            return Ok(target);
+                        }
+                        Err(error) => return Err(error.into()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.generated_standard_target_with_override(
+            lib,
+            id,
+            source,
+            source_hash,
+            operation_id.is_some(),
+        )
+    }
+
     pub fn generated_standard_target_with_override(
         &self,
         lib: &str,
@@ -301,6 +343,28 @@ impl Store {
         target: &std::path::Path,
         dimensions: (i64, i64),
     ) -> Result<()> {
+        self.publish_generated_standard_for_operation(
+            lib,
+            id,
+            source_hash,
+            staged,
+            target,
+            dimensions,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_generated_standard_for_operation(
+        &self,
+        lib: &str,
+        id: &str,
+        source_hash: &str,
+        staged: &std::path::Path,
+        target: &std::path::Path,
+        dimensions: (i64, i64),
+        operation_id: Option<&str>,
+    ) -> Result<()> {
         let hash = crate::media::sha256_file(staged)?;
         let size = i64::try_from(std::fs::metadata(staged)?.len())?;
         let path = target.to_str().context("standard path must be UTF-8")?;
@@ -339,7 +403,7 @@ impl Store {
                 ..Default::default()
             },
         )?;
-        tx.execute("UPDATE catalog_versions SET evidence=json_set(evidence,'$.generatedFrom',?),priority=1 WHERE library_id=? AND asset_id=? AND content_hash=?",params![source_hash,lib,id,hash])?;
+        tx.execute("UPDATE catalog_versions SET evidence=json_set(evidence,'$.generatedFrom',?,'$.generationOperationID',?,'$.generationTarget',?),priority=1 WHERE library_id=? AND asset_id=? AND content_hash=?",params![source_hash,operation_id,path,lib,id,hash])?;
         tx.execute(
             "DELETE FROM catalog_defaults WHERE library_id=? AND asset_id=?",
             params![lib, id],
@@ -599,6 +663,115 @@ mod tests {
             dir.path().join("DSC02514.2.heic")
         );
         assert_eq!(std::fs::read(original)?, b"user photo");
+        Ok(())
+    }
+
+    #[test]
+    fn standard_override_reuses_same_operation_after_publication_or_reserved_target_restart()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("db");
+        let store = Store::open(&db, true)?;
+        let raw = dir.path().join("source.arw");
+        std::fs::write(&raw, b"camera raw")?;
+        let id = store.ingest_original(
+            "lib",
+            raw.to_str().unwrap(),
+            &file("rawhash", true),
+            &snapshot(),
+        )?;
+        let target = store.generated_standard_target_for_operation(
+            "lib",
+            &id,
+            &raw,
+            "rawhash",
+            Some("operation-1"),
+        )?;
+        let staged = dir.path().join("staged");
+        std::fs::write(&staged, b"generated standard")?;
+        store.publish_generated_standard_for_operation(
+            "lib",
+            &id,
+            "rawhash",
+            &staged,
+            &target,
+            (100, 100),
+            Some("operation-1"),
+        )?;
+        drop(store);
+        let store = Store::open(&db, false)?;
+        assert_eq!(
+            store.generated_standard_target_for_operation(
+                "lib",
+                &id,
+                &raw,
+                "rawhash",
+                Some("operation-1")
+            )?,
+            target
+        );
+        assert_ne!(
+            store.generated_standard_target_for_operation(
+                "lib",
+                &id,
+                &raw,
+                "rawhash",
+                Some("operation-2")
+            )?,
+            target
+        );
+        // Model a crash after registering the association but before publishing its hard link.
+        std::fs::remove_file(&target)?;
+        assert_eq!(
+            store.generated_standard_target_for_operation(
+                "lib",
+                &id,
+                &raw,
+                "rawhash",
+                Some("operation-1")
+            )?,
+            target
+        );
+        store.publish_generated_standard_for_operation(
+            "lib",
+            &id,
+            "rawhash",
+            &staged,
+            &target,
+            (100, 100),
+            Some("operation-1"),
+        )?;
+        assert!(store.generated_standard_matches("lib", &id, &target)?);
+        let generated_hash = crate::media::sha256_file(&target)?;
+        store.ingest_original(
+            "lib",
+            target.to_str().unwrap(),
+            &file(&generated_hash, false),
+            &snapshot(),
+        )?;
+        assert_eq!(
+            store.generated_standard_target_for_operation(
+                "lib",
+                &id,
+                &raw,
+                "rawhash",
+                Some("operation-1")
+            )?,
+            target
+        );
+        std::fs::write(&target, b"user replacement")?;
+        assert_ne!(
+            store.generated_standard_target_for_operation(
+                "lib",
+                &id,
+                &raw,
+                "rawhash",
+                Some("operation-1")
+            )?,
+            target
+        );
+        assert_eq!(std::fs::read(&target)?, b"user replacement");
+        assert_eq!(std::fs::read(&raw)?, b"camera raw");
         Ok(())
     }
 

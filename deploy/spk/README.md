@@ -35,7 +35,7 @@ python3 -m unittest discover -s deploy/spk -p 'test_*.py'
 3. 启动后核对 `/healthz`、鉴权、资产计数、缩略图下载及后台状态，再恢复维护进程。可用性与全库处理完成是两回事。
 4. 回退前另存最新数据库。使用与数据库 schema 匹配的套件和配置；恢复旧数据库会丢失备份之后的整理修改，不能直接覆盖最新状态。
 
-长期备份使用 Hyper Backup 的应用备份，选择 `Keeps Native Probe`。备份目标、计划和版本保留由 Hyper Backup 任务管理；套件通过 `scripts/backup` 导出双库、四个配置文件及存在时的 `maintenance` 状态，不包含原片或可重建预览。原片共享文件夹须单独纳入任务。备份期间需要停服以保证双库一致，导出会校验 SQLite 完整性并生成校验和；临时目录应位于数据卷，不能使用空间有限的 DSM 系统分区。
+长期备份使用 Hyper Backup 的应用备份，选择 `Keeps Native Probe`。备份目标、计划和版本保留由 Hyper Backup 任务管理；套件通过 `scripts/backup` 导出双库、四个配置文件及存在时的 `maintenance` 状态，不包含原片或可重建预览。原片共享文件夹须单独纳入任务。备份期间需要停服以保证双库一致；停止时先通知主进程，在当前步骤完成并保存断点后退出，重启自动继续未完成扫描，导出会校验 SQLite 完整性并生成校验和；临时目录应位于数据卷，不能使用空间有限的 DSM 系统分区。
 
 当前 NAS 使用独立的 `Keeps` Hyper Backup 任务，目标为 S3 `chuan.backup/keeps-native`，每天 NAS 时间（America/Los_Angeles）01:00 运行，智能保留最多 256 个版本。原片由原有 `Amazon S3` 任务备份；两者分开调度，避免应用状态备份排在大批照片传输之后。
 

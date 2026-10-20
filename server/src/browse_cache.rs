@@ -1,6 +1,6 @@
 //! Persistent fast-browse derivatives of the existing preview, never the original.
 use crate::{cache_pipeline, media::MediaProcessor, previews::PreviewStorage, store::Store};
-use anyhow::Result;
+use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
@@ -51,7 +51,7 @@ pub fn process_asset(
     library: &str,
     asset: &str,
 ) -> Result<bool> {
-    process_asset_with_override(store, previews, library, asset, false)
+    process_asset_with_override(store, previews, library, asset, None)
 }
 
 pub fn process_asset_with_override(
@@ -59,18 +59,20 @@ pub fn process_asset_with_override(
     previews: &PreviewStorage,
     library: &str,
     asset: &str,
-    override_media: bool,
+    override_operation: Option<&str>,
 ) -> Result<bool> {
     let selected = {
         let db = store.lock()?;
-        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail,c.browse_thumbnail FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?2 AND c.asset_id=?3 AND c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,library,asset], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?))).optional()?
+        db.query_row("SELECT c.library_id,c.asset_id,c.source_hash,c.thumbnail,c.browse_thumbnail,c.browse_operation_id FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE c.library_id=?2 AND c.asset_id=?3 AND c.status='ready' AND c.spec=?1 AND c.source_hash=coalesce(d.content_hash,a.content_hash) AND c.thumbnail IS NOT NULL AND NOT EXISTS(SELECT 1 FROM catalog_paths p JOIN import_compute_leases l ON l.library_id=p.library_id AND l.path=p.path WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND l.expires_at>unixepoch()) ORDER BY c.browse_available_at,c.asset_id LIMIT 1",params![cache_pipeline::spec()?,library,asset], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,Option<String>>(5)?))).optional()?
     };
-    let Some((lib, id, hash, thumbnail, browse)) = selected else {
+    let Some((lib, id, hash, thumbnail, browse, completed_operation)) = selected else {
         return Ok(false);
     };
     let thumbnail: Value = serde_json::from_str(&thumbnail)?;
     let version = thumbnail["version"].as_str().unwrap_or_default();
-    if !override_media && let Some(browse) = browse {
+    if (override_operation.is_none() || completed_operation.as_deref() == override_operation)
+        && let Some(browse) = browse
+    {
         let browse: Value = serde_json::from_str(&browse)?;
         if browse["sourceThumbnailVersion"].as_str() == Some(version)
             && browse["spec"].as_str() == Some(SPEC)
@@ -92,7 +94,15 @@ pub fn process_asset_with_override(
         let object =
             previews.put_generated_role(&lib, &id, &generated.sha256, &output, "browse")?;
         let descriptor = json!({"objectRef":object,"width":generated.width,"height":generated.height,"sizeBytes":generated.size_bytes,"version":format!("{SPEC}:{}",generated.sha256),"spec":SPEC,"sourceThumbnailVersion":version});
-        publish(store, &lib, &id, &hash, version, &descriptor)?;
+        publish_for_operation(
+            store,
+            &lib,
+            &id,
+            &hash,
+            version,
+            &descriptor,
+            override_operation,
+        )?;
         Ok(())
     })();
     if let Err(error) = result {
@@ -112,6 +122,18 @@ pub(crate) fn publish(
     version: &str,
     descriptor: &Value,
 ) -> Result<()> {
+    publish_for_operation(store, lib, id, hash, version, descriptor, None)
+}
+
+pub(crate) fn publish_for_operation(
+    store: &Store,
+    lib: &str,
+    id: &str,
+    hash: &str,
+    version: &str,
+    descriptor: &Value,
+    operation_id: Option<&str>,
+) -> Result<()> {
     let mut db = store.lock()?;
     let tx = db.transaction()?;
     let previous: Option<String> = tx
@@ -122,7 +144,7 @@ pub(crate) fn publish(
         )
         .optional()?
         .flatten();
-    let changed = tx.execute("UPDATE media_cache SET browse_thumbnail=?1,browse_last_error=NULL WHERE library_id=?2 AND asset_id=?3 AND source_hash=?4 AND json_extract(thumbnail,'$.version')=?5 AND status='ready' AND spec=?6 AND EXISTS(SELECT 1 FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE a.library_id=?2 AND a.id=?3 AND coalesce(d.content_hash,a.content_hash)=?4)",params![descriptor.to_string(),lib,id,hash,version,cache_pipeline::spec()?])?;
+    let changed = tx.execute("UPDATE media_cache SET browse_thumbnail=?1,browse_last_error=NULL,browse_operation_id=?7 WHERE library_id=?2 AND asset_id=?3 AND source_hash=?4 AND json_extract(thumbnail,'$.version')=?5 AND status='ready' AND spec=?6 AND EXISTS(SELECT 1 FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE a.library_id=?2 AND a.id=?3 AND coalesce(d.content_hash,a.content_hash)=?4)",params![descriptor.to_string(),lib,id,hash,version,cache_pipeline::spec()?,operation_id])?;
     if changed > 0 {
         if let Some(previous) = previous {
             let previous: Value = serde_json::from_str(&previous)?;
@@ -151,6 +173,10 @@ pub(crate) fn publish(
         )?;
     }
     tx.commit()?;
+    ensure!(
+        operation_id.is_none() || changed > 0,
+        "media source or thumbnail changed before browse override publication"
+    );
     Ok(())
 }
 
@@ -231,7 +257,10 @@ mod tests {
         browse["objectRef"] = object.clone();
         publish(&store, "lib", "asset", "hash", "preview-v1", &browse)?;
         assert!(!process_asset(&store, &previews, "lib", "asset")?);
-        assert!(process_asset_with_override(&store, &previews, "lib", "asset", true).is_err());
+        assert!(
+            process_asset_with_override(&store, &previews, "lib", "asset", Some("override"))
+                .is_err()
+        );
         assert!(previews.contains(&object)?);
         assert!(!process_asset(&store, &previews, "lib", "asset")?);
         std::fs::remove_file(previews.object_path(&object)?)?;

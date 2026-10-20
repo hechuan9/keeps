@@ -19,7 +19,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
-/// User-submitted work runs on one low-priority thread; interrupted work needs an explicit retry.
+/// User-submitted work runs on one low-priority thread and resumes persisted scan checkpoints.
 pub fn run(
     store: Arc<Store>,
     jobs: Arc<Jobs>,
@@ -457,7 +457,7 @@ fn process_photo(
                 previews,
                 &job.library_id,
                 &id,
-                job.rebuild_media,
+                job.media_operation_id.as_deref(),
             )?;
             jobs.set_phase(&job.id, "cleanup")?;
             store.collect_asset_cache_garbage(previews, &job.library_id, &id)?;
@@ -494,8 +494,10 @@ fn process_file(
         .map(|p| p.version.clone())
         .unwrap_or_default();
     let force = job.work_class == "manual" && job.refresh_metadata;
-    if !force
-        && let Some(previous) = &previous
+    if let Some(previous) = &previous
+        && (!force
+            || (job.metadata_operation_id.is_some()
+                && previous.metadata_operation_id == job.metadata_operation_id))
         && previous.size == size
         && previous.mtime_ns == mtime
         && previous.metadata_stamp == sidecars
@@ -609,23 +611,41 @@ fn process_file(
     }
     match &result {
         Ok(true) => {
-            jobs.record_file(&job.folder_id, text, size, mtime, &asset_id, &hash, None)?;
-            jobs.record_metadata_stamp(&job.folder_id, text, &sidecars)?;
+            jobs.record_metadata_result(
+                &job.folder_id,
+                text,
+                &crate::jobs::FileState {
+                    size,
+                    mtime_ns: mtime,
+                    asset_id: asset_id.clone(),
+                    version: hash.clone(),
+                    error: None,
+                    metadata_stamp: sidecars.clone(),
+                    metadata_operation_id: if force {
+                        job.metadata_operation_id.clone()
+                    } else {
+                        None
+                    },
+                },
+            )?;
             if identity_checked {
                 jobs.identity_result(&job.folder_id, text, None)?;
             }
         }
         Err(error) => {
-            jobs.record_file(
+            jobs.record_metadata_result(
                 &job.folder_id,
                 text,
-                size,
-                mtime,
-                &asset_id,
-                &hash,
-                Some(&format!("{error:#}")),
+                &crate::jobs::FileState {
+                    size,
+                    mtime_ns: mtime,
+                    asset_id: asset_id.clone(),
+                    version: hash.clone(),
+                    error: Some(format!("{error:#}")),
+                    metadata_stamp: sidecars.clone(),
+                    metadata_operation_id: None,
+                },
             )?;
-            jobs.record_metadata_stamp(&job.folder_id, text, &sidecars)?;
         }
         Ok(false) => {}
     }
@@ -687,6 +707,76 @@ mod tests {
         job.refresh_metadata = true;
         assert!(process_file(&store, &jobs, &previews, &job, &path, &stop).is_err());
         assert_eq!(media::sha256_file(&path)?, hash);
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_override_resumes_same_generation_and_reprocesses_changed_input() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let originals = temp.path().join("originals");
+        fs::create_dir(&originals)?;
+        let jobs_path = temp.path().join("jobs.sqlite");
+        let jobs = Jobs::open(&jobs_path, &originals)?;
+        let store = Store::open(&temp.path().join("catalog.sqlite"), true)?;
+        let previews = PreviewStorage::new(
+            &temp.path().join("keeps"),
+            Some(&originals),
+            "http://localhost",
+            "test",
+        )?;
+        let path = jobs.root().join("photo.png");
+        fs::write(
+            &path,
+            [
+                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0,
+                3, 8, 2, 0, 0, 0, 54, 136, 73, 214, 0, 0, 0, 11, 73, 68, 65, 84, 120, 156, 99, 96,
+                192, 2, 0, 0, 21, 0, 1, 170, 101, 151, 196, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+                96, 130,
+            ],
+        )?;
+        let hash = media::sha256_file(&path)?;
+        let folder = jobs.add_folder("library", ".")?;
+        let initial = jobs.enqueue_manual_metadata_refresh(&folder.id, jobs.root())?;
+        let job = jobs.claim_next()?.unwrap();
+        let stop = AtomicBool::new(false);
+        assert!(process_file(&store, &jobs, &previews, &job, &path, &stop)?);
+        assert_eq!(
+            jobs.file_state(&folder.id, path.to_str().unwrap())?
+                .unwrap()
+                .metadata_operation_id,
+            initial.metadata_operation_id
+        );
+        drop(jobs);
+        let jobs = Jobs::open(&jobs_path, &originals)?;
+        let resumed = jobs.claim_next()?.unwrap();
+        assert!(resumed.refresh_metadata);
+        assert_eq!(resumed.metadata_operation_id, initial.metadata_operation_id);
+        assert!(!process_file(
+            &store, &jobs, &previews, &resumed, &path, &stop
+        )?);
+        let next = jobs.enqueue_manual_metadata_refresh(&folder.id, jobs.root())?;
+        assert_ne!(next.metadata_operation_id, resumed.metadata_operation_id);
+        assert!(process_file(&store, &jobs, &previews, &next, &path, &stop)?);
+        assert!(!process_file(
+            &store, &jobs, &previews, &next, &path, &stop
+        )?);
+        assert_eq!(media::sha256_file(&path)?, hash);
+        let sidecar = crate::identity::sidecar_path(&path);
+        let mut xmp = fs::read_to_string(&sidecar)?;
+        xmp.push('\n');
+        fs::write(&sidecar, xmp)?;
+        assert!(process_file(&store, &jobs, &previews, &next, &path, &stop)?);
+        assert!(!process_file(
+            &store, &jobs, &previews, &next, &path, &stop
+        )?);
+        fs::write(&path, b"changed invalid source must be inspected")?;
+        assert!(process_file(&store, &jobs, &previews, &next, &path, &stop).is_err());
+        assert!(
+            jobs.file_state(&folder.id, path.to_str().unwrap())?
+                .unwrap()
+                .metadata_operation_id
+                .is_none()
+        );
         Ok(())
     }
 
@@ -916,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_keeps_indexed_file_state_but_does_not_resume_scan() -> Result<()> {
+    fn restart_keeps_indexed_file_state_and_resumes_scan() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -955,8 +1045,8 @@ mod tests {
         let claimed = jobs.claim_next()?.unwrap();
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        assert!(jobs.claim_next()?.is_none());
-        assert_eq!(jobs.job(&claimed.id)?.unwrap().status, "failed");
+        assert_eq!(jobs.claim_next()?.unwrap().id, claimed.id);
+        assert_eq!(jobs.job(&claimed.id)?.unwrap().status, "running");
         assert_eq!(jobs.file_state(&folder.id, path)?.unwrap().version, hash);
         assert_eq!(media::sha256_file(&original)?, hash);
         Ok(())
@@ -1033,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_preserves_checkpoint_but_explicit_retry_starts_new_pass() -> Result<()> {
+    fn restart_resumes_checkpoint_without_reprocessing_completed_files() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -1042,10 +1132,10 @@ mod tests {
             b"invalid media must never be parsed",
         )?;
         fs::write(originals.join("z.txt"), b"ignored")?;
-        let _store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
+        let store = Store::open(&directory.path().join("catalog.sqlite"), true)?;
         let jobs_path = directory.path().join("jobs.sqlite");
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        let _previews = PreviewStorage::new(
+        let previews = PreviewStorage::new(
             &directory.path().join("keeps"),
             Some(&originals),
             "http://localhost:2283",
@@ -1071,15 +1161,23 @@ mod tests {
         )?;
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
-        assert!(jobs.claim_next()?.is_none());
-        let interrupted = jobs.job(&job.id)?.unwrap();
-        assert_eq!(interrupted.status, "failed");
-        assert_eq!((interrupted.processed, interrupted.skipped), (7, 11));
+        let resumed = jobs.claim_next()?.unwrap();
+        assert_eq!(resumed.id, job.id);
+        assert_eq!((resumed.processed, resumed.skipped), (7, 11));
         let cursor: ScanCursor = serde_json::from_str(&jobs.load_checkpoint(&job.id)?.unwrap())?;
         assert_eq!(cursor.last_name.as_deref(), Some("already.jpg"));
-        jobs.retry(&job.id)?;
-        assert!(jobs.load_checkpoint(&job.id)?.is_none());
-        assert_eq!(jobs.claim_next()?.unwrap().id, job.id);
+        assert!(run_one(
+            &store,
+            &jobs,
+            &previews,
+            &resumed,
+            &AtomicBool::new(false)
+        )?);
+        jobs.finish(&job.id, None)?;
+        let completed = jobs.job(&job.id)?.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(completed.processed, 7);
+        assert_eq!(completed.failed, 0);
         Ok(())
     }
 
@@ -1117,7 +1215,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_settles_interrupted_owner_without_resuming_task() -> Result<()> {
+    fn startup_preserves_resumed_owner_until_task_completes() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let originals = directory.path().join("originals");
         fs::create_dir(&originals)?;
@@ -1137,7 +1235,16 @@ mod tests {
         drop(jobs);
         let jobs = Jobs::open(&jobs_path, &originals)?;
         maintain_revisions(&store, &jobs)?;
-        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "failed");
+        assert_eq!(jobs.job(&queued.id)?.unwrap().status, "pending");
+        assert!(store.revision_batch_ids()?.contains(&queued.id));
+        assert_eq!(
+            store.catalog_revision("library", None, false)?["isUpdating"],
+            true
+        );
+        let resumed = jobs.claim_next()?.unwrap();
+        assert_eq!(resumed.id, queued.id);
+        jobs.finish(&resumed.id, None)?;
+        maintain_revisions(&store, &jobs)?;
         assert!(!store.revision_batch_ids()?.contains(&queued.id));
         assert!(jobs.claim_next()?.is_none());
         assert_eq!(

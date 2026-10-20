@@ -135,6 +135,19 @@ CREATE TRIGGER IF NOT EXISTS media_cache_published_insert AFTER INSERT ON media_
     Ok(())
 }
 
+pub fn migrate_operation_state(db: &Connection) -> Result<()> {
+    let columns: Vec<String> = db
+        .prepare("PRAGMA table_info(media_cache)")?
+        .query_map([], |r| r.get(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in ["thumbnail_operation_id", "browse_operation_id"] {
+        if !columns.iter().any(|column| column == name) {
+            db.execute_batch(&format!("ALTER TABLE media_cache ADD COLUMN {name} TEXT"))?;
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     pub fn record_directory(&self, library: &str, path: &Path) -> Result<()> {
         let parent = path.parent().and_then(Path::to_str);
@@ -299,6 +312,17 @@ impl Store {
         thumbnail: &Value,
         standard: &Value,
     ) -> Result<()> {
+        self.cache_publish_for_operation(lib, id, hash, thumbnail, standard, None)
+    }
+    pub(crate) fn cache_publish_for_operation(
+        &self,
+        lib: &str,
+        id: &str,
+        hash: &str,
+        thumbnail: &Value,
+        standard: &Value,
+        operation_id: Option<&str>,
+    ) -> Result<()> {
         let mut db = self.lock()?;
         let tx = db.transaction()?;
         let previous: Option<String> = tx
@@ -309,7 +333,7 @@ impl Store {
             )
             .optional()?
             .flatten();
-        let changed=tx.execute("UPDATE media_cache SET status='ready',thumbnail=?,standard=?,last_error=NULL,updated_at=unixepoch() WHERE library_id=? AND asset_id=? AND source_hash=? AND spec=? AND status<>'cancelled' AND EXISTS(SELECT 1 FROM catalog_assets a LEFT JOIN catalog_defaults d ON a.library_id=d.library_id AND a.id=d.asset_id WHERE a.library_id=? AND a.id=? AND coalesce(d.content_hash,a.content_hash)=?)",params![thumbnail.to_string(),standard.to_string(),lib,id,hash,spec()?,lib,id,hash])?;
+        let changed=tx.execute("UPDATE media_cache SET status='ready',thumbnail=?,standard=?,thumbnail_operation_id=?,last_error=NULL,updated_at=unixepoch() WHERE library_id=? AND asset_id=? AND source_hash=? AND spec=? AND status<>'cancelled' AND EXISTS(SELECT 1 FROM catalog_assets a LEFT JOIN catalog_defaults d ON a.library_id=d.library_id AND a.id=d.asset_id WHERE a.library_id=? AND a.id=? AND coalesce(d.content_hash,a.content_hash)=?)",params![thumbnail.to_string(),standard.to_string(),operation_id,lib,id,hash,spec()?,lib,id,hash])?;
         if changed == 0 {
             tx.execute(
                 "UPDATE media_cache SET status='pending' WHERE library_id=? AND asset_id=? AND source_hash=? AND status='processing'",
@@ -339,6 +363,10 @@ impl Store {
         }
         crate::revisions::flush(&tx)?;
         tx.commit()?;
+        ensure!(
+            operation_id.is_none() || changed > 0,
+            "media source changed before override publication"
+        );
         Ok(())
     }
     fn asset_cache_current(&self, previews: &PreviewStorage, lib: &str, id: &str) -> Result<bool> {
@@ -365,34 +393,54 @@ impl Store {
 /// Explicit cache operations are finite manual jobs, never background priority changes.
 pub fn queue_manual(store: &Store, jobs: &Jobs, library: &str, rebuild: bool) -> Result<usize> {
     let paths = {
-        let db = store.lock()?;
-        let mut q=db.prepare("SELECT (SELECT p.path FROM catalog_paths p WHERE p.library_id=c.library_id AND p.asset_id=c.asset_id AND p.content_hash=c.source_hash ORDER BY p.path LIMIT 1) FROM media_cache c WHERE c.library_id=?1 AND ((?2=1 AND c.status='ready') OR (?2=0 AND c.status IN ('pending','failed') AND c.last_error IS NOT NULL)) ORDER BY c.updated_at LIMIT 20")?;
-        q.query_map(params![library, rebuild], |r| r.get::<_, Option<String>>(0))?
+        let mut db = store.lock()?;
+        let tx = db.transaction()?;
+        if !rebuild {
+            let cancelled = tx.execute("UPDATE media_cache SET status='cancelled',last_error=NULL,available_at=0,updated_at=unixepoch() WHERE library_id=?1 AND status IN ('pending','failed') AND NOT EXISTS(SELECT 1 FROM catalog_assets a LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id WHERE a.library_id=media_cache.library_id AND a.id=media_cache.asset_id AND a.trashed=0 AND EXISTS(SELECT 1 FROM catalog_paths p WHERE p.library_id=a.library_id AND p.asset_id=a.id AND p.content_hash=coalesce(d.content_hash,a.content_hash) AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path)))", [library])?;
+            if cancelled > 0 {
+                tracing::info!(
+                    library_id = library,
+                    cancelled,
+                    reason = "assets have no eligible indexed source",
+                    "Obsolete media tasks cancelled"
+                );
+            }
+        }
+        let paths = {
+            let mut q=tx.prepare("SELECT c.asset_id,p.path FROM media_cache c JOIN catalog_assets a ON a.library_id=c.library_id AND a.id=c.asset_id LEFT JOIN catalog_defaults d ON d.library_id=a.library_id AND d.asset_id=a.id JOIN catalog_paths p ON p.library_id=a.library_id AND p.asset_id=a.id AND p.content_hash=coalesce(d.content_hash,a.content_hash) WHERE c.library_id=?1 AND a.trashed=0 AND ((?2=1 AND c.status='ready') OR (?2=0 AND c.status IN ('pending','failed'))) AND NOT EXISTS(SELECT 1 FROM catalog_deprecated_files x WHERE x.library_id=p.library_id AND x.path=p.path) ORDER BY c.updated_at,c.asset_id,p.path LIMIT ?3")?;
+            q.query_map(
+                params![library, rebuild, if rebuild { BATCH as i64 } else { -1 }],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        crate::revisions::flush(&tx)?;
+        tx.commit()?;
+        paths
     };
     let folders = jobs.folders()?;
-    let targets = paths
-        .into_iter()
-        .map(|p| {
-            let path = p.context("cannot retry a photo without an indexed source path")?;
-            let folder = folders
-                .iter()
-                .filter(|f| {
-                    f.active && f.library_id == library && Path::new(&path).starts_with(&f.path)
-                })
-                .max_by_key(|f| f.path.len())
-                .context("photo has no active source folder")?;
-            Ok((folder.id.clone(), path))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut selected = std::collections::HashSet::new();
     let mut queued = std::collections::HashSet::new();
-    for (folder, path) in targets {
+    for (asset, path) in paths {
+        if selected.contains(&asset) {
+            continue;
+        }
+        let Some(folder) = folders
+            .iter()
+            .filter(|f| {
+                f.active && f.library_id == library && Path::new(&path).starts_with(&f.path)
+            })
+            .max_by_key(|f| f.path.len())
+        else {
+            continue;
+        };
         let job = if rebuild {
-            jobs.enqueue_manual_media_rebuild(&folder, Path::new(&path))?
+            jobs.enqueue_manual_media_rebuild(&folder.id, Path::new(&path))?
         } else {
-            jobs.enqueue_manual_file(&folder, Path::new(&path))?
+            jobs.enqueue_manual_file(&folder.id, Path::new(&path))?
         };
         store.note_revision_activity(library, &job.id, &job.path)?;
+        selected.insert(asset);
         queued.insert(job.id);
     }
     Ok(queued.len())
@@ -406,7 +454,7 @@ pub fn process_asset(
     lib: &str,
     id: &str,
 ) -> Result<()> {
-    process_asset_with_override(store, jobs, previews, lib, id, false).map(|_| ())
+    process_asset_with_override(store, jobs, previews, lib, id, None).map(|_| ())
 }
 
 pub fn process_asset_with_override(
@@ -415,7 +463,7 @@ pub fn process_asset_with_override(
     previews: &PreviewStorage,
     lib: &str,
     id: &str,
-    override_media: bool,
+    override_operation: Option<&str>,
 ) -> Result<bool> {
     let selected: Option<(String, String)> = {
         let _source = store
@@ -449,9 +497,22 @@ pub fn process_asset_with_override(
         return Ok(false);
     }
     ensure!(status != "processing", "photo media is already processing");
-    if !override_media && store.asset_cache_current(previews, lib, id)? {
+    let operation_done: bool = store.lock()?.query_row(
+        "SELECT thumbnail_operation_id IS ?3 FROM media_cache WHERE library_id=?1 AND asset_id=?2",
+        params![lib, id, override_operation],
+        |r| r.get(0),
+    )?;
+    if (override_operation.is_none() || operation_done)
+        && store.asset_cache_current(previews, lib, id)?
+    {
         prepare_asset_cache(store, lib, id, &hash, true)?;
-        return crate::browse_cache::process_asset(store, previews, lib, id);
+        return crate::browse_cache::process_asset_with_override(
+            store,
+            previews,
+            lib,
+            id,
+            override_operation,
+        );
     }
     prepare_asset_cache(store, lib, id, &hash, false)?;
     let result = (|| {
@@ -463,15 +524,20 @@ pub fn process_asset_with_override(
             previews.free_bytes()? >= 2 * 1024 * 1024 * 1024,
             "cache disk has less than 2 GiB free"
         );
-        generate(store, jobs, previews, lib, id, &hash, override_media)
+        generate(store, jobs, previews, lib, id, &hash, override_operation)
     })();
     if let Err(error) = &result {
         store.cache_failed(lib, id, &hash, &format!("{error:#}"))?;
     }
     store.lock()?.execute("UPDATE cache_runtime SET last_batch_count=1,last_batch_at=unixepoch(),next_batch_at=0 WHERE id=1",[])?;
     let generated = result?;
-    let browse_generated =
-        crate::browse_cache::process_asset_with_override(store, previews, lib, id, override_media)?;
+    let browse_generated = crate::browse_cache::process_asset_with_override(
+        store,
+        previews,
+        lib,
+        id,
+        override_operation,
+    )?;
     Ok(generated || browse_generated)
 }
 
@@ -498,7 +564,7 @@ fn generate(
     lib: &str,
     id: &str,
     hash: &str,
-    override_media: bool,
+    override_operation: Option<&str>,
 ) -> Result<bool> {
     let selected = if let Some(selected) = store.default_version(lib, id)? {
         selected
@@ -523,8 +589,13 @@ fn generate(
         crate::imports::file_digest(jobs, lib, source)? == hash,
         "source content differs from indexed version"
     );
-    let standard_source =
-        select_standard_source_with_override(store, lib, id, &selected, override_media)?;
+    let standard_source = select_standard_source_with_override(
+        store,
+        lib,
+        id,
+        &selected,
+        override_operation.is_some(),
+    )?;
     let standard_input = Path::new(&standard_source.path);
     jobs.validate_path(
         standard_input
@@ -564,12 +635,12 @@ fn generate(
             free_bytes(root)? >= 2 * 1024 * 1024 * 1024,
             "standard photo disk has less than 2 GiB free"
         );
-        let target = store.generated_standard_target_with_override(
+        let target = store.generated_standard_target_for_operation(
             lib,
             id,
             standard_input,
             &standard_source.content_hash,
-            override_media,
+            override_operation,
         )?;
         if !target.exists() {
             let scratch = tempfile::tempdir_in(root)?;
@@ -590,7 +661,7 @@ fn generate(
                 "standard input changed during generation"
             );
             crate::identity::generated(&staged, &store.root_id(lib, id)?)?;
-            store.publish_generated_standard(
+            store.publish_generated_standard_for_operation(
                 lib,
                 id,
                 &standard_source.content_hash,
@@ -600,6 +671,7 @@ fn generate(
                     i64::from(generated_standard.width),
                     i64::from(generated_standard.height),
                 ),
+                override_operation,
             )?;
         }
         ensure!(
@@ -633,7 +705,7 @@ fn generate(
     let object = previews.put_generated_role(lib, id, &generated.sha256, &target, "thumbnail")?;
     let thumbnail = json!({"objectRef":object,"width":generated.width,"height":generated.height,"version":format!("{}{}:{}",if media::is_video(standard_input) { "video-v3:" } else { "" },spec()?,generated.sha256),"sizeBytes":generated.size_bytes});
     let standard = json!({"path":standard_path,"width":width,"height":height,"version":standard_hash,"sizeBytes":fs::metadata(&standard_path)?.len(),"mtimeNs":file_mtime(&standard_path)?,"deferred":extension == "3fr"});
-    store.cache_publish(lib, id, hash, &thumbnail, &standard)?;
+    store.cache_publish_for_operation(lib, id, hash, &thumbnail, &standard, override_operation)?;
     tracing::info!(asset_id=%id,bytes=generated.size_bytes,"NAS thumbnail ready");
     Ok(true)
 }
@@ -1097,6 +1169,150 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn manual_retry_queues_all_unfinished_sources_and_cancels_obsolete_records() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("photos");
+        fs::create_dir(&originals)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), &originals)?;
+        jobs.add_folder("lib", ".")?;
+        let originals = jobs.root().to_path_buf();
+        let store = Store::open(&dir.path().join("db"), true)?;
+        seed(&store, 30)?;
+        store.reconcile_cache()?;
+        for index in 0..25 {
+            let path = originals.join(format!("{index}.jpg"));
+            fs::write(&path, b"original fixture")?;
+            store.lock()?.execute(
+                "INSERT INTO catalog_paths VALUES('lib',?1,?2,?3,'jpeg_original')",
+                params![
+                    path.to_str(),
+                    format!("00000000-0000-0000-0000-{index:012}"),
+                    format!("hash{index}")
+                ],
+            )?;
+        }
+        {
+            let db = store.lock()?;
+            db.execute(
+                "UPDATE media_cache SET thumbnail='{}',standard='{}',browse_thumbnail='{}'",
+                [],
+            )?;
+            db.execute("UPDATE media_cache SET status='failed',last_error='interrupted' WHERE source_hash='hash1'",[])?;
+            db.execute(
+                "UPDATE media_cache SET source_hash='old-hash' WHERE source_hash='hash0'",
+                [],
+            )?;
+            db.execute(
+                "UPDATE media_cache SET status='ready' WHERE source_hash='hash28'",
+                [],
+            )?;
+            db.execute(
+                "UPDATE media_cache SET status='processing' WHERE source_hash='hash29'",
+                [],
+            )?;
+            db.execute("INSERT INTO catalog_paths VALUES('lib',?1,'00000000-0000-0000-0000-000000000026','hash26','jpeg_original')",[originals.join("deprecated.jpg").to_str()])?;
+            db.execute("INSERT INTO catalog_deprecated_files VALUES('lib',?1,'retained','identity','duplicate')",[originals.join("deprecated.jpg").to_str()])?;
+            db.execute(
+                "UPDATE catalog_assets SET trashed=1 WHERE content_hash='hash27'",
+                [],
+            )?;
+        }
+        assert_eq!(queue_manual(&store, &jobs, "lib", false)?, 25);
+        let queued = jobs.jobs_for_library("lib", 100)?;
+        assert_eq!(queued.len(), 25);
+        assert!(
+            queued
+                .iter()
+                .all(|job| !job.refresh_metadata && !job.rebuild_media)
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|job| Path::new(&job.path) == originals.join("0.jpg"))
+        );
+        assert_eq!(queue_manual(&store, &jobs, "lib", false)?, 25);
+        assert_eq!(jobs.jobs_for_library("lib", 100)?.len(), 25);
+        let db = store.lock()?;
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM media_cache WHERE status='cancelled'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )?,
+            3
+        );
+        assert_eq!(db.query_row("SELECT count(*) FROM media_cache WHERE thumbnail='{}' AND standard='{}' AND browse_thumbnail='{}'",[],|r|r.get::<_,i64>(0))?,30);
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM media_cache WHERE source_hash='hash28'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "ready"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM media_cache WHERE source_hash='hash29'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "processing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_media_rebuild_keeps_batch_limit_and_skips_untracked_sources() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let originals = dir.path().join("photos");
+        let tracked = originals.join("tracked");
+        fs::create_dir_all(&tracked)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), &originals)?;
+        jobs.add_folder("lib", "tracked")?;
+        let originals = jobs.root().to_path_buf();
+        let tracked = originals.join("tracked");
+        let store = Store::open(&dir.path().join("db"), true)?;
+        seed(&store, 26)?;
+        store.reconcile_cache()?;
+        for index in 0..26 {
+            let parent = if index == 0 { &originals } else { &tracked };
+            let path = parent.join(format!("{index}.jpg"));
+            fs::write(&path, b"original fixture")?;
+            store.lock()?.execute(
+                "INSERT INTO catalog_paths VALUES('lib',?1,?2,?3,'jpeg_original')",
+                params![
+                    path.to_str(),
+                    format!("00000000-0000-0000-0000-{index:012}"),
+                    format!("hash{index}")
+                ],
+            )?;
+        }
+        assert_eq!(queue_manual(&store, &jobs, "lib", false)?, 25);
+        assert_eq!(
+            store.lock()?.query_row(
+                "SELECT status FROM media_cache WHERE source_hash='hash0'",
+                [],
+                |r| r.get::<_, String>(0)
+            )?,
+            "pending"
+        );
+        let rebuild_jobs = Jobs::open(&dir.path().join("rebuild-jobs"), &originals)?;
+        rebuild_jobs.add_folder("lib", "tracked")?;
+        store
+            .lock()?
+            .execute("UPDATE media_cache SET status='ready'", [])?;
+        assert_eq!(queue_manual(&store, &rebuild_jobs, "lib", true)?, 19);
+        let queued = rebuild_jobs.jobs_for_library("lib", 100)?;
+        assert_eq!(queued.len(), 19);
+        assert!(
+            queued
+                .iter()
+                .all(|job| job.rebuild_media && !job.refresh_metadata)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn explicit_retry_includes_pending_errors_but_not_ready_or_processing() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
@@ -1196,6 +1412,182 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn override_publication_rejects_changed_source_default_and_thumbnail() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let store = Store::open(&dir.path().join("db"), true)?;
+        seed(&store, 1)?;
+        store.reconcile_cache()?;
+        let id = "00000000-0000-0000-0000-000000000000";
+        let thumbnail = json!({"objectRef":{"bucket":"keeps-previews","key":format!("libraries/lib/assets/{id}/derivatives/thumbnail/test.heic")},"version":"current","width":512,"height":384,"sizeBytes":5});
+        let standard = json!({"path":"/temporary-test-only","width":512,"height":384,"sizeBytes":5,"version":"hash0"});
+        store.cache_publish_for_operation(
+            "lib",
+            id,
+            "hash0",
+            &thumbnail,
+            &standard,
+            Some("published"),
+        )?;
+        assert!(
+            store
+                .cache_publish_for_operation(
+                    "lib",
+                    id,
+                    "stale-hash",
+                    &thumbnail,
+                    &standard,
+                    Some("stale-source")
+                )
+                .is_err()
+        );
+        store.lock()?.execute(
+            "INSERT INTO catalog_defaults VALUES('lib',?,'new-default',1)",
+            [id],
+        )?;
+        assert!(
+            store
+                .cache_publish_for_operation(
+                    "lib",
+                    id,
+                    "hash0",
+                    &thumbnail,
+                    &standard,
+                    Some("stale-default")
+                )
+                .is_err()
+        );
+        let browse = json!({"objectRef":thumbnail["objectRef"],"sourceThumbnailVersion":"current","spec":crate::browse_cache::SPEC,"version":"browse","width":64,"height":48,"sizeBytes":5});
+        assert!(
+            crate::browse_cache::publish_for_operation(
+                &store,
+                "lib",
+                id,
+                "hash0",
+                "current",
+                &browse,
+                Some("stale-default")
+            )
+            .is_err()
+        );
+        store.lock()?.execute("DELETE FROM catalog_defaults", [])?;
+        assert!(
+            crate::browse_cache::publish_for_operation(
+                &store,
+                "lib",
+                id,
+                "stale-hash",
+                "current",
+                &browse,
+                Some("stale-source")
+            )
+            .is_err()
+        );
+        assert!(
+            crate::browse_cache::publish_for_operation(
+                &store,
+                "lib",
+                id,
+                "hash0",
+                "old-thumbnail",
+                &browse,
+                Some("stale-thumbnail")
+            )
+            .is_err()
+        );
+        let operations: (Option<String>, Option<String>) = store.lock()?.query_row(
+            "SELECT thumbnail_operation_id,browse_operation_id FROM media_cache",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert_eq!(operations, (Some("published".into()), None));
+        // Remote/ordinary late publications retain their existing discard semantics.
+        store.cache_publish("lib", id, "stale-hash", &thumbnail, &standard)?;
+        crate::browse_cache::publish(&store, "lib", id, "hash0", "old-thumbnail", &browse)?;
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_override_keeps_published_thumbnail_and_finishes_browse_once() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("db");
+        let store = Store::open(&path, true)?;
+        let jobs = Jobs::open(&dir.path().join("jobs"), dir.path())?;
+        seed(&store, 1)?;
+        store.reconcile_cache()?;
+        let id = "00000000-0000-0000-0000-000000000000";
+        let previews = PreviewStorage::new(
+            &dir.path().join("keeps"),
+            None,
+            "http://localhost",
+            "test-key",
+        )?;
+        let source = dir.path().join("published.jpg");
+        fs::write(&source, b"invalid image fixture")?;
+        let object = previews.put_generated_role("lib", id, "thumb", &source, "thumbnail")?;
+        let thumbnail = json!({"objectRef":object,"version":"published","width":512,"height":384,"sizeBytes":21});
+        let standard = json!({"path":source,"sizeBytes":fs::metadata(&source)?.len(),"mtimeNs":file_mtime(&source)?,"width":512,"height":384,"version":"hash0"});
+        store.cache_publish_for_operation(
+            "lib",
+            id,
+            "hash0",
+            &thumbnail,
+            &standard,
+            Some("operation-1"),
+        )?;
+        drop(store);
+        let store = Store::open(&path, false)?;
+        // The thumbnail commit survived, but the next browse step cannot decode this fixture.
+        assert!(
+            process_asset_with_override(&store, &jobs, &previews, "lib", id, Some("operation-1"))
+                .is_err()
+        );
+        let state:(i64,i64,String,Option<String>)=store.lock()?.query_row("SELECT attempts,browse_attempts,thumbnail_operation_id,browse_operation_id FROM media_cache",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+        assert_eq!(state, (0, 1, "operation-1".into(), None));
+        let browse = json!({"objectRef":object,"sourceThumbnailVersion":"published","spec":crate::browse_cache::SPEC,"version":"browse","width":64,"height":48,"sizeBytes":21});
+        crate::browse_cache::publish_for_operation(
+            &store,
+            "lib",
+            id,
+            "hash0",
+            "published",
+            &browse,
+            Some("operation-1"),
+        )?;
+        drop(store);
+        let store = Store::open(&path, false)?;
+        assert!(!process_asset_with_override(
+            &store,
+            &jobs,
+            &previews,
+            "lib",
+            id,
+            Some("operation-1")
+        )?);
+        assert_eq!(
+            store
+                .lock()?
+                .query_row("SELECT browse_attempts FROM media_cache", [], |r| r
+                    .get::<_, i64>(0))?,
+            1
+        );
+        // A new explicit operation must not inherit the earlier operation's success.
+        assert!(
+            process_asset_with_override(&store, &jobs, &previews, "lib", id, Some("operation-2"))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .lock()?
+                .query_row("SELECT thumbnail_operation_id FROM media_cache", [], |r| {
+                    r.get::<_, String>(0)
+                })?,
+            "operation-1"
+        );
+        assert_eq!(fs::read(source)?, b"invalid image fixture");
+        Ok(())
+    }
+
+    #[test]
     fn normal_retry_reuses_published_media_but_override_attempts_generation() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let store = Store::open(&dir.path().join("db"), true)?;
@@ -1222,7 +1614,7 @@ mod tests {
             [browse.to_string()],
         )?;
         assert!(!process_asset_with_override(
-            &store, &jobs, &previews, "lib", id, false
+            &store, &jobs, &previews, "lib", id, None
         )?);
         assert_eq!(store.cache_status("lib")?["counts"]["ready"], 1);
         assert_eq!(
@@ -1232,7 +1624,10 @@ mod tests {
                     .get::<_, i64>(0))?,
             0
         );
-        assert!(process_asset_with_override(&store, &jobs, &previews, "lib", id, true).is_err());
+        assert!(
+            process_asset_with_override(&store, &jobs, &previews, "lib", id, Some("override"))
+                .is_err()
+        );
         assert_eq!(
             store
                 .lock()?

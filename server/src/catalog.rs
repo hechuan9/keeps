@@ -20,7 +20,7 @@ fn missing_paths_query(scope: &str) -> Result<String> {
     ))
 }
 
-const VERSION: i64 = 21;
+const VERSION: i64 = 22;
 const DIRECTORY_ASSET_SET: &str =
     " AND a.id IN (SELECT f.asset_id FROM catalog_paths f WHERE f.library_id=? AND ";
 // Ordering by path must not make SQLite scan the whole library for every asset.
@@ -71,7 +71,7 @@ pub fn ensure_schema(db: &mut Connection, allow_migrate: bool) -> Result<()> {
         db.prepare("SELECT library_id,id,snapshot FROM photos LIMIT 0")?;
         db.prepare("SELECT library_id,id,snapshot FROM videos LIMIT 0")?;
         db.prepare("SELECT library_id,path,parent_path FROM directories LIMIT 0")?;
-        db.prepare("SELECT library_id,asset_id,source_hash,spec,status,attempts,available_at,last_error,thumbnail,standard,updated_at,audited_at,published_source_hash,published_spec FROM media_cache LIMIT 0")?;
+        db.prepare("SELECT library_id,asset_id,source_hash,spec,status,attempts,available_at,last_error,thumbnail,standard,updated_at,audited_at,published_source_hash,published_spec,thumbnail_operation_id,browse_operation_id FROM media_cache LIMIT 0")?;
         db.prepare("SELECT next_batch_at,last_batch_count,last_batch_at,last_error,free_bytes FROM cache_runtime LIMIT 0")?;
         db.prepare("SELECT snapshot,content_hash,fingerprint,sort_time,filename,rating,flag,color,trashed FROM catalog_assets LIMIT 0")?;
         db.prepare(
@@ -197,6 +197,9 @@ CREATE TABLE IF NOT EXISTS catalog_missing_capture_dates(library_id TEXT NOT NUL
     }
     if version < 21 {
         crate::cache_pipeline::migrate_published_state(&tx)?;
+    }
+    if version < 22 {
+        crate::cache_pipeline::migrate_operation_state(&tx)?;
     }
     tx.pragma_update(None, "user_version", VERSION)?;
     tx.commit()?;
@@ -1131,6 +1134,26 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_twenty_one_adds_operation_checkpoints_without_fabricating_success() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("db");
+        let store = Store::open(&path, true)?;
+        store.lock()?.execute_batch("ALTER TABLE media_cache DROP COLUMN thumbnail_operation_id; ALTER TABLE media_cache DROP COLUMN browse_operation_id; INSERT INTO media_cache(library_id,asset_id,source_hash,spec,status,thumbnail,standard) VALUES('lib','ready','hash','spec','ready','{}','{}'); PRAGMA user_version=21;")?;
+        drop(store);
+        assert!(Store::open(&path, false).is_err());
+        let store = Store::open(&path, true)?;
+        let row: (String, Option<String>, Option<String>) = store.lock()?.query_row(
+            "SELECT status,thumbnail_operation_id,browse_operation_id FROM media_cache",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(row, ("ready".into(), None, None));
+        drop(store);
+        Store::open(&path, false)?;
+        Ok(())
+    }
+
     #[test]
     fn schema_twenty_media_publication_migrates_existing_results() -> Result<()> {
         let directory = tempfile::tempdir()?;

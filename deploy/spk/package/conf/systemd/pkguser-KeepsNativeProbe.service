@@ -11,5 +11,5 @@ WorkingDirectory=/var/packages/KeepsNativeProbe/var
 ExecStart=/var/packages/KeepsNativeProbe/target/bin/launch-probe
 Restart=no
 TimeoutStopSec=930
-KillMode=control-group
+KillMode=mixed
 UMask=0077

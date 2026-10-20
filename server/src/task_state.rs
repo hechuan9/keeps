@@ -10,7 +10,6 @@ pub(crate) enum Event {
     Yield,
     Complete,
     Fail,
-    Interrupt,
     Retry,
 }
 
@@ -20,7 +19,6 @@ impl TaskState {
     fn pending(event: &Event) -> Outcome<State> {
         match event {
             Event::Start => Transition(State::running()),
-            Event::Interrupt => Transition(State::failed()),
             _ => Handled,
         }
     }
@@ -30,7 +28,7 @@ impl TaskState {
         match event {
             Event::Yield => Transition(State::pending()),
             Event::Complete => Transition(State::completed()),
-            Event::Fail | Event::Interrupt => Transition(State::failed()),
+            Event::Fail => Transition(State::failed()),
             _ => Handled,
         }
     }
@@ -85,9 +83,8 @@ mod tests {
     }
 
     #[test]
-    fn interruption_stops_queued_and_running_tasks() {
-        for status in ["pending", "running"] {
-            assert_eq!(transition(status, Event::Interrupt).unwrap(), "failed");
-        }
+    fn yielded_work_can_resume_without_failure() {
+        assert_eq!(transition("running", Event::Yield).unwrap(), "pending");
+        assert_eq!(transition("pending", Event::Start).unwrap(), "running");
     }
 }
