@@ -18,5 +18,7 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>连接局域网中的 NAS 服务，浏览和整理照片。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>将 Keeps 中的照片保存到本机照片图库。</string>
 </dict>
 </plist>

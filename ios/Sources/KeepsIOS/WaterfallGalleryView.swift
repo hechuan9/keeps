@@ -1,4 +1,6 @@
 import SwiftUI
+import Photos
+import UIKit
 import KeepsAPI
 import OSLog
 
@@ -48,6 +50,8 @@ struct IOSPhotoViewer: View {
     @State private var controlsVisible = true
     @State private var restoringSelection = false
     @State private var information: KeepsAsset?
+    @State private var savingToPhotos = false
+    @State private var saveMessage: String?
     let initialAsset: KeepsAsset
 
     init(initialAsset: KeepsAsset) {
@@ -98,6 +102,12 @@ struct IOSPhotoViewer: View {
                         Spacer()
                         Button { information = current } label: { Image(systemName: "info.circle").padding(12) }
                             .accessibilityLabel("照片信息与整理")
+                        Button { Task { await saveCurrentToPhotos() } } label: {
+                            if savingToPhotos { ProgressView().padding(12) }
+                            else { Image(systemName: "square.and.arrow.down").padding(12) }
+                        }
+                        .disabled(savingToPhotos)
+                        .accessibilityLabel("保存到本机相册")
                     }.padding(.horizontal, 8).padding(.vertical, 6).background(.ultraThinMaterial)
                 }
             }
@@ -175,6 +185,51 @@ struct IOSPhotoViewer: View {
                 })
                     .toolbar { ToolbarItem(placement: .confirmationAction) { Button("完成") { information = nil } } }
             }.environmentObject(library)
+        }
+        .alert("保存到本机相册", isPresented: Binding(
+            get: { saveMessage != nil },
+            set: { if !$0 { saveMessage = nil } }
+        )) {
+            Button("好", role: .cancel) { saveMessage = nil }
+        } message: {
+            Text(saveMessage ?? "")
+        }
+    }
+
+    @MainActor
+    private func saveCurrentToPhotos() async {
+        guard !savingToPhotos else { return }
+        guard let configuration = library.configuration else {
+            saveMessage = "请先连接 NAS 图库。"
+            return
+        }
+        savingToPhotos = true
+        defer { savingToPhotos = false }
+        do {
+            let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+            let permitted: Bool
+            if status == .notDetermined {
+                permitted = await PHPhotoLibrary.requestAuthorization(for: .addOnly) == .authorized
+            } else {
+                permitted = status == .authorized || status == .limited
+            }
+            guard permitted else {
+                saveMessage = "没有获得添加照片的权限。请在系统设置中允许 Keeps 添加到照片。"
+                return
+            }
+
+            let client = KeepsClient(configuration: configuration)
+            let temporary = FileManager.default.temporaryDirectory
+                .appendingPathComponent("keeps-photo-\(UUID().uuidString).jpg")
+            defer { try? FileManager.default.removeItem(at: temporary) }
+            try await client.downloadCurrentStandard(assetID: current.id, to: temporary)
+            try Task.checkCancellation()
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: temporary)
+            }
+            saveMessage = "已保存到本机相册。"
+        } catch {
+            saveMessage = "保存失败：\(error.localizedDescription)\n\(String(reflecting: error))"
         }
     }
 }
